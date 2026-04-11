@@ -1551,6 +1551,93 @@ def compare_reference_image(
         raise Exception(f"compare_reference_image failed: {e}")
 
 
+@mcp.tool()
+def diff_images(
+    ctx: Context,
+    image_path_a: str,
+    image_path_b: str,
+    threshold: int = 15,
+    tile_size: int = 512,
+) -> Image:
+    """
+    Compare two images and produce a 3-panel composite: [Image A] | [Image B] | [Diff].
+    The diff panel desaturates the base image and paints changed regions in bright red,
+    making differences immediately obvious.
+
+    Parameters:
+    - image_path_a: Path to the first image (treated as the reference/baseline)
+    - image_path_b: Path to the second image (treated as the new/changed version)
+    - threshold: Pixel difference (0-255) below which changes are ignored (default 15, filters noise)
+    - tile_size: Width/height of each panel in the composite (default 512)
+    """
+    try:
+        if not _PIL_AVAILABLE:
+            raise Exception("Pillow is required for diff_images — install it with: pip install pillow")
+
+        for p in (image_path_a, image_path_b):
+            if not os.path.exists(p):
+                raise Exception(f"File not found: {p}")
+
+        import numpy as np
+        from PIL import ImageChops, ImageEnhance, ImageFilter
+
+        img_a = PILImage.open(image_path_a).convert("RGB").resize((tile_size, tile_size), PILImage.LANCZOS)
+        img_b = PILImage.open(image_path_b).convert("RGB").resize((tile_size, tile_size), PILImage.LANCZOS)
+
+        # --- Build diff mask ---
+        diff = ImageChops.difference(img_a, img_b)
+        diff_gray = diff.convert("L")
+        diff_arr  = np.array(diff_gray, dtype=np.float32)
+
+        # Amplify so subtle changes become visible, then threshold
+        amplified = np.clip(diff_arr * 6, 0, 255).astype(np.uint8)
+        mask_arr  = np.where(amplified > threshold, 255, 0).astype(np.uint8)
+
+        # Soft glow: slight blur on the mask so hard edges bleed outward
+        mask_img  = PILImage.fromarray(mask_arr, "L").filter(ImageFilter.GaussianBlur(radius=2))
+
+        # --- Diff panel: desaturated base + red overlay ---
+        base_desat  = ImageEnhance.Color(img_a).enhance(0.15)   # near-grayscale
+        red_overlay = PILImage.new("RGB", (tile_size, tile_size), (255, 30, 30))
+        diff_panel  = PILImage.composite(red_overlay, base_desat, mask_img)
+
+        # Annotate changed pixel percentage
+        changed_pct = (mask_arr > 0).sum() / (tile_size * tile_size) * 100
+
+        # --- 3-panel composite ---
+        gap    = 6
+        bar    = 28
+        w      = tile_size * 3 + gap * 2
+        h      = tile_size + bar
+        sheet  = PILImage.new("RGB", (w, h), (20, 20, 20))
+
+        sheet.paste(img_a,      (0,                         bar))
+        sheet.paste(img_b,      (tile_size + gap,           bar))
+        sheet.paste(diff_panel, (tile_size * 2 + gap * 2,   bar))
+
+        draw = ImageDraw.Draw(sheet)
+        x_a    = tile_size // 2 - 30
+        x_b    = tile_size + gap + tile_size // 2 - 30
+        x_diff = tile_size * 2 + gap * 2 + tile_size // 2 - 50
+        draw.text((x_a,    6), "Image A",                       fill=(200, 200, 200))
+        draw.text((x_b,    6), "Image B",                       fill=(200, 200, 200))
+        draw.text((x_diff, 6), f"Diff  ({changed_pct:.1f}% changed)",  fill=(255, 100, 100))
+
+        out_path = os.path.join(tempfile.gettempdir(), f"blender_diff_{os.getpid()}.png")
+        sheet.save(out_path)
+        with open(out_path, "rb") as f:
+            data = f.read()
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"diff_images error: {e}")
+        raise Exception(f"diff_images failed: {e}")
+
+
 # ─── Mesh editing ────────────────────────────────────────────────────────────
 
 @mcp.tool()
