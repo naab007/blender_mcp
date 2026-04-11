@@ -12,12 +12,71 @@ import os
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+import io
 
+# Optional PIL — used for image safety guards and compositing
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    PILImage = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
+    _PIL_AVAILABLE = False
 
-# Configure logging
+_SAFE_IMAGE_MAX_PIXELS = 8_000_000  # ~2828×2828 at 1:1 aspect
+
+# Configure logging early so _safe_image_return can use logger
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
+
+
+def _safe_image_return(data: bytes, fmt: str = "png"):
+    """
+    Validate and, if necessary, resize image bytes before returning them
+    to Claude's API.
+
+    - Raises ValueError when data is empty or None.
+    - When PIL is available and the image exceeds _SAFE_IMAGE_MAX_PIXELS total
+      pixels, resizes proportionally with LANCZOS and re-encodes to PNG.
+    - When PIL is unavailable and the file is > 5 MB, logs a warning but still
+      returns the data so the caller at least gets something.
+
+    Returns (bytes, format_str) — always PNG when PIL performs a resize.
+    """
+    if not data:
+        raise ValueError("Image data is empty — Blender may not have written the file")
+
+    if _PIL_AVAILABLE:
+        try:
+            img = PILImage.open(io.BytesIO(data))
+            w, h = img.size
+            total = w * h
+            if total > _SAFE_IMAGE_MAX_PIXELS:
+                scale = (_SAFE_IMAGE_MAX_PIXELS / total) ** 0.5
+                new_w = max(1, int(w * scale))
+                new_h = max(1, int(h * scale))
+                logger.info(
+                    f"_safe_image_return: resizing {w}×{h} → {new_w}×{new_h} "
+                    f"({total:,} px > {_SAFE_IMAGE_MAX_PIXELS:,} px limit)"
+                )
+                img = img.convert("RGB").resize((new_w, new_h), PILImage.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                data = buf.getvalue()
+                fmt = "png"
+        except Exception as e:
+            logger.warning(f"_safe_image_return: PIL check failed ({e}), returning raw data")
+    else:
+        if len(data) > 5 * 1024 * 1024:
+            logger.warning(
+                f"_safe_image_return: image is {len(data) / 1024 / 1024:.1f} MB but "
+                "PIL is not available — cannot resize; API may reject it"
+            )
+
+    return Image(data=data, format=fmt)
+
 
 # Default configuration
 DEFAULT_HOST = "localhost"
@@ -309,11 +368,11 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
         # Read the file
         with open(temp_path, 'rb') as f:
             image_bytes = f.read()
-        
+
         # Delete the temp file
         os.remove(temp_path)
-        
-        return Image(data=image_bytes, format="png")
+
+        return _safe_image_return(image_bytes)
         
     except Exception as e:
         logger.error(f"Error capturing screenshot: {str(e)}")
@@ -695,7 +754,7 @@ def get_sketchfab_model_preview(
         author = result.get("author", "Unknown")
         logger.info(f"Preview retrieved for '{model_name}' by {author}")
         
-        return Image(data=image_data, format=img_format)
+        return _safe_image_return(image_data, fmt=img_format)
         
     except Exception as e:
         logger.error(f"Error getting Sketchfab preview: {str(e)}")
@@ -1290,13 +1349,6 @@ def get_blender_status(ctx: Context) -> str:
 
 # ─── Extended tools ──────────────────────────────────────────────────────────
 
-# Optional PIL for contact-sheet compositing (server-side only)
-try:
-    from PIL import Image as PILImage, ImageDraw, ImageFont
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-
 # Subprocess management for the local image-to-3D server
 import subprocess as _subprocess
 import time as _time
@@ -1336,7 +1388,7 @@ def capture_viewport_angle(
         with open(temp_path, "rb") as f:
             data = f.read()
         os.remove(temp_path)
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
     except Exception as e:
         logger.error(f"capture_viewport_angle error: {e}")
         raise Exception(f"capture_viewport_angle failed: {e}")
@@ -1406,7 +1458,7 @@ def capture_contact_sheet(
                         except Exception:
                             pass
 
-                return Image(data=data, format="png")
+                return _safe_image_return(data)
 
         # Fallback: just return the first captured image
         for angle in angle_list:
@@ -1415,7 +1467,7 @@ def capture_contact_sheet(
                 with open(fp, "rb") as f:
                     data = f.read()
                 os.remove(fp)
-                return Image(data=data, format="png")
+                return _safe_image_return(data)
 
         raise Exception("No images were captured")
     except Exception as e:
@@ -1449,7 +1501,7 @@ def render_depth_map(
         with open(temp_path, "rb") as f:
             data = f.read()
         os.remove(temp_path)
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
     except Exception as e:
         logger.error(f"render_depth_map error: {e}")
         raise Exception(f"render_depth_map failed: {e}")
@@ -1521,7 +1573,7 @@ def compare_reference_image(
             with open(temp_render, "rb") as f:
                 data = f.read()
             os.remove(temp_render)
-            return Image(data=data, format="png")
+            return _safe_image_return(data)
 
         render_img = PILImage.open(temp_render).convert("RGB").resize((max_size, max_size))
         ref_img    = PILImage.open(ref_path).convert("RGB").resize((max_size, max_size))
@@ -1545,7 +1597,7 @@ def compare_reference_image(
             except Exception:
                 pass
 
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
     except Exception as e:
         logger.error(f"compare_reference_image error: {e}")
         raise Exception(f"compare_reference_image failed: {e}")
@@ -1632,7 +1684,7 @@ def diff_images(
         except Exception:
             pass
 
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
     except Exception as e:
         logger.error(f"diff_images error: {e}")
         raise Exception(f"diff_images failed: {e}")
@@ -2391,7 +2443,7 @@ def render_from_camera(
         with open(temp_path, "rb") as f:
             data = f.read()
         os.remove(temp_path)
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
     except Exception as e:
         logger.error(f"render_from_camera error: {e}")
         raise Exception(f"render_from_camera failed: {e}")
@@ -2475,12 +2527,12 @@ def render_all_cameras(
                 f"render_all_cameras: {len(successful)}/{result['total_cameras']} "
                 f"cameras rendered"
             )
-            return Image(data=data, format="png")
+            return _safe_image_return(data)
 
         # Fallback: return the first render as-is
         with open(successful[0]["filepath"], "rb") as f:
             data = f.read()
-        return Image(data=data, format="png")
+        return _safe_image_return(data)
 
     except Exception as e:
         logger.error(f"render_all_cameras error: {e}")
