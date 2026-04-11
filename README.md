@@ -1,287 +1,189 @@
+# BlenderMCP — Blender Model Context Protocol Integration
 
+BlenderMCP connects Blender to AI assistants through the Model Context Protocol (MCP), letting Claude directly control Blender for prompt-assisted 3D modelling, scene creation, rendering, and automation.
 
-# BlenderMCP - Blender Model Context Protocol Integration
+This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) with **91 tools**, full Blender 4.x compatibility, and telemetry removed.
 
-BlenderMCP connects Blender to Claude AI through the Model Context Protocol (MCP), allowing Claude to directly interact with and control Blender. This integration enables prompt assisted 3D modeling, scene creation, and manipulation.
+---
 
-**We have no official website. Any website you see online is unofficial and has no affiliation with this project. Use them at your own risk.**
+## What's new in this fork
 
-[Full tutorial](https://www.youtube.com/watch?v=lCyQ717DuzQ)
+- **91 tools** across 26 categories (up from the original ~20)
+- **Blender 4.x compatibility** — fixes for BMesh layer API changes, EEVEE engine name, `temp_override` region requirement, compositor node ordering
+- **No telemetry** — all analytics code removed
+- **Auto-restart on addon reload** — server restarts automatically when the addon is cycled in Preferences; no manual click needed
+- **`deploy.py`** — one-command script to copy `addon.py` to Blender's installed addons path
+- **`img_to_3d_server.py`** — local image-to-3D inference via TripoSR (optional, loads/unloads on demand to free VRAM)
+- **`TOOLS.md`** — full reference for all 91 tools with parameters
 
-### Join the Community
+---
 
-Give feedback, get inspired, and build on top of the MCP: [Discord](https://discord.gg/z5apgR8TFU)
+## Tool categories (91 tools)
 
-### Supporters
+| Category | Tools |
+|---|---|
+| Process management | `start_blender`, `close_blender`, `get_blender_status` |
+| Scene & object info | `get_scene_info`, `get_object_info`, `find_objects_by_type`, `measure_distance` |
+| Primitives & object mgmt | `add_primitive`, `delete_object`, `duplicate_object`, `rename_object`, `join_objects`, `separate_mesh`, `set_origin`, `snap_to_ground`, `set_smooth_shading`, `parent_object`, `select_objects`, `align_objects` |
+| Transforms | `move_object`, `scale_object`, `rotate_object` |
+| Mesh editing | `get_mesh_stats`, `subdivide_mesh`, `apply_modifier`, `set_vertex_position` |
+| Vertex operations | `get_vertex_positions`, `set_vertex_positions` |
+| Edge operations | `get_edges`, `mark_sharp_edges`, `set_edge_crease`, `set_edge_bevel_weight` |
+| Face operations | `get_faces`, `extrude_faces`, `inset_faces`, `flip_normals`, `merge_vertices`, `triangulate_mesh`, `set_face_material_index` |
+| Curve control points | `get_control_points`, `set_control_point` |
+| Camera | `create_camera`, `set_active_camera` |
+| Lighting | `add_light`, `set_world_background`, `add_3point_lighting` |
+| Materials | `create_material`, `assign_material`, `set_object_material_color`, `load_texture`, `set_texture` |
+| Modifiers | `add_modifier`, `boolean_operation` |
+| Rendering | `set_render_settings`, `render_from_camera`, `render_all_cameras` |
+| Viewport capture | `get_viewport_screenshot`, `capture_viewport_angle`, `capture_contact_sheet`, `render_depth_map` |
+| Reference images | `store_reference_image`, `compare_reference_image` |
+| Animation | `add_keyframe`, `set_frame` |
+| Collections | `create_collection`, `move_to_collection` |
+| Export / import | `export_object`, `import_file`, `save_blend`, `load_blend` |
+| Scripting | `execute_blender_code` |
+| PolyHaven | `get_polyhaven_status`, `get_polyhaven_categories`, `search_polyhaven_assets`, `download_polyhaven_asset` |
+| Sketchfab | `get_sketchfab_status`, `search_sketchfab_models`, `get_sketchfab_model_preview`, `download_sketchfab_model` |
+| Hyper3D / Rodin | `get_hyper3d_status`, `generate_hyper3d_model_via_text`, `generate_hyper3d_model_via_images`, `poll_rodin_job_status`, `import_generated_asset` |
+| Hunyuan3D | `get_hunyuan3d_status`, `generate_hunyuan3d_model`, `poll_hunyuan_job_status`, `import_generated_asset_hunyuan` |
+| Image-to-3D (TripoSR) | `load_img_to_3d_model`, `generate_3d_from_image`, `unload_img_to_3d_model` |
 
-[CodeRabbit](https://www.coderabbit.ai/)
+See [TOOLS.md](TOOLS.md) for full parameter documentation.
 
-**All supporters:**
+---
 
-[Support this project](https://github.com/sponsors/ahujasid)
+## Requirements
 
-## Current version(1.5.5)
-- Added Hunyuan3D support
-- View screenshots for Blender viewport to better understand the scene
-- Search and download Sketchfab models
-- Support for Poly Haven assets through their API
-- Support to generate 3D models using Hyper3D Rodin
-- Run Blender MCP on a remote host
-- Telemetry for tools executed (completely anonymous)
+- Blender 4.0 or newer (Blender 4.3 recommended)
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
 
-### Installating a new version (existing users)
-- For newcomers, you can go straight to Installation. For existing users, see the points below
-- Download the latest addon.py file and replace the older one, then add it to Blender
-- Delete the MCP server from Claude and add it back again, and you should be good to go!
-
-
-## Features
-
-- **Two-way communication**: Connect Claude AI to Blender through a socket-based server
-- **Object manipulation**: Create, modify, and delete 3D objects in Blender
-- **Material control**: Apply and modify materials and colors
-- **Scene inspection**: Get detailed information about the current Blender scene
-- **Code execution**: Run arbitrary Python code in Blender from Claude
-
-## Components
-
-The system consists of two main components:
-
-1. **Blender Addon (`addon.py`)**: A Blender addon that creates a socket server within Blender to receive and execute commands
-2. **MCP Server (`src/blender_mcp/server.py`)**: A Python server that implements the Model Context Protocol and connects to the Blender addon
+---
 
 ## Installation
 
+### 1. Install the MCP server
 
-### Prerequisites
-
-- Blender 3.0 or newer
-- Python 3.10 or newer
-- uv package manager: 
-
-**If you're on Mac, please install uv as**
 ```bash
-brew install uv
-```
-**On Windows**
-```powershell
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex" 
-```
-and then add uv to the user path in Windows (you may need to restart Claude Desktop after):
-```powershell
-$localBin = "$env:USERPROFILE\.local\bin"
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-[Environment]::SetEnvironmentVariable("Path", "$userPath;$localBin", "User")
+git clone https://github.com/naab007/blender_mcp
+cd blender_mcp
+uv venv .venv
+uv pip install -e .
 ```
 
-Otherwise installation instructions are on their website: [Install uv](https://docs.astral.sh/uv/getting-started/installation/)
+### 2. Install the Blender addon
 
-**⚠️ Do not proceed before installing UV**
+1. Download `addon.py` from this repo
+2. Open Blender → Edit → Preferences → Add-ons → Install...
+3. Select `addon.py` and enable **Interface: Blender MCP**
+4. In the 3D View sidebar (N), open the **BlenderMCP** tab and click **Start MCP Server**
 
-### Environment Variables
+> After the first install, use `deploy.py` to push addon updates in one command:
+> ```bash
+> .venv/Scripts/python.exe deploy.py
+> ```
+> Edit the destination path in `deploy.py` to match your Blender version.
 
-The following environment variables can be used to configure the Blender connection:
+### 3. Configure your AI client
 
-- `BLENDER_HOST`: Host address for Blender socket server (default: "localhost")
-- `BLENDER_PORT`: Port number for Blender socket server (default: 9876)
-
-Example:
-```bash
-export BLENDER_HOST='host.docker.internal'
-export BLENDER_PORT=9876
-```
-
-### Claude for Desktop Integration
-
-[Watch the setup instruction video](https://www.youtube.com/watch?v=neoK_WMq92g) (Assuming you have already installed uv)
-
-Go to Claude > Settings > Developer > Edit Config > claude_desktop_config.json to include the following:
-
+**Claude Code** — create `.mcp.json` in your working directory:
 ```json
 {
-    "mcpServers": {
-        "blender": {
-            "command": "uvx",
-            "args": [
-                "blender-mcp"
-            ]
-        }
+  "mcpServers": {
+    "blender": {
+      "type": "stdio",
+      "command": "/path/to/blender_mcp/.venv/Scripts/blender-mcp.exe"
     }
-}
-```
-<details>
-<summary>Claude Code</summary>
-
-Use the Claude Code CLI to add the blender MCP server:
-
-```bash
-claude mcp add blender uvx blender-mcp
-```
-</details>
-
-### Cursor integration
-
-[![Install MCP Server](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/link/mcp%2Finstall?name=blender&config=eyJjb21tYW5kIjoidXZ4IGJsZW5kZXItbWNwIn0%3D)
-
-For Mac users, go to Settings > MCP and paste the following 
-
-- To use as a global server, use "add new global MCP server" button and paste
-- To use as a project specific server, create `.cursor/mcp.json` in the root of the project and paste
-
-
-```json
-{
-    "mcpServers": {
-        "blender": {
-            "command": "uvx",
-            "args": [
-                "blender-mcp"
-            ]
-        }
-    }
+  }
 }
 ```
 
-For Windows users, go to Settings > MCP > Add Server, add a new server with the following settings:
-
+**Claude Desktop** — add to `claude_desktop_config.json`:
 ```json
 {
-    "mcpServers": {
-        "blender": {
-            "command": "cmd",
-            "args": [
-                "/c",
-                "uvx",
-                "blender-mcp"
-            ]
-        }
+  "mcpServers": {
+    "blender": {
+      "command": "uvx",
+      "args": ["blender-mcp"]
     }
+  }
 }
 ```
 
-[Cursor setup video](https://www.youtube.com/watch?v=wgWsJshecac)
+**Cursor** — add to `.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "blender": {
+      "command": "uvx",
+      "args": ["blender-mcp"]
+    }
+  }
+}
+```
 
-**⚠️ Only run one instance of the MCP server (either on Cursor or Claude Desktop), not both**
-
-### Visual Studio Code Integration
-
-_Prerequisites_: Make sure you have [Visual Studio Code](https://code.visualstudio.com/) installed before proceeding.
-
-[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_blender--mcp_server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=ffffff)](vscode:mcp/install?%7B%22name%22%3A%22blender-mcp%22%2C%22type%22%3A%22stdio%22%2C%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22blender-mcp%22%5D%7D)
-
-### Installing the Blender Addon
-
-1. Download the `addon.py` file from this repo
-1. Open Blender
-2. Go to Edit > Preferences > Add-ons
-3. Click "Install..." and select the `addon.py` file
-4. Enable the addon by checking the box next to "Interface: Blender MCP"
-
+---
 
 ## Usage
 
-### Starting the Connection
-![BlenderMCP in the sidebar](assets/addon-instructions.png)
+Once the addon is running and the MCP server is configured, ask Claude to:
 
-1. In Blender, go to the 3D View sidebar (press N if not visible)
-2. Find the "BlenderMCP" tab
-3. Turn on the Poly Haven checkbox if you want assets from their API (optional)
-4. Click "Connect to Claude"
-5. Make sure the MCP server is running in your terminal
+- "Create a low-poly dungeon scene with a dragon guarding a pot of gold"
+- "Set up 3-point studio lighting and render from the active camera"
+- "Add a Subdivision Surface modifier to the selected object and apply a PBR material"
+- "Capture viewport angles from front, side, and top and give me a contact sheet"
+- "Boolean-subtract the sphere from the cube"
+- "Download a rock model from PolyHaven and place it at the origin"
+- "Generate a 3D model of a garden gnome via Hyper3D"
+- "Render depth map of the current scene"
+- "Keyframe this object moving from (0,0,0) to (5,0,0) over 60 frames"
 
-### Using with Claude
+---
 
-Once the config file has been set on Claude, and the addon is running on Blender, you will see a hammer icon with tools for the Blender MCP.
+## Environment variables
 
-![BlenderMCP in the sidebar](assets/hammer-icon.png)
+| Variable | Default | Description |
+|---|---|---|
+| `BLENDER_HOST` | `localhost` | Host for the Blender TCP socket |
+| `BLENDER_PORT` | `9876` | Port for the Blender TCP socket |
+| `IMG_TO_3D_PORT` | `7862` | Port for the local TripoSR server |
+| `IMG_TO_3D_MODEL_DIR` | `stabilityai/TripoSR` | Local weights path or HuggingFace hub ID |
+| `IMG_TO_3D_DEVICE` | auto | `cuda` or `cpu` |
 
-#### Capabilities
+---
 
-- Get scene and object information 
-- Create, delete and modify shapes
-- Apply or create materials for objects
-- Execute any Python code in Blender
-- Download the right models, assets and HDRIs through [Poly Haven](https://polyhaven.com/)
-- AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/)
+## Architecture
 
+```
+Claude / AI client
+      │  MCP (stdio)
+      ▼
+server.py  (FastMCP, @mcp.tool functions)
+      │  JSON over TCP :9876
+      ▼
+addon.py   (Blender Python addon, bpy.app.timers dispatch)
+      │
+      ▼
+Blender scene
+```
 
-### Example Commands
+- All addon handlers run on Blender's main thread via `bpy.app.timers.register()` — no threading issues
+- Commands are JSON `{ "type": "...", "params": {...} }`, responses are `{ "status": "success"|"error", "result": ... }`
 
-Here are some examples of what you can ask Claude to do:
-
-- "Create a low poly scene in a dungeon, with a dragon guarding a pot of gold" [Demo](https://www.youtube.com/watch?v=DqgKuLYUv00)
-- "Create a beach vibe using HDRIs, textures, and models like rocks and vegetation from Poly Haven" [Demo](https://www.youtube.com/watch?v=I29rn92gkC4)
-- Give a reference image, and create a Blender scene out of it [Demo](https://www.youtube.com/watch?v=FDRb03XPiRo)
-- "Generate a 3D model of a garden gnome through Hyper3D"
-- "Get information about the current scene, and make a threejs sketch from it" [Demo](https://www.youtube.com/watch?v=jxbNI5L7AH8)
-- "Make this car red and metallic" 
-- "Create a sphere and place it above the cube"
-- "Make the lighting like a studio"
-- "Point the camera at the scene, and make it isometric"
-
-## Hyper3D integration
-
-Hyper3D's free trial key allows you to generate a limited number of models per day. If the daily limit is reached, you can wait for the next day's reset or obtain your own key from hyper3d.ai and fal.ai.
+---
 
 ## Troubleshooting
 
-- **Connection issues**: Make sure the Blender addon server is running, and the MCP server is configured on Claude, DO NOT run the uvx command in the terminal. Sometimes, the first command won't go through but after that it starts working.
-- **Timeout errors**: Try simplifying your requests or breaking them into smaller steps
-- **Poly Haven integration**: Claude is sometimes erratic with its behaviour
-- **Have you tried turning it off and on again?**: If you're still having connection errors, try restarting both Claude and the Blender server
+- **"context is incorrect" on view3d operators** — requires Blender 4.x `temp_override(area=area, region=region)`. Already fixed in this fork.
+- **BLENDER_EEVEE enum not found** — use `BLENDER_EEVEE_NEXT` in Blender 4.x. Already normalized in this fork.
+- **Render writes nothing after depth map** — compositor state corruption from empty node tree. Fixed in this fork via full snapshot/restore in `render_depth_map`.
+- **`execute_blender_code`** runs arbitrary Python in Blender — powerful but irreversible. Save your work first.
+- **Connection issues** — ensure the addon server is running (green dot in the BlenderMCP sidebar tab) before sending commands.
 
+---
 
-## Technical Details
+## License
 
-### Communication Protocol
+MIT — see [LICENSE](LICENSE).
 
-The system uses a simple JSON-based protocol over TCP sockets:
-
-- **Commands** are sent as JSON objects with a `type` and optional `params`
-- **Responses** are JSON objects with a `status` and `result` or `message`
-
-## Limitations & Security Considerations
-
-- The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. ALWAYS save your work before using it.
-- Poly Haven requires downloading models, textures, and HDRI images. If you do not want to use it, please turn it off in the checkbox in Blender. 
-- Complex operations might need to be broken down into smaller steps
-
-
-#### Telemetry Control
-
-BlenderMCP collects anonymous usage data to help improve the tool. You can control telemetry in two ways:
-
-1. **In Blender**: Go to Edit > Preferences > Add-ons > Blender MCP and uncheck the telemetry consent checkbox
-   - With consent (checked): Collects anonymized prompts, code snippets, and screenshots
-   - Without consent (unchecked): Only collects minimal anonymous usage data (tool names, success/failure, duration)
-
-2. **Environment Variable**: Completely disable all telemetry by running:
-```bash
-DISABLE_TELEMETRY=true uvx blender-mcp
-```
-
-Or add it to your MCP config:
-```json
-{
-    "mcpServers": {
-        "blender": {
-            "command": "uvx",
-            "args": ["blender-mcp"],
-            "env": {
-                "DISABLE_TELEMETRY": "true"
-            }
-        }
-    }
-}
-```
-
-All telemetry data is fully anonymized and used solely to improve BlenderMCP.
-
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Disclaimer
-
-This is a third-party integration and not made by Blender. Made by [Siddharth](https://x.com/sidahuj)
+Based on [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) by Siddharth Ahuja.
