@@ -32,6 +32,10 @@ bl_info = {
 
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
 
+# Set to True by unregister() when the server was running at reload time,
+# so register() can auto-restart it (off/on cycle on addon reload).
+_restart_server_on_register = False
+
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
@@ -252,6 +256,91 @@ class BlenderMCPServer:
             }
             handlers.update(hunyuan_handlers)
 
+        # Add extended handlers (always available)
+        extended_handlers = {
+            # Multi-angle capture
+            "capture_viewport_angle": self.capture_viewport_angle,
+            "capture_contact_sheet": self.capture_contact_sheet,
+            # Depth map
+            "render_depth_map": self.render_depth_map,
+            # Reference image
+            "store_reference_image": self.store_reference_image,
+            # Mesh editing
+            "move_object": self.move_object,
+            "scale_object": self.scale_object,
+            "rotate_object": self.rotate_object,
+            "set_object_material_color": self.set_object_material_color,
+            "get_vertex_positions": self.get_vertex_positions,
+            "set_vertex_position": self.set_vertex_position,
+            "set_vertex_positions": self.set_vertex_positions,
+            "get_control_points": self.get_control_points,
+            "set_control_point": self.set_control_point,
+            # Lifecycle
+            "quit_blender": self.quit_blender,
+            # Edge operations
+            "get_edges": self.get_edges,
+            "mark_sharp_edges": self.mark_sharp_edges,
+            "set_edge_crease": self.set_edge_crease,
+            "set_edge_bevel_weight": self.set_edge_bevel_weight,
+            # Face operations
+            "get_faces": self.get_faces,
+            "set_face_material_index": self.set_face_material_index,
+            "extrude_faces": self.extrude_faces,
+            "inset_faces": self.inset_faces,
+            "flip_normals": self.flip_normals,
+            "merge_vertices": self.merge_vertices,
+            "triangulate_mesh": self.triangulate_mesh,
+            "subdivide_mesh": self.subdivide_mesh,
+            "apply_modifier": self.apply_modifier,
+            "get_mesh_stats": self.get_mesh_stats,
+            # Camera management
+            "create_camera": self.create_camera,
+            "set_active_camera": self.set_active_camera,
+            "render_from_camera": self.render_from_camera,
+            "render_all_cameras": self.render_all_cameras,
+            # Scene analysis
+            "find_objects_by_type": self.find_objects_by_type,
+            "measure_distance": self.measure_distance,
+            # Lighting
+            "add_light": self.add_light,
+            "set_world_background": self.set_world_background,
+            "add_3point_lighting": self.add_3point_lighting,
+            # Export / import / blend save-load
+            "export_object": self.export_object,
+            "import_file": self.import_file,
+            "save_blend": self.save_blend,
+            "load_blend": self.load_blend,
+            # Primitives & object management
+            "add_primitive": self.add_primitive,
+            "delete_object": self.delete_object,
+            "duplicate_object": self.duplicate_object,
+            "join_objects": self.join_objects,
+            "separate_mesh": self.separate_mesh,
+            "rename_object": self.rename_object,
+            "set_origin": self.set_origin,
+            "snap_to_ground": self.snap_to_ground,
+            "set_smooth_shading": self.set_smooth_shading,
+            "parent_object": self.parent_object,
+            "select_objects": self.select_objects,
+            "align_objects": self.align_objects,
+            # Materials
+            "create_material": self.create_material,
+            "assign_material": self.assign_material,
+            "load_texture": self.load_texture,
+            # Modifiers
+            "add_modifier": self.add_modifier_ext,
+            "boolean_operation": self.boolean_operation,
+            # Render settings
+            "set_render_settings": self.set_render_settings,
+            # Animation
+            "add_keyframe": self.add_keyframe,
+            "set_frame": self.set_frame,
+            # Collections
+            "create_collection": self.create_collection,
+            "move_to_collection": self.move_to_collection,
+        }
+        handlers.update(extended_handlers)
+
         handler = handlers.get(cmd_type)
         if handler:
             try:
@@ -436,6 +525,1926 @@ class BlenderMCPServer:
             raise Exception(f"Code execution error: {str(e)}")
 
 
+
+    # ─── Multi-angle viewport capture ────────────────────────────────────────
+
+    # Predefined view presets: (view_axis, negative)
+    _VIEW_PRESETS = {
+        "front":            ("FRONT",  False),
+        "back":             ("FRONT",  True),
+        "left":             ("RIGHT",  True),
+        "right":            ("RIGHT",  False),
+        "top":              ("TOP",    False),
+        "bottom":           ("TOP",    True),
+        "iso_front_right":  None,   # handled specially
+        "iso_front_left":   None,
+    }
+
+    def capture_viewport_angle(self, angle="front", max_size=800, filepath=None):
+        """
+        Capture the 3D viewport from a named angle.
+        angle: one of front, back, left, right, top, bottom, iso_front_right, iso_front_left
+        """
+        import math
+        area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+        if not area:
+            return {"error": "No 3D viewport found"}
+
+        space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
+        if not space:
+            return {"error": "No VIEW_3D space found"}
+
+        region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+        if not region:
+            return {"error": "No WINDOW region found in VIEW_3D"}
+
+        r3d = space.region_3d
+
+        # Save original state
+        orig_view_matrix = r3d.view_matrix.copy()
+        orig_perspective = r3d.view_perspective
+
+        try:
+            with bpy.context.temp_override(area=area, region=region):
+                if angle == "iso_front_right":
+                    r3d.view_perspective = 'PERSP'
+                    bpy.ops.view3d.view_axis(type='FRONT')
+                    # Rotate 45° around Z and 35.264° around X (isometric)
+                    rot = mathutils.Euler((math.radians(54.736), 0, math.radians(45)), 'XYZ')
+                    r3d.view_rotation = rot.to_quaternion()
+                elif angle == "iso_front_left":
+                    r3d.view_perspective = 'PERSP'
+                    bpy.ops.view3d.view_axis(type='FRONT')
+                    rot = mathutils.Euler((math.radians(54.736), 0, math.radians(-45)), 'XYZ')
+                    r3d.view_rotation = rot.to_quaternion()
+                else:
+                    preset = self._VIEW_PRESETS.get(angle)
+                    if preset is None:
+                        return {"error": f"Unknown angle: {angle}. Choose from: {list(self._VIEW_PRESETS.keys())}"}
+                    axis, negative = preset
+                    bpy.ops.view3d.view_axis(type=axis, align_active=False)
+                    if negative:
+                        bpy.ops.view3d.view_axis(type=axis, align_active=False)
+                        r3d.view_rotation = (-r3d.view_rotation).normalized()
+
+                bpy.ops.view3d.view_selected(use_all_regions=False)
+
+            if not filepath:
+                import tempfile
+                filepath = os.path.join(tempfile.gettempdir(), f"blender_angle_{angle}_{os.getpid()}.png")
+
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.screen.screenshot_area(filepath=filepath)
+
+            # Resize if needed
+            img = bpy.data.images.load(filepath)
+            w, h = img.size
+            if max(w, h) > max_size:
+                scale = max_size / max(w, h)
+                img.scale(int(w * scale), int(h * scale))
+                img.file_format = 'PNG'
+                img.save()
+                w, h = img.size
+            bpy.data.images.remove(img)
+
+            return {"success": True, "angle": angle, "filepath": filepath, "width": w, "height": h}
+
+        finally:
+            r3d.view_matrix = orig_view_matrix
+            r3d.view_perspective = orig_perspective
+
+    def capture_contact_sheet(self, angles=None, max_size=512, filepath=None):
+        """
+        Capture multiple viewport angles and return paths for each.
+        angles: list of angle names; defaults to [front, right, top, iso_front_right]
+        """
+        if angles is None:
+            angles = ["front", "right", "top", "iso_front_right"]
+
+        import tempfile
+        results = {}
+        for angle in angles:
+            fp = os.path.join(tempfile.gettempdir(), f"blender_cs_{angle}_{os.getpid()}.png")
+            r = self.capture_viewport_angle(angle=angle, max_size=max_size, filepath=fp)
+            results[angle] = r
+
+        return {"images": results}
+
+    # ─── Depth map ──────────────────────────────────────────────────────────
+
+    def render_depth_map(self, filepath=None, max_depth=10.0):
+        """
+        Render a normalised depth map from the active camera using the compositor Z-pass.
+        Returns the filepath of the saved PNG.
+        """
+        import tempfile
+        if not filepath:
+            filepath = os.path.join(tempfile.gettempdir(), f"blender_depth_{os.getpid()}.png")
+
+        import copy
+
+        scene = bpy.context.scene
+        orig_use_nodes  = scene.use_nodes
+        orig_use_pass_z = scene.view_layers[0].use_pass_z
+        orig_render_path = scene.render.filepath
+        orig_file_format = scene.render.image_settings.file_format
+
+        # Snapshot the existing compositor node tree so we can restore it.
+        # We serialise each node's type/location/values and all links.
+        tree = scene.node_tree
+        if tree is None:
+            scene.use_nodes = True          # creates the node_tree attribute
+            tree = scene.node_tree
+
+        def _snapshot_tree(tree):
+            snap_nodes = []
+            for n in tree.nodes:
+                nd = {"type": n.type, "name": n.name, "loc": (n.location.x, n.location.y),
+                      "inputs": {}}
+                for inp in n.inputs:
+                    try:
+                        nd["inputs"][inp.name] = inp.default_value
+                    except Exception:
+                        pass
+                snap_nodes.append(nd)
+            snap_links = [(lk.from_node.name, lk.from_socket.name,
+                           lk.to_node.name,   lk.to_socket.name)
+                          for lk in tree.links]
+            return snap_nodes, snap_links
+
+        def _restore_tree(tree, snap_nodes, snap_links):
+            tree.nodes.clear()
+            created = {}
+            for nd in snap_nodes:
+                try:
+                    n = tree.nodes.new(f"CompositorNode{nd['type'].title().replace('_','')}")
+                except Exception:
+                    try:
+                        n = tree.nodes.new(nd['type'])
+                    except Exception:
+                        continue
+                n.name = nd["name"]
+                n.location = nd["loc"]
+                for inp_name, val in nd["inputs"].items():
+                    try:
+                        n.inputs[inp_name].default_value = val
+                    except Exception:
+                        pass
+                created[nd["name"]] = n
+            for fn, fs, tn, ts in snap_links:
+                try:
+                    tree.links.new(created[fn].outputs[fs], created[tn].inputs[ts])
+                except Exception:
+                    pass
+
+        orig_snap = _snapshot_tree(tree) if orig_use_nodes else ([], [])
+
+        # Enable Z pass BEFORE building the compositor tree so the
+        # RenderLayers node has the "Depth" output when created.
+        scene.view_layers[0].use_pass_z = True
+
+        # Enable compositor nodes
+        scene.use_nodes = True
+        tree = scene.node_tree
+        nodes = tree.nodes
+        links = tree.links
+
+        # Clear existing nodes and build depth-map graph
+        nodes.clear()
+
+        # Build: RenderLayers -> Map Range (0..max_depth → 0..1) -> Invert -> Composite
+        rl = nodes.new("CompositorNodeRLayers")
+        rl.location = (0, 0)
+
+        map_node = nodes.new("CompositorNodeMapRange")
+        map_node.location = (250, 0)
+        map_node.inputs["From Min"].default_value = 0.0
+        map_node.inputs["From Max"].default_value = max_depth
+        map_node.inputs["To Min"].default_value = 0.0
+        map_node.inputs["To Max"].default_value = 1.0
+
+        invert = nodes.new("CompositorNodeInvert")
+        invert.location = (450, 0)
+
+        composite = nodes.new("CompositorNodeComposite")
+        composite.location = (650, 0)
+
+        links.new(rl.outputs["Depth"], map_node.inputs["Value"])
+        links.new(map_node.outputs["Value"], invert.inputs["Color"])
+        links.new(invert.outputs["Color"], composite.inputs["Image"])
+
+        scene.render.filepath = filepath
+        scene.render.image_settings.file_format = 'PNG'
+
+        try:
+            bpy.ops.render.render(write_still=True)
+        finally:
+            # Fully restore: clear depth nodes first, then restore original tree
+            nodes.clear()
+            if orig_use_nodes and orig_snap[0]:
+                try:
+                    _restore_tree(tree, *orig_snap)
+                except Exception as e:
+                    print(f"render_depth_map: node restore warning: {e}")
+            scene.use_nodes   = orig_use_nodes
+            scene.view_layers[0].use_pass_z = orig_use_pass_z
+            scene.render.filepath            = orig_render_path
+            scene.render.image_settings.file_format = orig_file_format
+
+        return {"success": True, "filepath": filepath}
+
+    # ─── Reference image ────────────────────────────────────────────────────
+
+    # Shared storage: maps name → filepath
+    _reference_images: dict = {}
+
+    def store_reference_image(self, name, filepath):
+        """Register a local image path under a short name for later comparison."""
+        if not os.path.exists(filepath):
+            return {"error": f"File not found: {filepath}"}
+        BlenderMCPServer._reference_images[name] = filepath
+        return {"success": True, "name": name, "filepath": filepath,
+                "stored_refs": list(BlenderMCPServer._reference_images.keys())}
+
+    # ─── Mesh editing ───────────────────────────────────────────────────────
+
+    def move_object(self, name, x=0.0, y=0.0, z=0.0):
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        obj.location = (x, y, z)
+        return {"success": True, "name": name, "location": [x, y, z]}
+
+    def scale_object(self, name, x=1.0, y=1.0, z=1.0):
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        obj.scale = (x, y, z)
+        return {"success": True, "name": name, "scale": [x, y, z]}
+
+    def rotate_object(self, name, x=0.0, y=0.0, z=0.0, mode="XYZ"):
+        """Rotate object (Euler angles in degrees)."""
+        import math
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        obj.rotation_mode = mode
+        obj.rotation_euler = (math.radians(x), math.radians(y), math.radians(z))
+        return {"success": True, "name": name, "rotation_deg": [x, y, z]}
+
+    def set_object_material_color(self, name, r=1.0, g=1.0, b=1.0, a=1.0, material_index=0):
+        """Set or create a Principled BSDF material on an object with the given base colour."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+
+        # Ensure object has a material slot
+        if len(obj.material_slots) <= material_index or obj.material_slots[material_index].material is None:
+            mat = bpy.data.materials.new(name=f"{name}_mat_{material_index}")
+            mat.use_nodes = True
+            if len(obj.material_slots) <= material_index:
+                obj.data.materials.append(mat)
+            else:
+                obj.material_slots[material_index].material = mat
+        else:
+            mat = obj.material_slots[material_index].material
+            if not mat.use_nodes:
+                mat.use_nodes = True
+
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is None:
+            bsdf = mat.node_tree.nodes.new("ShaderNodeBsdfPrincipled")
+
+        bsdf.inputs["Base Color"].default_value = (r, g, b, a)
+        return {"success": True, "name": name, "material": mat.name, "color": [r, g, b, a]}
+
+    def get_vertex_positions(self, name, indices=None, world_space=True, max_verts=2000):
+        """
+        Return vertex positions for a mesh object.
+        indices: list of specific vertex indices; returns all if None (capped at max_verts)
+        world_space: True = world coordinates, False = local/object coordinates
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+        mesh = obj.data
+        mat = obj.matrix_world if world_space else mathutils.Matrix.Identity(4)
+
+        if indices is not None:
+            out_of_range = [i for i in indices if i >= len(mesh.vertices)]
+            if out_of_range:
+                return {"error": f"Indices out of range: {out_of_range} (mesh has {len(mesh.vertices)} verts)"}
+            verts = [(i, mesh.vertices[i]) for i in indices]
+        else:
+            verts = list(enumerate(mesh.vertices))
+            if len(verts) > max_verts:
+                return {
+                    "error": f"Mesh has {len(mesh.vertices)} vertices — exceeds max_verts={max_verts}. "
+                             f"Pass specific indices or increase max_verts."
+                }
+
+        positions = [
+            {"index": i, "co": [round(v, 6) for v in (mat @ vert.co)]}
+            for i, vert in verts
+        ]
+        return {
+            "name": name,
+            "total_vertices": len(mesh.vertices),
+            "returned": len(positions),
+            "world_space": world_space,
+            "vertices": positions,
+        }
+
+    def set_vertex_position(self, name, vertex_index, x, y, z):
+        """Move a single vertex of a mesh object to world-space coordinates."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh object"}
+        mesh = obj.data
+        if vertex_index >= len(mesh.vertices):
+            return {"error": f"Vertex index {vertex_index} out of range ({len(mesh.vertices)} vertices)"}
+        local = obj.matrix_world.inverted() @ mathutils.Vector((x, y, z))
+        mesh.vertices[vertex_index].co = local
+        mesh.update()
+        return {"success": True, "name": name, "vertex_index": vertex_index, "local": list(local)}
+
+    def set_vertex_positions(self, name, vertices, world_space=True):
+        """
+        Batch-update multiple vertex positions in a single call.
+        vertices: list of {"index": int, "co": [x, y, z]}
+        world_space: if True, co values are in world space and will be converted to local
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+        mesh = obj.data
+        inv = obj.matrix_world.inverted() if world_space else mathutils.Matrix.Identity(4)
+
+        updated = []
+        errors = []
+        for entry in vertices:
+            idx = entry.get("index")
+            co  = entry.get("co")
+            if idx is None or co is None:
+                errors.append(f"Missing 'index' or 'co' in entry: {entry}")
+                continue
+            if idx >= len(mesh.vertices):
+                errors.append(f"Index {idx} out of range")
+                continue
+            local = inv @ mathutils.Vector(co)
+            mesh.vertices[idx].co = local
+            updated.append(idx)
+
+        mesh.update()
+        result = {"success": True, "name": name, "updated_count": len(updated), "updated": updated}
+        if errors:
+            result["errors"] = errors
+        return result
+
+    # ─── Curve control points ─────────────────────────────────────────────────
+
+    def get_control_points(self, name, spline_index=0):
+        """
+        Return the control points of a curve or bezier spline object.
+        For BEZIER splines returns: co, handle_left, handle_right, handle_left_type, handle_right_type
+        For POLY/NURBS splines returns: co, weight (NURBS only)
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'CURVE':
+            return {"error": f"{name} is not a curve object (type={obj.type})"}
+        curve = obj.data
+        if spline_index >= len(curve.splines):
+            return {"error": f"Spline index {spline_index} out of range ({len(curve.splines)} splines)"}
+
+        spline = curve.splines[spline_index]
+        mat = obj.matrix_world
+        points_out = []
+
+        if spline.type == 'BEZIER':
+            for i, pt in enumerate(spline.bezier_points):
+                world_co = mat @ pt.co
+                world_hl = mat @ pt.handle_left
+                world_hr = mat @ pt.handle_right
+                points_out.append({
+                    "index": i,
+                    "co":           [round(v, 6) for v in world_co],
+                    "handle_left":  [round(v, 6) for v in world_hl],
+                    "handle_right": [round(v, 6) for v in world_hr],
+                    "handle_left_type":  pt.handle_left_type,
+                    "handle_right_type": pt.handle_right_type,
+                })
+        else:  # POLY or NURBS
+            for i, pt in enumerate(spline.points):
+                world_co = mat @ mathutils.Vector(pt.co[:3])
+                entry = {"index": i, "co": [round(v, 6) for v in world_co]}
+                if spline.type == 'NURBS':
+                    entry["weight"] = pt.weight
+                points_out.append(entry)
+
+        return {
+            "name": name,
+            "spline_index": spline_index,
+            "spline_type": spline.type,
+            "spline_count": len(curve.splines),
+            "point_count": len(points_out),
+            "points": points_out,
+        }
+
+    def set_control_point(self, name, point_index, co,
+                           handle_left=None, handle_right=None,
+                           handle_left_type=None, handle_right_type=None,
+                           spline_index=0):
+        """
+        Move a curve control point (and optionally its handles).
+        co: [x, y, z] in world space.
+        handle_left / handle_right: [x, y, z] in world space (bezier only).
+        handle_*_type: FREE, ALIGNED, VECTOR, AUTO (bezier only).
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'CURVE':
+            return {"error": f"{name} is not a curve object"}
+        curve = obj.data
+        spline = curve.splines[spline_index]
+        inv = obj.matrix_world.inverted()
+
+        local_co = inv @ mathutils.Vector(co)
+
+        if spline.type == 'BEZIER':
+            if point_index >= len(spline.bezier_points):
+                return {"error": f"Point index {point_index} out of range"}
+            pt = spline.bezier_points[point_index]
+            pt.co = local_co
+            if handle_left:
+                pt.handle_left  = inv @ mathutils.Vector(handle_left)
+            if handle_right:
+                pt.handle_right = inv @ mathutils.Vector(handle_right)
+            if handle_left_type:
+                pt.handle_left_type  = handle_left_type
+            if handle_right_type:
+                pt.handle_right_type = handle_right_type
+        else:
+            if point_index >= len(spline.points):
+                return {"error": f"Point index {point_index} out of range"}
+            pt = spline.points[point_index]
+            pt.co = (*local_co, pt.co[3])  # preserve W
+
+        curve.id_data.update_tag()
+        return {
+            "success": True,
+            "name": name,
+            "spline_index": spline_index,
+            "point_index": point_index,
+            "co_world": co,
+        }
+
+    # ─── Lifecycle ───────────────────────────────────────────────────────────
+
+    def quit_blender(self, save_prompt=False):
+        """
+        Quit Blender gracefully.
+        save_prompt=False skips the "save before closing?" dialog.
+        """
+        if not save_prompt:
+            # Mark the file as unmodified so Blender doesn't prompt
+            bpy.data.use_fake_user = False
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        with bpy.context.temp_override(window=window, area=area):
+                            bpy.ops.wm.quit_blender()
+                        return {"success": True}
+        bpy.ops.wm.quit_blender()
+        return {"success": True}
+
+    # ─── Edge operations ─────────────────────────────────────────────────────
+
+    def get_edges(self, name, indices=None, max_edges=5000):
+        """
+        Read edge data: vertex pair, sharpness, crease, and bevel weight.
+        indices: list of edge indices; returns all if None (capped at max_edges).
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+
+        if indices is None:
+            if len(mesh.edges) > max_edges:
+                return {"error": f"Mesh has {len(mesh.edges)} edges — exceeds "
+                                  f"max_edges={max_edges}. Pass specific indices or increase max_edges."}
+
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+
+        crease_layer = bm.edges.layers.float.get("crease_edge")
+        bevel_layer  = bm.edges.layers.float.get("bevel_weight_edge")
+
+        edge_list = (
+            [bm.edges[i] for i in indices if i < len(bm.edges)]
+            if indices is not None
+            else list(bm.edges)
+        )
+
+        out = []
+        for e in edge_list:
+            out.append({
+                "index":        e.index,
+                "vertices":     [e.verts[0].index, e.verts[1].index],
+                "sharp":        not e.smooth,
+                "seam":         e.seam,
+                "crease":       round(e[crease_layer], 6) if crease_layer else 0.0,
+                "bevel_weight": round(e[bevel_layer],  6) if bevel_layer  else 0.0,
+            })
+
+        bm.free()
+        return {
+            "name":        name,
+            "total_edges": len(mesh.edges),
+            "returned":    len(out),
+            "edges":       out,
+        }
+
+    def mark_sharp_edges(self, name, edge_indices, sharp=True):
+        """
+        Mark or unmark edges as sharp.
+        Sharp edges are respected by auto-smooth and the Edge Split modifier.
+        edge_indices: list of edge indices, or "all"
+        sharp: True = hard edge, False = soft edge
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+
+        if edge_indices == "all":
+            edges = list(bm.edges)
+        else:
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+
+        for e in edges:
+            e.smooth = not sharp   # smooth=False means sharp in Blender
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "marked_edges": len(edges), "sharp": sharp}
+
+    def set_edge_crease(self, name, edge_indices, crease):
+        """
+        Set subdivision crease weight on edges (0.0 = no crease, 1.0 = fully sharp crease).
+        Controls how the Subdivision Surface modifier handles edge sharpness.
+        edge_indices: list of edge indices, or "all"
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        crease = max(0.0, min(1.0, float(crease)))
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+
+        crease_layer = bm.edges.layers.float.get("crease_edge") or bm.edges.layers.float.new("crease_edge")
+
+        if edge_indices == "all":
+            edges = list(bm.edges)
+        else:
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+
+        for e in edges:
+            e[crease_layer] = crease
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "updated_edges": len(edges), "crease": crease}
+
+    def set_edge_bevel_weight(self, name, edge_indices, weight):
+        """
+        Set bevel weight on edges (0.0 = no bevel, 1.0 = full bevel).
+        Used with the Bevel modifier when limit_method is set to WEIGHT.
+        edge_indices: list of edge indices, or "all"
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        weight = max(0.0, min(1.0, float(weight)))
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+
+        bevel_layer = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
+
+        if edge_indices == "all":
+            edges = list(bm.edges)
+        else:
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+
+        for e in edges:
+            e[bevel_layer] = weight
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "updated_edges": len(edges), "bevel_weight": weight}
+
+    # ─── Face operations ─────────────────────────────────────────────────────
+
+    def get_faces(self, name, indices=None, world_space=True, max_faces=2000):
+        """
+        Return face data for a mesh object.
+        indices: list of face indices; returns all if None (capped at max_faces)
+        Each face includes: vertex_indices, normal, center, material_index, area
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        mat  = obj.matrix_world
+
+        if indices is not None:
+            out_of_range = [i for i in indices if i >= len(mesh.polygons)]
+            if out_of_range:
+                return {"error": f"Face indices out of range: {out_of_range} "
+                                  f"(mesh has {len(mesh.polygons)} faces)"}
+            polys = [(i, mesh.polygons[i]) for i in indices]
+        else:
+            if len(mesh.polygons) > max_faces:
+                return {"error": f"Mesh has {len(mesh.polygons)} faces — exceeds "
+                                  f"max_faces={max_faces}. Pass specific indices or increase max_faces."}
+            polys = list(enumerate(mesh.polygons))
+
+        faces_out = []
+        for i, poly in polys:
+            if world_space:
+                center = mat @ poly.center
+                normal = (mat.to_3x3().inverted().transposed() @ poly.normal).normalized()
+            else:
+                center = poly.center
+                normal = poly.normal
+
+            faces_out.append({
+                "index":            i,
+                "vertex_indices":   list(poly.vertices),
+                "normal":           [round(v, 6) for v in normal],
+                "center":           [round(v, 6) for v in center],
+                "material_index":   poly.material_index,
+                "area":             round(poly.area, 6),
+                "loop_total":       poly.loop_total,
+            })
+
+        return {
+            "name":         name,
+            "total_faces":  len(mesh.polygons),
+            "returned":     len(faces_out),
+            "world_space":  world_space,
+            "faces":        faces_out,
+        }
+
+    def set_face_material_index(self, name, face_indices, material_index):
+        """
+        Assign a material slot index to specific faces.
+        face_indices: list of face indices, or "all" to affect every face
+        material_index: slot number (material must already be in the object's slot list)
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+        if material_index >= len(obj.material_slots):
+            return {"error": f"Material slot {material_index} does not exist "
+                              f"(object has {len(obj.material_slots)} slots)"}
+
+        mesh = obj.data
+        if face_indices == "all":
+            face_indices = range(len(mesh.polygons))
+
+        updated = 0
+        for i in face_indices:
+            if i < len(mesh.polygons):
+                mesh.polygons[i].material_index = material_index
+                updated += 1
+
+        mesh.update()
+        return {"success": True, "name": name, "updated_faces": updated,
+                "material_slot": material_index}
+
+    def extrude_faces(self, name, face_indices, amount=0.2):
+        """
+        Extrude faces outward along their individual normals.
+        face_indices: list of face indices to extrude
+        amount: extrusion distance (negative = inward)
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+
+        valid = [i for i in face_indices if i < len(bm.faces)]
+        if not valid:
+            bm.free()
+            return {"error": "No valid face indices provided"}
+
+        faces = [bm.faces[i] for i in valid]
+
+        result = _bmesh.ops.extrude_face_region(bm, geom=faces)
+        new_verts = [g for g in result["geom"] if isinstance(g, _bmesh.types.BMVert)]
+
+        # Translate each new vert along its normal
+        for v in new_verts:
+            v.co += v.normal * amount
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "extruded_faces": len(valid), "amount": amount}
+
+    def inset_faces(self, name, face_indices, thickness=0.1, depth=0.0,
+                    use_individual=True):
+        """
+        Inset (shrink inward) faces, creating a border ring of new faces.
+        thickness: inset distance from face edges
+        depth: push inset faces along their normals (0 = flat inset)
+        use_individual: True = inset each face independently
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+
+        valid = [i for i in face_indices if i < len(bm.faces)]
+        if not valid:
+            bm.free()
+            return {"error": "No valid face indices provided"}
+
+        faces = [bm.faces[i] for i in valid]
+
+        if use_individual:
+            _bmesh.ops.inset_individual(bm, faces=faces,
+                                        thickness=thickness, depth=depth,
+                                        use_even_offset=True)
+        else:
+            _bmesh.ops.inset_region(bm, faces=faces,
+                                    thickness=thickness, depth=depth,
+                                    use_even_offset=True)
+
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "inset_faces": len(valid),
+                "thickness": thickness, "depth": depth}
+
+    def flip_normals(self, name, face_indices=None):
+        """
+        Flip the normals of specified faces (or all faces if face_indices is None).
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+
+        if face_indices is None:
+            faces = list(bm.faces)
+        else:
+            faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]
+
+        _bmesh.ops.reverse_faces(bm, faces=faces)
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name, "flipped_faces": len(faces)}
+
+    def merge_vertices(self, name, distance=0.001):
+        """
+        Merge (weld) vertices that are within `distance` of each other.
+        Equivalent to 'Merge by Distance' in Blender.
+        Returns number of vertices removed.
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        before = len(mesh.vertices)
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        _bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=distance)
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        after = len(mesh.vertices)
+        return {"success": True, "name": name,
+                "removed": before - after,
+                "vertices_before": before, "vertices_after": after}
+
+    def triangulate_mesh(self, name, method="BEAUTY"):
+        """
+        Triangulate all faces of a mesh.
+        method: BEAUTY (best quality), FIXED, FIXED_ALTERNATE, SHORTEST_DIAGONAL
+        """
+        import bmesh as _bmesh
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh"}
+
+        mesh = obj.data
+        bm = _bmesh.new()
+        bm.from_mesh(mesh)
+        _bmesh.ops.triangulate(bm, faces=bm.faces, quad_method=method, ngon_method='BEAUTY')
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+
+        return {"success": True, "name": name,
+                "triangles": len(mesh.polygons)}
+
+    def subdivide_mesh(self, name, cuts=1, smoothness=0.0):
+        """Apply a subdivision (loop cuts) to a mesh object."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh object"}
+
+        # Make active and enter edit mode
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.subdivide(number_cuts=cuts, smoothness=smoothness)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        return {"success": True, "name": name, "cuts": cuts,
+                "vertices": len(obj.data.vertices), "faces": len(obj.data.polygons)}
+
+    def apply_modifier(self, name, modifier_name):
+        """Apply a named modifier on an object."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        mod = obj.modifiers.get(modifier_name)
+        if not mod:
+            return {"error": f"Modifier '{modifier_name}' not found on {name}"}
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.modifier_apply(modifier=modifier_name)
+        return {"success": True, "name": name, "applied_modifier": modifier_name}
+
+    def get_mesh_stats(self, name):
+        """Return detailed mesh topology stats for an object."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh object"}
+        mesh = obj.data
+        tri_count = sum(len(p.vertices) - 2 for p in mesh.polygons)
+        return {
+            "name": name,
+            "vertices": len(mesh.vertices),
+            "edges": len(mesh.edges),
+            "polygons": len(mesh.polygons),
+            "triangles": tri_count,
+            "materials": len(obj.material_slots),
+            "modifiers": [m.name for m in obj.modifiers],
+            "bounding_box": self._get_aabb(obj),
+        }
+
+    # ─── Camera management ──────────────────────────────────────────────────
+
+    def create_camera(self, name="Camera", location=None, look_at=None,
+                      lens=50.0, cam_type="PERSP"):
+        """
+        Add a new camera to the scene.
+        location: [x, y, z] (default: [0, -5, 3])
+        look_at: [x, y, z] target point the camera points toward (default: origin)
+        """
+        import math
+        if location is None:
+            location = [0, -5, 3]
+        if look_at is None:
+            look_at = [0, 0, 0]
+
+        cam_data = bpy.data.cameras.new(name=name)
+        cam_data.lens = lens
+        cam_data.type = cam_type
+        cam_obj = bpy.data.objects.new(name, cam_data)
+        bpy.context.scene.collection.objects.link(cam_obj)
+        cam_obj.location = location
+
+        # Point camera toward look_at
+        direction = mathutils.Vector(look_at) - mathutils.Vector(location)
+        rot_quat = direction.to_track_quat('-Z', 'Y')
+        cam_obj.rotation_euler = rot_quat.to_euler()
+
+        return {"success": True, "name": cam_obj.name,
+                "location": list(cam_obj.location),
+                "rotation_deg": [math.degrees(a) for a in cam_obj.rotation_euler]}
+
+    def set_active_camera(self, name):
+        """Set the scene's active render camera."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if obj.type != 'CAMERA':
+            return {"error": f"{name} is not a camera"}
+        bpy.context.scene.camera = obj
+        return {"success": True, "active_camera": name}
+
+    def render_from_camera(self, camera_name=None, filepath=None,
+                           width=1920, height=1080, samples=32):
+        """
+        Render a still from the specified (or current active) camera and save it.
+        """
+        import tempfile
+        if not filepath:
+            filepath = os.path.join(tempfile.gettempdir(),
+                                    f"blender_render_{os.getpid()}.png")
+
+        scene = bpy.context.scene
+        orig_camera = scene.camera
+        orig_res_x = scene.render.resolution_x
+        orig_res_y = scene.render.resolution_y
+        orig_samples = scene.cycles.samples if scene.render.engine == 'CYCLES' else None
+        orig_filepath = scene.render.filepath
+        orig_format = scene.render.image_settings.file_format
+
+        try:
+            if camera_name:
+                cam_obj = bpy.data.objects.get(camera_name)
+                if not cam_obj:
+                    return {"error": f"Camera not found: {camera_name}"}
+                scene.camera = cam_obj
+
+            scene.render.resolution_x = width
+            scene.render.resolution_y = height
+            if scene.render.engine == 'CYCLES' and orig_samples is not None:
+                scene.cycles.samples = samples
+            scene.render.filepath = filepath
+            scene.render.image_settings.file_format = 'PNG'
+            bpy.ops.render.render(write_still=True)
+
+        finally:
+            scene.camera = orig_camera
+            scene.render.resolution_x = orig_res_x
+            scene.render.resolution_y = orig_res_y
+            if orig_samples is not None:
+                scene.cycles.samples = orig_samples
+            scene.render.filepath = orig_filepath
+            scene.render.image_settings.file_format = orig_format
+
+        return {"success": True, "filepath": filepath, "width": width, "height": height}
+
+    def render_all_cameras(self, width=1920, height=1080, samples=32,
+                           output_dir=None, file_format="PNG"):
+        """
+        Render a still from every camera object in the scene.
+        Returns a list of {camera, filepath, success} dicts.
+        """
+        import tempfile
+
+        cameras = [obj for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
+        if not cameras:
+            return {"error": "No camera objects found in the scene"}
+
+        if output_dir is None:
+            output_dir = tempfile.gettempdir()
+
+        scene = bpy.context.scene
+        orig_camera   = scene.camera
+        orig_res_x    = scene.render.resolution_x
+        orig_res_y    = scene.render.resolution_y
+        orig_samples  = scene.cycles.samples if scene.render.engine == 'CYCLES' else None
+        orig_filepath = scene.render.filepath
+        orig_format   = scene.render.image_settings.file_format
+
+        results = []
+
+        try:
+            scene.render.resolution_x = width
+            scene.render.resolution_y = height
+            scene.render.image_settings.file_format = file_format
+            if scene.render.engine == 'CYCLES' and orig_samples is not None:
+                scene.cycles.samples = samples
+
+            for cam in cameras:
+                # Sanitise camera name for use in filename
+                safe_name = "".join(c if c.isalnum() or c in "-_." else "_"
+                                    for c in cam.name)
+                filepath = os.path.join(output_dir,
+                                        f"render_{safe_name}_{os.getpid()}.png")
+                scene.camera = cam
+                scene.render.filepath = filepath
+
+                try:
+                    bpy.ops.render.render(write_still=True)
+                    results.append({
+                        "camera":   cam.name,
+                        "filepath": filepath,
+                        "success":  os.path.exists(filepath),
+                    })
+                except Exception as e:
+                    results.append({
+                        "camera":  cam.name,
+                        "filepath": filepath,
+                        "success": False,
+                        "error":   str(e),
+                    })
+
+        finally:
+            scene.camera                            = orig_camera
+            scene.render.resolution_x               = orig_res_x
+            scene.render.resolution_y               = orig_res_y
+            scene.render.filepath                   = orig_filepath
+            scene.render.image_settings.file_format = orig_format
+            if orig_samples is not None:
+                scene.cycles.samples = orig_samples
+
+        succeeded = [r for r in results if r["success"]]
+        return {
+            "success":       True,
+            "total_cameras": len(cameras),
+            "rendered":      len(succeeded),
+            "renders":       results,
+        }
+
+    # ─── Scene analysis ─────────────────────────────────────────────────────
+
+    def find_objects_by_type(self, obj_type="MESH"):
+        """Return names and locations of all objects matching obj_type."""
+        obj_type = obj_type.upper()
+        results = []
+        for obj in bpy.context.scene.objects:
+            if obj.type == obj_type:
+                results.append({
+                    "name": obj.name,
+                    "location": [round(float(v), 4) for v in obj.location],
+                    "visible": obj.visible_get(),
+                })
+        return {"type": obj_type, "count": len(results), "objects": results}
+
+    def measure_distance(self, name_a, name_b):
+        """Return the Euclidean distance between the origins of two objects."""
+        a = bpy.data.objects.get(name_a)
+        b = bpy.data.objects.get(name_b)
+        if not a:
+            return {"error": f"Object not found: {name_a}"}
+        if not b:
+            return {"error": f"Object not found: {name_b}"}
+        dist = (a.location - b.location).length
+        return {"distance": round(dist, 6), "from": name_a, "to": name_b,
+                "loc_a": list(a.location), "loc_b": list(b.location)}
+
+    # ─── Lighting ───────────────────────────────────────────────────────────
+
+    def add_light(self, light_type="POINT", name=None, location=None,
+                  energy=1000.0, color=None, radius=0.1):
+        """
+        Add a light to the scene.
+        light_type: POINT, SUN, SPOT, AREA
+        """
+        if location is None:
+            location = [0, 0, 5]
+        if color is None:
+            color = [1.0, 1.0, 1.0]
+        if name is None:
+            name = light_type.capitalize() + "Light"
+
+        light_data = bpy.data.lights.new(name=name, type=light_type)
+        light_data.energy = energy
+        light_data.color = color[:3]
+        if hasattr(light_data, 'shadow_soft_size'):
+            light_data.shadow_soft_size = radius
+
+        light_obj = bpy.data.objects.new(name, light_data)
+        bpy.context.scene.collection.objects.link(light_obj)
+        light_obj.location = location
+
+        return {"success": True, "name": light_obj.name, "type": light_type,
+                "location": location, "energy": energy}
+
+    def set_world_background(self, color=None, strength=1.0, hdri_path=None):
+        """
+        Set the world background to a solid colour or an HDRI.
+        color: [r, g, b] for solid colour
+        hdri_path: local file path to .hdr / .exr
+        """
+        world = bpy.context.scene.world
+        if world is None:
+            world = bpy.data.worlds.new("World")
+            bpy.context.scene.world = world
+        world.use_nodes = True
+        tree = world.node_tree
+        tree.nodes.clear()
+
+        bg = tree.nodes.new("ShaderNodeBackground")
+        out = tree.nodes.new("ShaderNodeOutputWorld")
+        tree.links.new(bg.outputs["Background"], out.inputs["Surface"])
+        bg.inputs["Strength"].default_value = strength
+
+        if hdri_path:
+            if not os.path.exists(hdri_path):
+                return {"error": f"HDRI file not found: {hdri_path}"}
+            env_tex = tree.nodes.new("ShaderNodeTexEnvironment")
+            env_tex.image = bpy.data.images.load(hdri_path)
+            mapping = tree.nodes.new("ShaderNodeMapping")
+            tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+            tree.links.new(tex_coord.outputs["Generated"], mapping.inputs["Vector"])
+            tree.links.new(mapping.outputs["Vector"], env_tex.inputs["Vector"])
+            tree.links.new(env_tex.outputs["Color"], bg.inputs["Color"])
+            return {"success": True, "mode": "hdri", "path": hdri_path}
+        else:
+            if color is None:
+                color = [0.05, 0.05, 0.05]
+            bg.inputs["Color"].default_value = (*color[:3], 1.0)
+            return {"success": True, "mode": "color", "color": color}
+
+    def add_3point_lighting(self, subject_name=None, key_energy=1500.0,
+                            fill_energy=500.0, back_energy=800.0):
+        """
+        Add a classic 3-point lighting rig around the subject (or scene origin).
+        Returns names of created lights.
+        """
+        if subject_name:
+            obj = bpy.data.objects.get(subject_name)
+            center = list(obj.location) if obj else [0, 0, 0]
+        else:
+            center = [0, 0, 0]
+
+        cx, cy, cz = center
+        key_loc   = [cx - 3,  cy - 3,  cz + 4]
+        fill_loc  = [cx + 3,  cy - 2,  cz + 2]
+        back_loc  = [cx,      cy + 4,  cz + 3]
+
+        key  = self.add_light("AREA",  "Key_Light",  key_loc,  key_energy,  [1.0, 0.95, 0.9])
+        fill = self.add_light("AREA",  "Fill_Light", fill_loc, fill_energy, [0.9, 0.95, 1.0])
+        back = self.add_light("POINT", "Back_Light", back_loc, back_energy, [1.0, 1.0, 0.95])
+
+        return {"success": True, "lights": [key["name"], fill["name"], back["name"]]}
+
+    # ─── Export / import ────────────────────────────────────────────────────
+
+    def export_object(self, name=None, filepath=None, file_format="glb"):
+        """
+        Export an object (or the entire scene if name is None).
+        file_format: glb, gltf, fbx, obj, stl, ply
+        """
+        import tempfile
+        file_format = file_format.lower()
+        if not filepath:
+            ext = "glb" if file_format == "glb" else file_format
+            filepath = os.path.join(tempfile.gettempdir(),
+                                    f"blender_export_{os.getpid()}.{ext}")
+
+        # Select only the target object if specified
+        if name:
+            obj = bpy.data.objects.get(name)
+            if not obj:
+                return {"error": f"Object not found: {name}"}
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+
+        if file_format in ("glb", "gltf"):
+            bpy.ops.export_scene.gltf(
+                filepath=filepath,
+                export_format="GLB" if file_format == "glb" else "GLTF_SEPARATE",
+                use_selection=(name is not None),
+            )
+        elif file_format == "fbx":
+            bpy.ops.export_scene.fbx(filepath=filepath, use_selection=(name is not None))
+        elif file_format == "obj":
+            bpy.ops.export_scene.obj(filepath=filepath, use_selection=(name is not None))
+        elif file_format == "stl":
+            bpy.ops.export_mesh.stl(filepath=filepath)
+        elif file_format == "ply":
+            bpy.ops.export_mesh.ply(filepath=filepath)
+        else:
+            return {"error": f"Unsupported format: {file_format}"}
+
+        return {"success": True, "filepath": filepath, "format": file_format}
+
+    def import_file(self, filepath):
+        """
+        Import a 3D file. Supports: glb/gltf, fbx, obj, stl, ply, blend.
+        """
+        if not os.path.exists(filepath):
+            return {"error": f"File not found: {filepath}"}
+
+        ext = os.path.splitext(filepath)[1].lower()
+        before = set(bpy.data.objects.keys())
+
+        if ext in (".glb", ".gltf"):
+            bpy.ops.import_scene.gltf(filepath=filepath)
+        elif ext == ".fbx":
+            bpy.ops.import_scene.fbx(filepath=filepath)
+        elif ext == ".obj":
+            bpy.ops.import_scene.obj(filepath=filepath)
+        elif ext == ".stl":
+            bpy.ops.import_mesh.stl(filepath=filepath)
+        elif ext == ".ply":
+            bpy.ops.import_mesh.ply(filepath=filepath)
+        elif ext == ".blend":
+            bpy.ops.wm.append(filepath=filepath)
+        else:
+            return {"error": f"Unsupported file extension: {ext}"}
+
+        after = set(bpy.data.objects.keys())
+        new_objects = list(after - before)
+        return {"success": True, "filepath": filepath, "imported_objects": new_objects}
+
+    def save_blend(self, filepath=None):
+        """
+        Save the current Blender project as a .blend file.
+        If filepath is omitted, saves over the currently open file (or to a temp path
+        if the file has never been saved before).
+        """
+        import tempfile
+        if not filepath:
+            current = bpy.data.filepath
+            if current:
+                filepath = current
+            else:
+                filepath = os.path.join(tempfile.gettempdir(),
+                                        f"blender_unsaved_{os.getpid()}.blend")
+
+        if not filepath.endswith(".blend"):
+            filepath += ".blend"
+
+        bpy.ops.wm.save_as_mainfile(filepath=filepath)
+        return {"success": True, "filepath": filepath}
+
+    def load_blend(self, filepath):
+        """
+        Open a .blend file, replacing the current scene.
+        WARNING: unsaved changes to the current file will be lost.
+        """
+        if not os.path.exists(filepath):
+            return {"error": f"File not found: {filepath}"}
+        if not filepath.lower().endswith(".blend"):
+            return {"error": "load_blend only accepts .blend files. Use import_file for 3D model formats."}
+
+        bpy.ops.wm.open_mainfile(filepath=filepath)
+        # After open, report the new scene state
+        scene = bpy.context.scene
+        return {
+            "success": True,
+            "filepath": filepath,
+            "scene_name": scene.name,
+            "object_count": len(scene.objects),
+        }
+
+    # ─── Primitives & object management ─────────────────────────────────────
+
+    def add_primitive(self, primitive_type="cube", location=None, size=2.0,
+                      name=None, rotation=None):
+        """Add a standard mesh primitive to the scene."""
+        if location is None:
+            location = [0, 0, 0]
+        if rotation is None:
+            rotation = [0, 0, 0]
+
+        ptype = primitive_type.lower()
+        r = size / 2  # convenience radius
+
+        # Find viewport area for context override
+        area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
+
+        def _add(op, **kw):
+            if area:
+                with bpy.context.temp_override(area=area):
+                    op(**kw)
+            else:
+                op(**kw)
+
+        ops = {
+            "cube":       (bpy.ops.mesh.primitive_cube_add,
+                           dict(size=size, location=location, rotation=rotation)),
+            "plane":      (bpy.ops.mesh.primitive_plane_add,
+                           dict(size=size, location=location, rotation=rotation)),
+            "circle":     (bpy.ops.mesh.primitive_circle_add,
+                           dict(radius=r, location=location, rotation=rotation)),
+            "sphere":     (bpy.ops.mesh.primitive_uv_sphere_add,
+                           dict(radius=r, location=location, rotation=rotation)),
+            "ico_sphere": (bpy.ops.mesh.primitive_ico_sphere_add,
+                           dict(radius=r, location=location, rotation=rotation)),
+            "cylinder":   (bpy.ops.mesh.primitive_cylinder_add,
+                           dict(radius=r, depth=size, location=location, rotation=rotation)),
+            "cone":       (bpy.ops.mesh.primitive_cone_add,
+                           dict(radius1=r, radius2=0, depth=size, location=location, rotation=rotation)),
+            "torus":      (bpy.ops.mesh.primitive_torus_add,
+                           dict(major_radius=r, minor_radius=r*0.3, location=location, rotation=rotation)),
+            "monkey":     (bpy.ops.mesh.primitive_monkey_add,
+                           dict(size=size, location=location, rotation=rotation)),
+        }
+
+        if ptype not in ops:
+            return {"error": f"Unknown primitive '{ptype}'. Choose from: {list(ops.keys())}"}
+
+        op_fn, kw = ops[ptype]
+        _add(op_fn, **kw)
+
+        obj = bpy.context.active_object
+        if name and obj:
+            obj.name = name
+            if obj.data:
+                obj.data.name = name
+
+        return {"success": True, "name": obj.name if obj else "?",
+                "type": ptype, "location": list(obj.location) if obj else location}
+
+    def delete_object(self, name):
+        """Delete an object and purge orphaned mesh/material data."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        bpy.data.objects.remove(obj, do_unlink=True)
+        # Purge orphaned datablocks so mesh/material memory is freed
+        for _ in range(3):
+            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=False, do_recursive=True)
+        return {"success": True, "deleted": name}
+
+    def duplicate_object(self, name, new_name=None, offset=None, linked=False):
+        """
+        Duplicate an object.
+        linked=True shares mesh data (instance); linked=False is a full independent copy.
+        offset: [x, y, z] displacement from original (default [0.5, 0.5, 0])
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        if offset is None:
+            offset = [0.5, 0.5, 0.0]
+
+        new_obj = obj.copy()
+        new_obj.data = obj.data if linked else (obj.data.copy() if obj.data else None)
+        new_obj.location = (obj.location.x + offset[0],
+                            obj.location.y + offset[1],
+                            obj.location.z + offset[2])
+        if new_name:
+            new_obj.name = new_name
+        bpy.context.scene.collection.objects.link(new_obj)
+        return {"success": True, "original": name, "duplicate": new_obj.name,
+                "location": list(new_obj.location), "linked": linked}
+
+    def join_objects(self, names, result_name=None):
+        """Join multiple objects into the first one in the list."""
+        objects = []
+        for n in names:
+            o = bpy.data.objects.get(n)
+            if not o:
+                return {"error": f"Object not found: {n}"}
+            objects.append(o)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in objects:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = objects[0]
+        bpy.ops.object.join()
+
+        result = bpy.context.active_object
+        if result_name and result:
+            result.name = result_name
+        return {"success": True, "result": result.name if result else "?",
+                "merged_count": len(objects)}
+
+    def separate_mesh(self, name, method="LOOSE"):
+        """Separate a mesh by LOOSE parts, MATERIAL, or SELECTED faces."""
+        obj = bpy.data.objects.get(name)
+        if not obj or obj.type != 'MESH':
+            return {"error": f"Mesh object not found: {name}"}
+
+        before = set(bpy.data.objects.keys())
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.separate(type=method)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        after = set(bpy.data.objects.keys())
+        new_objs = list(after - before)
+        return {"success": True, "method": method, "new_objects": new_objs}
+
+    def rename_object(self, old_name, new_name):
+        """Rename an object and its mesh data."""
+        obj = bpy.data.objects.get(old_name)
+        if not obj:
+            return {"error": f"Object not found: {old_name}"}
+        obj.name = new_name
+        if obj.data:
+            obj.data.name = new_name
+        return {"success": True, "old_name": old_name, "new_name": obj.name}
+
+    def set_origin(self, name, origin_type="ORIGIN_GEOMETRY"):
+        """
+        Set the object origin.
+        origin_type: ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS,
+                     ORIGIN_CENTER_OF_VOLUME
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
+        return {"success": True, "name": name, "origin_type": origin_type,
+                "new_location": list(obj.location)}
+
+    def snap_to_ground(self, name, ground_z=0.0):
+        """Translate an object so its lowest bounding-box point sits at ground_z."""
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+        bbox_world = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+        min_z = min(v.z for v in bbox_world)
+        obj.location.z += (ground_z - min_z)
+        return {"success": True, "name": name, "location_z": round(obj.location.z, 6)}
+
+    def set_smooth_shading(self, name, smooth=True, auto_smooth=True, angle=30.0):
+        """Toggle smooth/flat shading and optionally enable auto-smooth."""
+        import math
+        obj = bpy.data.objects.get(name)
+        if not obj or obj.type != 'MESH':
+            return {"error": f"Mesh object not found: {name}"}
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        if smooth:
+            bpy.ops.object.shade_smooth()
+            if auto_smooth and hasattr(obj.data, 'use_auto_smooth'):
+                obj.data.use_auto_smooth = True
+                obj.data.auto_smooth_angle = math.radians(angle)
+        else:
+            bpy.ops.object.shade_flat()
+        return {"success": True, "name": name, "smooth": smooth, "auto_smooth_angle": angle}
+
+    def parent_object(self, child_name, parent_name, keep_transform=True):
+        """Parent child_name to parent_name, optionally preserving world transform."""
+        child = bpy.data.objects.get(child_name)
+        parent = bpy.data.objects.get(parent_name)
+        if not child:
+            return {"error": f"Child object not found: {child_name}"}
+        if not parent:
+            return {"error": f"Parent object not found: {parent_name}"}
+
+        orig_matrix = child.matrix_world.copy() if keep_transform else None
+        child.parent = parent
+        child.matrix_parent_inverse = parent.matrix_world.inverted()
+        if keep_transform and orig_matrix:
+            child.matrix_world = orig_matrix
+        return {"success": True, "child": child_name, "parent": parent_name}
+
+    def select_objects(self, names=None, action="SELECT", obj_type=None):
+        """
+        Select/deselect objects by name list and/or type filter.
+        action: SELECT, DESELECT, TOGGLE
+        obj_type: if given and names is None, selects all objects of that type
+        """
+        if names is None and obj_type is None:
+            bpy.ops.object.select_all(action=action)
+            return {"success": True, "action": action,
+                    "selected_count": len(bpy.context.selected_objects)}
+
+        if names is None:
+            names = [o.name for o in bpy.context.scene.objects
+                     if o.type == obj_type.upper()]
+
+        for n in names:
+            o = bpy.data.objects.get(n)
+            if o:
+                if action == "SELECT":
+                    o.select_set(True)
+                elif action == "DESELECT":
+                    o.select_set(False)
+                elif action == "TOGGLE":
+                    o.select_set(not o.select_get())
+
+        return {"success": True, "action": action, "names": names}
+
+    def align_objects(self, names, axis="X", align_to="FIRST"):
+        """
+        Align objects' origins on one axis.
+        align_to: FIRST, LAST, MIN, MAX, AVERAGE
+        """
+        objects = []
+        for n in names:
+            o = bpy.data.objects.get(n)
+            if not o:
+                return {"error": f"Object not found: {n}"}
+            objects.append(o)
+
+        ax = {"X": 0, "Y": 1, "Z": 2}.get(axis.upper(), 0)
+        locs = [o.location[ax] for o in objects]
+
+        target = {
+            "FIRST":   locs[0],
+            "LAST":    locs[-1],
+            "MIN":     min(locs),
+            "MAX":     max(locs),
+            "AVERAGE": sum(locs) / len(locs),
+        }.get(align_to.upper())
+
+        if target is None:
+            return {"error": f"Unknown align_to '{align_to}'."}
+
+        for o in objects:
+            loc = list(o.location)
+            loc[ax] = target
+            o.location = loc
+
+        return {"success": True, "axis": axis, "align_to": align_to,
+                "value": target, "names": names}
+
+    # ─── Materials ───────────────────────────────────────────────────────────
+
+    def create_material(self, name, base_color=None, metallic=0.0, roughness=0.5,
+                        emission_color=None, emission_strength=0.0, alpha=1.0,
+                        assign_to=None):
+        """
+        Create or replace a PBR material with Principled BSDF.
+        base_color: [r, g, b]  (default [0.8, 0.8, 0.8])
+        emission_color: [r, g, b] (optional, enables emission)
+        assign_to: object name to assign the material to (slot 0)
+        """
+        if base_color is None:
+            base_color = [0.8, 0.8, 0.8]
+
+        mat = bpy.data.materials.get(name) or bpy.data.materials.new(name=name)
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+        out  = nodes.new("ShaderNodeOutputMaterial")
+        out.location = (300, 0)
+        links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+        bsdf.inputs["Base Color"].default_value   = (*base_color[:3], 1.0)
+        bsdf.inputs["Metallic"].default_value     = metallic
+        bsdf.inputs["Roughness"].default_value    = roughness
+        bsdf.inputs["Alpha"].default_value        = alpha
+
+        if alpha < 1.0:
+            mat.blend_method = 'BLEND'
+            mat.shadow_method = 'CLIP'
+
+        if emission_color:
+            # Blender 4.x uses "Emission Color" input; earlier uses separate "Emission"
+            em_input = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+            if em_input:
+                em_input.default_value = (*emission_color[:3], 1.0)
+            es_input = bsdf.inputs.get("Emission Strength")
+            if es_input:
+                es_input.default_value = emission_strength
+
+        if assign_to:
+            obj = bpy.data.objects.get(assign_to)
+            if obj:
+                if not obj.data.materials:
+                    obj.data.materials.append(mat)
+                else:
+                    obj.data.materials[0] = mat
+
+        return {"success": True, "material": mat.name}
+
+    def assign_material(self, object_name, material_name, slot=0):
+        """Assign an existing material to an object's material slot."""
+        obj = bpy.data.objects.get(object_name)
+        if not obj:
+            return {"error": f"Object not found: {object_name}"}
+        mat = bpy.data.materials.get(material_name)
+        if not mat:
+            return {"error": f"Material not found: {material_name}"}
+
+        while len(obj.data.materials) <= slot:
+            obj.data.materials.append(None)
+        obj.data.materials[slot] = mat
+        return {"success": True, "object": object_name, "material": material_name, "slot": slot}
+
+    def load_texture(self, material_name, image_path, texture_slot="Base Color",
+                     uv_scale=1.0):
+        """
+        Load an image file and connect it to a texture slot of a material.
+        texture_slot: 'Base Color', 'Roughness', 'Metallic', 'Normal', 'Emission Color'
+        For 'Normal', a Normal Map node is inserted automatically.
+        """
+        mat = bpy.data.materials.get(material_name)
+        if not mat:
+            return {"error": f"Material not found: {material_name}"}
+        if not os.path.exists(image_path):
+            return {"error": f"Image not found: {image_path}"}
+
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if not bsdf:
+            return {"error": "No Principled BSDF node found in material"}
+
+        # Load or reuse image
+        img = bpy.data.images.get(os.path.basename(image_path))
+        if img is None:
+            img = bpy.data.images.load(image_path)
+
+        # TexCoord → Mapping → Image Texture
+        tc  = nodes.new("ShaderNodeTexCoord")
+        mp  = nodes.new("ShaderNodeMapping")
+        tex = nodes.new("ShaderNodeTexImage")
+        tc.location  = (-800, 0)
+        mp.location  = (-600, 0)
+        tex.location = (-300, 0)
+        tex.image    = img
+
+        if uv_scale != 1.0:
+            mp.inputs["Scale"].default_value = (uv_scale, uv_scale, uv_scale)
+
+        links.new(tc.outputs["UV"],    mp.inputs["Vector"])
+        links.new(mp.outputs["Vector"], tex.inputs["Vector"])
+
+        if texture_slot == "Normal":
+            nm = nodes.new("ShaderNodeNormalMap")
+            nm.location = (-100, -200)
+            links.new(tex.outputs["Color"], nm.inputs["Color"])
+            links.new(nm.outputs["Normal"], bsdf.inputs["Normal"])
+            img.colorspace_settings.name = 'Non-Color'
+        else:
+            target = bsdf.inputs.get(texture_slot)
+            if not target:
+                return {"error": f"Input '{texture_slot}' not found on Principled BSDF"}
+            links.new(tex.outputs["Color"], target)
+            if texture_slot in ("Roughness", "Metallic"):
+                img.colorspace_settings.name = 'Non-Color'
+
+        return {"success": True, "material": material_name, "texture_slot": texture_slot,
+                "image": os.path.basename(image_path)}
+
+    # ─── Modifiers ───────────────────────────────────────────────────────────
+
+    def add_modifier_ext(self, name, modifier_type, modifier_name=None, **kwargs):
+        """
+        Add a modifier to an object.
+        modifier_type: MIRROR, BEVEL, ARRAY, SOLIDIFY, SUBSURF, BOOLEAN,
+                       DECIMATE, DISPLACE, SHRINKWRAP, WIREFRAME, SKIN, etc.
+        kwargs: any modifier property name → value pair.
+        Common examples:
+          MIRROR:   use_axis=[True,True,False], use_clip=True
+          BEVEL:    width=0.1, segments=3, limit_method='ANGLE', angle_limit=0.523
+          ARRAY:    count=3, use_relative_offset=True, relative_offset_displace=[1,0,0]
+          SOLIDIFY: thickness=0.05
+          SUBSURF:  levels=2, render_levels=3
+        """
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+
+        if modifier_name is None:
+            modifier_name = modifier_type.replace("_", " ").title()
+
+        mod = obj.modifiers.new(name=modifier_name, type=modifier_type)
+
+        for k, v in kwargs.items():
+            try:
+                if hasattr(mod, k):
+                    setattr(mod, k, v)
+            except Exception as ex:
+                print(f"[addon] add_modifier_ext: could not set {k}={v}: {ex}")
+
+        return {"success": True, "object": name, "modifier": mod.name, "type": modifier_type}
+
+    def boolean_operation(self, target_name, cutter_name,
+                          operation="DIFFERENCE", solver="EXACT", apply=True):
+        """
+        Apply a boolean modifier on target_name using cutter_name.
+        operation: DIFFERENCE, UNION, INTERSECT
+        solver: EXACT (better quality), FAST (faster, less reliable)
+        apply: if True, applies the modifier and removes the cutter object
+        """
+        target = bpy.data.objects.get(target_name)
+        cutter = bpy.data.objects.get(cutter_name)
+        if not target:
+            return {"error": f"Target not found: {target_name}"}
+        if not cutter:
+            return {"error": f"Cutter not found: {cutter_name}"}
+
+        mod = target.modifiers.new(name="Boolean", type="BOOLEAN")
+        mod.operation = operation
+        mod.object    = cutter
+        if hasattr(mod, 'solver'):
+            mod.solver = solver
+
+        if apply:
+            bpy.context.view_layer.objects.active = target
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+            bpy.data.objects.remove(cutter, do_unlink=True)
+
+        return {"success": True, "target": target_name, "cutter": cutter_name,
+                "operation": operation, "applied": apply}
+
+    # ─── Render settings ─────────────────────────────────────────────────────
+
+    def set_render_settings(self, engine=None, width=None, height=None,
+                            samples=None, output_path=None, file_format=None,
+                            transparent_background=None):
+        """
+        Configure scene render settings.
+        engine: CYCLES, BLENDER_EEVEE, BLENDER_WORKBENCH
+        file_format: PNG, JPEG, EXR, TIFF
+        """
+        scene = bpy.context.scene
+        if engine:
+            # Normalise legacy name: BLENDER_EEVEE was renamed to BLENDER_EEVEE_NEXT in Blender 4.x
+            engine_upper = engine.upper()
+            if engine_upper == 'BLENDER_EEVEE' and bpy.app.version >= (4, 0, 0):
+                engine_upper = 'BLENDER_EEVEE_NEXT'
+            scene.render.engine = engine_upper
+        if width:
+            scene.render.resolution_x = int(width)
+        if height:
+            scene.render.resolution_y = int(height)
+        if output_path:
+            scene.render.filepath = output_path
+        if file_format:
+            scene.render.image_settings.file_format = file_format.upper()
+        if transparent_background is not None:
+            scene.render.film_transparent = bool(transparent_background)
+
+        if samples is not None:
+            if scene.render.engine == 'CYCLES':
+                scene.cycles.samples = int(samples)
+            elif scene.render.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):
+                if hasattr(scene, 'eevee'):
+                    scene.eevee.taa_render_samples = int(samples)
+
+        return {
+            "success": True,
+            "engine": scene.render.engine,
+            "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            "output": scene.render.filepath,
+            "transparent": scene.render.film_transparent,
+        }
+
+    # ─── Animation ───────────────────────────────────────────────────────────
+
+    def add_keyframe(self, name, data_path="location", frame=None, value=None):
+        """
+        Insert a keyframe on an object property.
+        data_path: 'location', 'rotation_euler', 'scale', or any animatable path
+        frame: frame number (defaults to current scene frame)
+        value: if given, sets the property to this value before keying.
+               For location/rotation/scale pass [x, y, z]; for single values pass a number.
+        """
+        import math
+        obj = bpy.data.objects.get(name)
+        if not obj:
+            return {"error": f"Object not found: {name}"}
+
+        scene = bpy.context.scene
+        if frame is not None:
+            scene.frame_set(int(frame))
+
+        if value is not None:
+            if data_path == "rotation_euler" and isinstance(value, list):
+                value = [math.radians(v) for v in value]
+            try:
+                prop = obj.path_resolve(data_path)
+                if hasattr(prop, '__setitem__'):
+                    for i, v in enumerate(value):
+                        prop[i] = v
+                else:
+                    setattr(obj, data_path, value)
+            except Exception as e:
+                return {"error": f"Could not set {data_path}: {e}"}
+
+        obj.keyframe_insert(data_path=data_path, frame=scene.frame_current)
+        return {"success": True, "name": name, "data_path": data_path,
+                "frame": scene.frame_current}
+
+    def set_frame(self, frame):
+        """Set the current scene frame."""
+        bpy.context.scene.frame_set(int(frame))
+        return {"success": True, "frame": bpy.context.scene.frame_current}
+
+    # ─── Collections ─────────────────────────────────────────────────────────
+
+    def create_collection(self, name, parent_collection=None):
+        """Create a new collection and link it to the scene (or a parent collection)."""
+        col = bpy.data.collections.get(name)
+        if col is None:
+            col = bpy.data.collections.new(name)
+
+        if parent_collection:
+            parent = bpy.data.collections.get(parent_collection)
+            if not parent:
+                return {"error": f"Parent collection not found: {parent_collection}"}
+            if col.name not in parent.children:
+                parent.children.link(col)
+        else:
+            scene_cols = [c.name for c in bpy.context.scene.collection.children]
+            if col.name not in scene_cols:
+                bpy.context.scene.collection.children.link(col)
+
+        return {"success": True, "collection": col.name}
+
+    def move_to_collection(self, object_names, collection_name):
+        """Move objects into a collection (removes them from all other collections)."""
+        if isinstance(object_names, str):
+            object_names = [object_names]
+
+        col = bpy.data.collections.get(collection_name)
+        if col is None:
+            return {"error": f"Collection not found: '{collection_name}'. "
+                             "Create it first with create_collection."}
+
+        moved = []
+        for n in object_names:
+            obj = bpy.data.objects.get(n)
+            if not obj:
+                return {"error": f"Object not found: {n}"}
+            # Unlink from all current collections
+            for c in list(obj.users_collection):
+                c.objects.unlink(obj)
+            col.objects.link(obj)
+            moved.append(n)
+
+        return {"success": True, "collection": collection_name, "moved": moved}
+
+    # ─── PolyHaven handlers (begin) ──────────────────────────────────────────
 
     def get_polyhaven_categories(self, asset_type):
         """Get categories for a specific asset type from Polyhaven"""
@@ -2596,9 +4605,30 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
+    # Auto-restart the server if it was running before the reload.
+    if _restart_server_on_register:
+        def _deferred_start():
+            try:
+                port = bpy.context.scene.blendermcp_port
+                if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
+                    bpy.types.blendermcp_server = BlenderMCPServer(port=port)
+                bpy.types.blendermcp_server.start()
+                bpy.context.scene.blendermcp_server_running = True
+                print(f"BlenderMCP server auto-restarted on port {port}")
+            except Exception as e:
+                print(f"BlenderMCP auto-restart failed: {e}")
+        bpy.app.timers.register(_deferred_start, first_interval=0.5)
+
     print("BlenderMCP addon registered")
 
 def unregister():
+    global _restart_server_on_register
+    # Remember whether the server was running so register() can restart it.
+    _restart_server_on_register = (
+        hasattr(bpy.types, "blendermcp_server")
+        and bpy.types.blendermcp_server is not None
+        and getattr(bpy.context.scene, "blendermcp_server_running", False)
+    )
     # Stop the server if it's running
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()

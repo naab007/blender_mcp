@@ -13,9 +13,6 @@ from pathlib import Path
 import base64
 from urllib.parse import urlparse
 
-# Import telemetry
-from .telemetry import record_startup, get_telemetry
-from .telemetry_decorator import telemetry_tool
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -178,11 +175,6 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Just log that we're starting up
         logger.info("BlenderMCP server starting up")
 
-        # Record startup event for telemetry
-        try:
-            record_startup()
-        except Exception as e:
-            logger.debug(f"Failed to record startup telemetry: {e}")
 
         # Try to connect to Blender on startup to verify it's available
         try:
@@ -215,6 +207,9 @@ mcp = FastMCP(
 # Global connection for resources (since resources can't access context)
 _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
+
+# Managed Blender process (started via start_blender tool)
+_blender_process = None
 
 def get_blender_connection():
     """Get or create a persistent Blender connection"""
@@ -251,7 +246,6 @@ def get_blender_connection():
     return _blender_connection
 
 
-@telemetry_tool("get_scene_info")
 @mcp.tool()
 def get_scene_info(ctx: Context) -> str:
     """Get detailed information about the current Blender scene"""
@@ -265,7 +259,6 @@ def get_scene_info(ctx: Context) -> str:
         logger.error(f"Error getting scene info from Blender: {str(e)}")
         return f"Error getting scene info: {str(e)}"
 
-@telemetry_tool("get_object_info")
 @mcp.tool()
 def get_object_info(ctx: Context, object_name: str) -> str:
     """
@@ -284,7 +277,6 @@ def get_object_info(ctx: Context, object_name: str) -> str:
         logger.error(f"Error getting object info from Blender: {str(e)}")
         return f"Error getting object info: {str(e)}"
 
-@telemetry_tool("get_viewport_screenshot")
 @mcp.tool()
 def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     """
@@ -328,7 +320,6 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
         raise Exception(f"Screenshot failed: {str(e)}")
 
 
-@telemetry_tool("execute_blender_code")
 @mcp.tool()
 def execute_blender_code(ctx: Context, code: str) -> str:
     """
@@ -346,7 +337,6 @@ def execute_blender_code(ctx: Context, code: str) -> str:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
 
-@telemetry_tool("get_polyhaven_categories")
 @mcp.tool()
 def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
     """
@@ -379,7 +369,6 @@ def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
         logger.error(f"Error getting Polyhaven categories: {str(e)}")
         return f"Error getting Polyhaven categories: {str(e)}"
 
-@telemetry_tool("search_polyhaven_assets")
 @mcp.tool()
 def search_polyhaven_assets(
     ctx: Context,
@@ -429,7 +418,6 @@ def search_polyhaven_assets(
         logger.error(f"Error searching Polyhaven assets: {str(e)}")
         return f"Error searching Polyhaven assets: {str(e)}"
 
-@telemetry_tool("download_polyhaven_asset")
 @mcp.tool()
 def download_polyhaven_asset(
     ctx: Context,
@@ -481,7 +469,6 @@ def download_polyhaven_asset(
         logger.error(f"Error downloading Polyhaven asset: {str(e)}")
         return f"Error downloading Polyhaven asset: {str(e)}"
 
-@telemetry_tool("set_texture")
 @mcp.tool()
 def set_texture(
     ctx: Context,
@@ -541,7 +528,6 @@ def set_texture(
         logger.error(f"Error applying texture: {str(e)}")
         return f"Error applying texture: {str(e)}"
 
-@telemetry_tool("get_polyhaven_status")
 @mcp.tool()
 def get_polyhaven_status(ctx: Context) -> str:
     """
@@ -560,7 +546,6 @@ def get_polyhaven_status(ctx: Context) -> str:
         logger.error(f"Error checking PolyHaven status: {str(e)}")
         return f"Error checking PolyHaven status: {str(e)}"
 
-@telemetry_tool("get_hyper3d_status")
 @mcp.tool()
 def get_hyper3d_status(ctx: Context) -> str:
     """
@@ -581,7 +566,6 @@ def get_hyper3d_status(ctx: Context) -> str:
         logger.error(f"Error checking Hyper3D status: {str(e)}")
         return f"Error checking Hyper3D status: {str(e)}"
 
-@telemetry_tool("get_sketchfab_status")
 @mcp.tool()
 def get_sketchfab_status(ctx: Context) -> str:
     """
@@ -600,7 +584,6 @@ def get_sketchfab_status(ctx: Context) -> str:
         logger.error(f"Error checking Sketchfab status: {str(e)}")
         return f"Error checking Sketchfab status: {str(e)}"
 
-@telemetry_tool("search_sketchfab_models")
 @mcp.tool()
 def search_sketchfab_models(
     ctx: Context,
@@ -677,7 +660,6 @@ def search_sketchfab_models(
         logger.error(traceback.format_exc())
         return f"Error searching Sketchfab models: {str(e)}"
 
-@telemetry_tool("download_sketchfab_model")
 @mcp.tool()
 def get_sketchfab_model_preview(
     ctx: Context,
@@ -802,7 +784,6 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
         raise ValueError("Incorrect number range: bbox must be bigger than zero!")
     return [int(float(i) / max(original_bbox) * 100) for i in original_bbox] if original_bbox else None
 
-@telemetry_tool("generate_hyper3d_model_via_text")
 @mcp.tool()
 def generate_hyper3d_model_via_text(
     ctx: Context,
@@ -839,7 +820,6 @@ def generate_hyper3d_model_via_text(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("generate_hyper3d_model_via_images")
 @mcp.tool()
 def generate_hyper3d_model_via_images(
     ctx: Context,
@@ -896,7 +876,6 @@ def generate_hyper3d_model_via_images(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("poll_rodin_job_status")
 @mcp.tool()
 def poll_rodin_job_status(
     ctx: Context,
@@ -940,7 +919,6 @@ def poll_rodin_job_status(
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
 
-@telemetry_tool("import_generated_asset")
 @mcp.tool()
 def import_generated_asset(
     ctx: Context,
@@ -1084,6 +1062,2332 @@ def import_generated_asset_hunyuan(
     except Exception as e:
         logger.error(f"Error generating Hunyuan3D task: {str(e)}")
         return f"Error generating Hunyuan3D task: {str(e)}"
+
+
+# ─── Blender process management ──────────────────────────────────────────────
+
+import glob as _glob
+import shutil as _shutil
+
+
+def _find_blender_exe(hint: str = None) -> str | None:
+    """Locate the Blender executable, checking in priority order."""
+    # 1. Explicit hint or env var
+    for candidate in filter(None, [hint, os.environ.get("BLENDER_EXE")]):
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 2. PATH
+    found = _shutil.which("blender") or _shutil.which("blender.exe")
+    if found:
+        return found
+
+    # 3. Windows default install locations (newest version wins)
+    win_patterns = [
+        r"C:\Program Files\Blender Foundation\Blender *\blender.exe",
+        r"C:\Program Files (x86)\Blender Foundation\Blender *\blender.exe",
+        r"C:\Program Files\Blender Foundation\blender.exe",
+    ]
+    matches = []
+    for pat in win_patterns:
+        matches.extend(_glob.glob(pat))
+    if matches:
+        return sorted(matches)[-1]   # highest version string sorts last
+
+    # 4. Steam (Windows)
+    steam = r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe"
+    if os.path.isfile(steam):
+        return steam
+
+    # 5. macOS .app bundle
+    mac_paths = [
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+        "/Applications/Blender/blender.app/Contents/MacOS/Blender",
+    ]
+    for p in mac_paths:
+        if os.path.isfile(p):
+            return p
+
+    return None
+
+
+@mcp.tool()
+def start_blender(
+    ctx: Context,
+    blend_file: str = None,
+    blender_exe: str = None,
+    background: bool = False,
+    wait_for_addon: bool = True,
+    python_expr: str = None,
+) -> str:
+    """
+    Launch Blender as a managed subprocess.
+
+    Parameters:
+    - blend_file: Path to a .blend file to open on startup (optional)
+    - blender_exe: Full path to the Blender executable. Auto-detected if omitted
+                   (checks BLENDER_EXE env var, PATH, then common install locations).
+    - background: True = headless mode (--background), no UI. Useful for rendering.
+    - wait_for_addon: Wait up to 30 s for the BlenderMCP addon socket to become
+                      reachable on port 9876 (default True). Set False for background
+                      jobs that don't use the addon.
+    - python_expr: Optional Python expression passed to Blender via --python-expr,
+                   e.g. "import bpy; bpy.ops.wm.quit_blender()" for scripted batch runs.
+    """
+    global _blender_process, _blender_connection
+
+    if _blender_process is not None and _blender_process.poll() is None:
+        return f"Blender is already running (pid {_blender_process.pid}). Call close_blender() first."
+
+    exe = _find_blender_exe(blender_exe)
+    if not exe:
+        return (
+            "Could not find the Blender executable. "
+            "Set the BLENDER_EXE environment variable to the full path, "
+            "or pass blender_exe='/path/to/blender'."
+        )
+
+    cmd = [exe]
+    if background:
+        cmd.append("--background")
+    if blend_file:
+        if not os.path.exists(blend_file):
+            return f"Blend file not found: {blend_file}"
+        cmd.append(blend_file)
+    if python_expr:
+        cmd += ["--python-expr", python_expr]
+
+    try:
+        _blender_process = _subprocess.Popen(
+            cmd,
+            stdout=_subprocess.DEVNULL if background else None,
+            stderr=_subprocess.DEVNULL if background else None,
+        )
+        logger.info(f"Blender started: pid={_blender_process.pid}  cmd={cmd}")
+    except Exception as e:
+        return f"Failed to launch Blender: {e}"
+
+    # Reset any stale connection so get_blender_connection() reconnects fresh
+    if _blender_connection:
+        try:
+            _blender_connection.disconnect()
+        except Exception:
+            pass
+        _blender_connection = None
+
+    if not wait_for_addon or background:
+        return (
+            f"Blender launched (pid {_blender_process.pid})."
+            + (" Waiting for addon skipped (background mode)." if background else
+               " Not waiting for addon (wait_for_addon=False).")
+        )
+
+    # Poll port 9876 until the addon TCP server is up
+    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    for _ in range(60):   # 30 s total
+        _time.sleep(0.5)
+        if _blender_process.poll() is not None:
+            return f"Blender exited unexpectedly (code {_blender_process.returncode})"
+        try:
+            test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test.settimeout(0.5)
+            test.connect((host, port))
+            test.close()
+            return (
+                f"Blender started (pid {_blender_process.pid}) and addon is ready on port {port}."
+                + (f" Opened: {blend_file}" if blend_file else "")
+            )
+        except (ConnectionRefusedError, OSError):
+            pass
+
+    return (
+        f"Blender launched (pid {_blender_process.pid}) but the MCP addon did not respond "
+        f"on port {port} within 30 s. Make sure the BlenderMCP addon is installed and enabled "
+        "in Blender Preferences → Add-ons."
+    )
+
+
+@mcp.tool()
+def close_blender(
+    ctx: Context,
+    force: bool = False,
+) -> str:
+    """
+    Close the Blender instance that was started with start_blender().
+
+    Parameters:
+    - force: If True, kills the process immediately instead of asking Blender
+             to quit gracefully via its Python API (default False).
+    """
+    global _blender_process, _blender_connection
+
+    pid = _blender_process.pid if _blender_process else None
+
+    # Graceful path: ask Blender to quit via the addon socket
+    if not force and _blender_connection:
+        try:
+            _blender_connection.send_command("quit_blender", {"save_prompt": False})
+            # Give it 3 s to actually close
+            if _blender_process:
+                try:
+                    _blender_process.wait(timeout=3)
+                except _subprocess.TimeoutExpired:
+                    pass
+        except Exception:
+            pass   # socket gone = Blender already closing
+
+    # Also disconnect on our side
+    if _blender_connection:
+        try:
+            _blender_connection.disconnect()
+        except Exception:
+            pass
+        _blender_connection = None
+
+    # Ensure the process is gone
+    if _blender_process is not None:
+        if _blender_process.poll() is None:
+            try:
+                _blender_process.terminate()
+                _blender_process.wait(timeout=5)
+            except _subprocess.TimeoutExpired:
+                _blender_process.kill()
+        _blender_process = None
+
+    return f"Blender closed." + (f" (pid was {pid})" if pid else "")
+
+
+@mcp.tool()
+def get_blender_status(ctx: Context) -> str:
+    """
+    Report whether Blender is running, and whether the MCP addon is reachable.
+    """
+    global _blender_process
+
+    proc_status = "not started via MCP"
+    if _blender_process is not None:
+        code = _blender_process.poll()
+        if code is None:
+            proc_status = f"running (pid {_blender_process.pid})"
+        else:
+            proc_status = f"exited (code {code})"
+
+    # Try to ping the addon socket
+    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    try:
+        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test.settimeout(1.0)
+        test.connect((host, port))
+        test.close()
+        addon_status = f"reachable on {host}:{port}"
+    except (ConnectionRefusedError, OSError):
+        addon_status = f"not reachable on {host}:{port}"
+
+    return f"Process: {proc_status}\nAddon socket: {addon_status}"
+
+
+# ─── Extended tools ──────────────────────────────────────────────────────────
+
+# Optional PIL for contact-sheet compositing (server-side only)
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+# Subprocess management for the local image-to-3D server
+import subprocess as _subprocess
+import time as _time
+import requests as _requests
+
+_img_to_3d_process = None
+_IMG_TO_3D_PORT = 7862
+_IMG_TO_3D_URL = f"http://127.0.0.1:{_IMG_TO_3D_PORT}"
+
+
+# ─── Multi-angle capture ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def capture_viewport_angle(
+    ctx: Context,
+    angle: str = "front",
+    max_size: int = 800,
+) -> Image:
+    """
+    Capture the Blender 3D viewport from a named angle and return it as an image.
+
+    Parameters:
+    - angle: View direction. One of: front, back, left, right, top, bottom,
+             iso_front_right, iso_front_left
+    - max_size: Maximum pixel dimension (default 800)
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_angle_{angle}_{os.getpid()}.png")
+        result = blender.send_command("capture_viewport_angle", {
+            "angle": angle,
+            "max_size": max_size,
+            "filepath": temp_path,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        os.remove(temp_path)
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"capture_viewport_angle error: {e}")
+        raise Exception(f"capture_viewport_angle failed: {e}")
+
+
+@mcp.tool()
+def capture_contact_sheet(
+    ctx: Context,
+    angles: str = "front,right,top,iso_front_right",
+    max_size: int = 512,
+) -> Image:
+    """
+    Capture multiple viewport angles and stitch them into a single contact sheet image.
+
+    Parameters:
+    - angles: Comma-separated list of angle names (default: front,right,top,iso_front_right)
+    - max_size: Pixel size for each individual tile (default 512)
+
+    Returns a single composited image with all requested angles labelled.
+    """
+    try:
+        blender = get_blender_connection()
+        angle_list = [a.strip() for a in angles.split(",") if a.strip()]
+        result = blender.send_command("capture_contact_sheet", {
+            "angles": angle_list,
+            "max_size": max_size,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+
+        images_info = result.get("images", {})
+
+        # If PIL is available, composite into a grid
+        if _PIL_AVAILABLE:
+            tiles = []
+            for angle in angle_list:
+                info = images_info.get(angle, {})
+                fp = info.get("filepath")
+                if fp and os.path.exists(fp):
+                    tile = PILImage.open(fp).convert("RGB")
+                    tiles.append((angle, tile))
+
+            if tiles:
+                cols = min(len(tiles), 4)
+                rows = (len(tiles) + cols - 1) // cols
+                tw, th = tiles[0][1].size
+                sheet = PILImage.new("RGB", (cols * tw, rows * th), (30, 30, 30))
+                for i, (label, tile) in enumerate(tiles):
+                    x = (i % cols) * tw
+                    y = (i // cols) * th
+                    sheet.paste(tile, (x, y))
+                    draw = ImageDraw.Draw(sheet)
+                    draw.text((x + 4, y + 4), label, fill=(255, 255, 0))
+
+                out_path = os.path.join(tempfile.gettempdir(), f"blender_contact_{os.getpid()}.png")
+                sheet.save(out_path)
+                with open(out_path, "rb") as f:
+                    data = f.read()
+                os.remove(out_path)
+
+                # Clean up individual tiles
+                for angle, _ in tiles:
+                    fp = images_info[angle].get("filepath")
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
+
+                return Image(data=data, format="png")
+
+        # Fallback: just return the first captured image
+        for angle in angle_list:
+            fp = images_info.get(angle, {}).get("filepath")
+            if fp and os.path.exists(fp):
+                with open(fp, "rb") as f:
+                    data = f.read()
+                os.remove(fp)
+                return Image(data=data, format="png")
+
+        raise Exception("No images were captured")
+    except Exception as e:
+        logger.error(f"capture_contact_sheet error: {e}")
+        raise Exception(f"capture_contact_sheet failed: {e}")
+
+
+# ─── Depth map ───────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def render_depth_map(
+    ctx: Context,
+    max_depth: float = 10.0,
+) -> Image:
+    """
+    Render a normalised depth map from the active camera using the Blender compositor
+    Z-pass. Closer objects appear lighter.
+
+    Parameters:
+    - max_depth: Depth value (scene units) mapped to black (default 10.0)
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_depth_{os.getpid()}.png")
+        result = blender.send_command("render_depth_map", {
+            "filepath": temp_path,
+            "max_depth": max_depth,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        os.remove(temp_path)
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"render_depth_map error: {e}")
+        raise Exception(f"render_depth_map failed: {e}")
+
+
+# ─── Reference image ─────────────────────────────────────────────────────────
+
+# Server-side registry so compare_reference_image can find paths without a round-trip
+_reference_registry: Dict[str, str] = {}
+
+
+@mcp.tool()
+def store_reference_image(ctx: Context, name: str, filepath: str) -> str:
+    """
+    Store a local image file as a named reference for later comparison tools.
+
+    Parameters:
+    - name: Short identifier (e.g. "concept_art")
+    - filepath: Absolute path to the image file on disk
+    """
+    try:
+        if not os.path.exists(filepath):
+            return f"Error: file not found: {filepath}"
+        _reference_registry[name] = filepath
+        blender = get_blender_connection()
+        result = blender.send_command("store_reference_image", {"name": name, "filepath": filepath})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Stored reference '{name}' from {filepath}. All refs: {result.get('stored_refs', [])}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def compare_reference_image(
+    ctx: Context,
+    reference_name: str,
+    angle: str = "front",
+    max_size: int = 512,
+) -> Image:
+    """
+    Capture the current viewport from a named angle and composite it side-by-side
+    with a previously stored reference image.
+
+    Parameters:
+    - reference_name: Name given to store_reference_image earlier
+    - angle: Viewport angle to capture for comparison
+    - max_size: Tile size for each image in the composite
+    """
+    try:
+        blender = get_blender_connection()
+
+        # Capture current viewport
+        temp_render = os.path.join(tempfile.gettempdir(), f"blender_cmp_render_{os.getpid()}.png")
+        r = blender.send_command("capture_viewport_angle", {
+            "angle": angle,
+            "max_size": max_size,
+            "filepath": temp_render,
+        })
+        if "error" in r:
+            raise Exception(r["error"])
+
+        ref_path = _reference_registry.get(reference_name)
+        if ref_path is None:
+            raise Exception(f"Reference '{reference_name}' not found. Call store_reference_image first.")
+
+        if not _PIL_AVAILABLE:
+            # Just return the render
+            with open(temp_render, "rb") as f:
+                data = f.read()
+            os.remove(temp_render)
+            return Image(data=data, format="png")
+
+        render_img = PILImage.open(temp_render).convert("RGB").resize((max_size, max_size))
+        ref_img    = PILImage.open(ref_path).convert("RGB").resize((max_size, max_size))
+
+        sheet = PILImage.new("RGB", (max_size * 2 + 8, max_size + 24), (30, 30, 30))
+        sheet.paste(ref_img,    (0,          24))
+        sheet.paste(render_img, (max_size + 8, 24))
+
+        draw = ImageDraw.Draw(sheet)
+        draw.text((4,            4), f"Reference: {reference_name}", fill=(200, 200, 255))
+        draw.text((max_size + 12, 4), f"Current: {angle}",            fill=(255, 200, 100))
+
+        out_path = os.path.join(tempfile.gettempdir(), f"blender_compare_{os.getpid()}.png")
+        sheet.save(out_path)
+        with open(out_path, "rb") as f:
+            data = f.read()
+
+        for p in (temp_render, out_path):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"compare_reference_image error: {e}")
+        raise Exception(f"compare_reference_image failed: {e}")
+
+
+# ─── Mesh editing ────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def move_object(ctx: Context, name: str, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> str:
+    """Move an object to an absolute world-space position."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("move_object", {"name": name, "x": x, "y": y, "z": z})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Moved '{name}' to ({x}, {y}, {z})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def scale_object(ctx: Context, name: str, x: float = 1.0, y: float = 1.0, z: float = 1.0) -> str:
+    """Set the absolute scale of an object on each axis."""
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("scale_object", {"name": name, "x": x, "y": y, "z": z})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Scaled '{name}' to ({x}, {y}, {z})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def rotate_object(
+    ctx: Context,
+    name: str,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+) -> str:
+    """
+    Set the Euler rotation of an object (degrees).
+
+    Parameters:
+    - name: Object name
+    - x, y, z: Rotation in degrees around each axis
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("rotate_object", {"name": name, "x": x, "y": y, "z": z})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Rotated '{name}' to ({x}°, {y}°, {z}°)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_object_material_color(
+    ctx: Context,
+    name: str,
+    r: float = 1.0,
+    g: float = 1.0,
+    b: float = 1.0,
+    a: float = 1.0,
+    material_index: int = 0,
+) -> str:
+    """
+    Set the Principled BSDF base colour of an object's material.
+    Creates the material if one does not exist.
+
+    Parameters:
+    - name: Object name
+    - r, g, b, a: Colour channels in 0..1 range
+    - material_index: Which material slot to update (default 0)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_object_material_color", {
+            "name": name, "r": r, "g": g, "b": b, "a": a, "material_index": material_index
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Set material color of '{name}' to rgba({r},{g},{b},{a})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_vertex_positions(
+    ctx: Context,
+    name: str,
+    indices: str = None,
+    world_space: bool = True,
+    max_verts: int = 2000,
+) -> str:
+    """
+    Read vertex positions from a mesh object.
+
+    Parameters:
+    - name: Mesh object name
+    - indices: Comma-separated vertex indices to retrieve (returns all if omitted)
+    - world_space: True = world coordinates (default), False = local/object coordinates
+    - max_verts: Safety cap when retrieving all vertices (default 2000)
+
+    Returns JSON with each vertex's index and [x, y, z] position.
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in indices.split(",")] if indices else None
+        result = blender.send_command("get_vertex_positions", {
+            "name": name, "indices": idx_list,
+            "world_space": world_space, "max_verts": max_verts,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_vertex_position(
+    ctx: Context,
+    name: str,
+    vertex_index: int,
+    x: float,
+    y: float,
+    z: float,
+) -> str:
+    """
+    Move a single vertex of a mesh object to a world-space position.
+
+    Parameters:
+    - name: Mesh object name
+    - vertex_index: Zero-based vertex index
+    - x, y, z: Target world-space position
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_vertex_position", {
+            "name": name, "vertex_index": vertex_index, "x": x, "y": y, "z": z
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Moved vertex {vertex_index} of '{name}' to ({x}, {y}, {z})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_vertex_positions(
+    ctx: Context,
+    name: str,
+    vertices: str,
+    world_space: bool = True,
+) -> str:
+    """
+    Batch-update multiple vertex positions in a single call (much faster than
+    calling set_vertex_position repeatedly for many vertices).
+
+    Parameters:
+    - name: Mesh object name
+    - vertices: JSON array of {"index": int, "co": [x, y, z]} objects.
+                Example: '[{"index":0,"co":[0,0,1]},{"index":3,"co":[1,0,0]}]'
+    - world_space: True = co values are world-space (default), False = local/object space
+    """
+    try:
+        blender = get_blender_connection()
+        vert_list = json.loads(vertices)
+        result = blender.send_command("set_vertex_positions", {
+            "name": name, "vertices": vert_list, "world_space": world_space,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Updated {result['updated_count']} vertices on '{name}'"
+        if result.get("errors"):
+            msg += f". Errors: {result['errors']}"
+        return msg
+    except json.JSONDecodeError as e:
+        return f"Error: 'vertices' must be valid JSON — {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_control_points(
+    ctx: Context,
+    name: str,
+    spline_index: int = 0,
+) -> str:
+    """
+    Read the control points of a curve (BEZIER, POLY, or NURBS) object.
+
+    For BEZIER curves returns: co, handle_left, handle_right, handle types.
+    For POLY/NURBS curves returns: co (and weight for NURBS).
+
+    Parameters:
+    - name: Curve object name
+    - spline_index: Which spline within the curve (default 0)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_control_points", {
+            "name": name, "spline_index": spline_index,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_control_point(
+    ctx: Context,
+    name: str,
+    point_index: int,
+    co: str,
+    handle_left: str = None,
+    handle_right: str = None,
+    handle_left_type: str = None,
+    handle_right_type: str = None,
+    spline_index: int = 0,
+) -> str:
+    """
+    Move a curve control point and optionally adjust its bezier handles.
+
+    Parameters:
+    - name: Curve object name
+    - point_index: Zero-based control point index
+    - co: Comma-separated x,y,z world-space position
+    - handle_left: Comma-separated x,y,z for left handle (bezier only)
+    - handle_right: Comma-separated x,y,z for right handle (bezier only)
+    - handle_left_type: FREE, ALIGNED, VECTOR, or AUTO (bezier only)
+    - handle_right_type: FREE, ALIGNED, VECTOR, or AUTO (bezier only)
+    - spline_index: Spline index within the curve object (default 0)
+    """
+    try:
+        blender = get_blender_connection()
+
+        def parse_vec(s):
+            return [float(v) for v in s.split(",")] if s else None
+
+        result = blender.send_command("set_control_point", {
+            "name": name,
+            "point_index": point_index,
+            "co": parse_vec(co),
+            "handle_left": parse_vec(handle_left),
+            "handle_right": parse_vec(handle_right),
+            "handle_left_type": handle_left_type,
+            "handle_right_type": handle_right_type,
+            "spline_index": spline_index,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Control point {point_index} on '{name}' (spline {spline_index}) moved to {co}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Edge operations ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_edges(
+    ctx: Context,
+    name: str,
+    indices: str = None,
+    max_edges: int = 5000,
+) -> str:
+    """
+    Read edge data from a mesh: vertex pair, sharp flag, seam flag, crease, and bevel weight.
+
+    Parameters:
+    - name: Mesh object name
+    - indices: Comma-separated edge indices (returns all if omitted)
+    - max_edges: Safety cap when retrieving all edges (default 5000)
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in indices.split(",")] if indices else None
+        result = blender.send_command("get_edges", {
+            "name": name, "indices": idx_list, "max_edges": max_edges,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def mark_sharp_edges(
+    ctx: Context,
+    name: str,
+    edge_indices: str,
+    sharp: bool = True,
+) -> str:
+    """
+    Mark edges as sharp (hard) or soft, controlling auto-smooth and the Edge Split modifier.
+
+    Sharp edges appear as hard creases when smooth shading + auto-smooth is enabled.
+    Soft (unsharp) edges blend smoothly with neighbouring faces.
+
+    Parameters:
+    - name: Mesh object name
+    - edge_indices: Comma-separated edge indices, or "all"
+    - sharp: True = hard edge (default), False = soft/smooth edge
+    """
+    try:
+        blender = get_blender_connection()
+        idx = edge_indices if edge_indices.strip().lower() == "all" \
+              else [int(i.strip()) for i in edge_indices.split(",")]
+        result = blender.send_command("mark_sharp_edges", {
+            "name": name, "edge_indices": idx, "sharp": sharp,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        label = "sharp (hard)" if sharp else "soft (smooth)"
+        return f"Marked {result['marked_edges']} edges as {label} on '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_edge_crease(
+    ctx: Context,
+    name: str,
+    edge_indices: str,
+    crease: float,
+) -> str:
+    """
+    Set subdivision crease weight on edges.
+
+    Crease controls how the Subdivision Surface modifier handles edge sharpness:
+    0.0 = fully smooth (no crease), 1.0 = perfectly sharp crease.
+    Values in between give progressively harder edges without going fully sharp.
+
+    Parameters:
+    - name: Mesh object name
+    - edge_indices: Comma-separated edge indices, or "all"
+    - crease: Weight 0.0–1.0
+    """
+    try:
+        blender = get_blender_connection()
+        idx = edge_indices if edge_indices.strip().lower() == "all" \
+              else [int(i.strip()) for i in edge_indices.split(",")]
+        result = blender.send_command("set_edge_crease", {
+            "name": name, "edge_indices": idx, "crease": crease,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Set crease={result['crease']} on {result['updated_edges']} edges of '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_edge_bevel_weight(
+    ctx: Context,
+    name: str,
+    edge_indices: str,
+    weight: float,
+) -> str:
+    """
+    Set bevel weight on edges, used with the Bevel modifier (limit_method=WEIGHT).
+
+    Only edges with weight > 0 will be bevelled when the modifier uses WEIGHT mode.
+    This lets you selectively bevel specific edges without affecting the whole mesh.
+
+    Typical workflow:
+      1. set_edge_bevel_weight("Cube", "4,5,6,7", weight=1.0)   ← top edges only
+      2. add_modifier("Cube", "BEVEL", params='{"width": 0.05, "limit_method": "WEIGHT"}')
+
+    Parameters:
+    - name: Mesh object name
+    - edge_indices: Comma-separated edge indices, or "all"
+    - weight: 0.0 (no bevel) to 1.0 (full bevel)
+    """
+    try:
+        blender = get_blender_connection()
+        idx = edge_indices if edge_indices.strip().lower() == "all" \
+              else [int(i.strip()) for i in edge_indices.split(",")]
+        result = blender.send_command("set_edge_bevel_weight", {
+            "name": name, "edge_indices": idx, "weight": weight,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Set bevel_weight={result['bevel_weight']} on {result['updated_edges']} edges of '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Face operations ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_faces(
+    ctx: Context,
+    name: str,
+    indices: str = None,
+    world_space: bool = True,
+    max_faces: int = 2000,
+) -> str:
+    """
+    Read face data from a mesh object.
+
+    Parameters:
+    - name: Mesh object name
+    - indices: Comma-separated face indices to retrieve (returns all if omitted)
+    - world_space: True = world coordinates for normals and centers (default)
+    - max_faces: Safety cap when retrieving all faces (default 2000)
+
+    Returns JSON with each face's vertex_indices, normal, center, material_index, and area.
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in indices.split(",")] if indices else None
+        result = blender.send_command("get_faces", {
+            "name": name, "indices": idx_list,
+            "world_space": world_space, "max_faces": max_faces,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_face_material_index(
+    ctx: Context,
+    name: str,
+    face_indices: str,
+    material_index: int,
+) -> str:
+    """
+    Assign a material slot to specific faces (for multi-material objects).
+
+    Parameters:
+    - name: Mesh object name
+    - face_indices: Comma-separated face indices, or "all" for every face
+    - material_index: Material slot number (0-based; material must already be in the object's slots)
+    """
+    try:
+        blender = get_blender_connection()
+        idx = face_indices if face_indices.strip().lower() == "all" \
+              else [int(i.strip()) for i in face_indices.split(",")]
+        result = blender.send_command("set_face_material_index", {
+            "name": name, "face_indices": idx, "material_index": material_index,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Assigned material slot {material_index} to "
+                f"{result['updated_faces']} faces on '{name}'")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def extrude_faces(
+    ctx: Context,
+    name: str,
+    face_indices: str,
+    amount: float = 0.2,
+) -> str:
+    """
+    Extrude faces outward along their individual normals.
+
+    Parameters:
+    - name: Mesh object name
+    - face_indices: Comma-separated face indices to extrude
+    - amount: Extrusion distance in Blender units (negative = inward, default 0.2)
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in face_indices.split(",")]
+        result = blender.send_command("extrude_faces", {
+            "name": name, "face_indices": idx_list, "amount": amount,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Extruded {result['extruded_faces']} faces on '{name}' "
+                f"by {amount} units")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def inset_faces(
+    ctx: Context,
+    name: str,
+    face_indices: str,
+    thickness: float = 0.1,
+    depth: float = 0.0,
+    use_individual: bool = True,
+) -> str:
+    """
+    Inset faces, creating a border ring of new polygons inside each face.
+
+    Parameters:
+    - name: Mesh object name
+    - face_indices: Comma-separated face indices to inset
+    - thickness: Inset distance from face edges (default 0.1)
+    - depth: Push inset faces along their normals — 0 = flat, positive = raised
+    - use_individual: Inset each face independently (default True)
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in face_indices.split(",")]
+        result = blender.send_command("inset_faces", {
+            "name": name, "face_indices": idx_list,
+            "thickness": thickness, "depth": depth,
+            "use_individual": use_individual,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Inset {result['inset_faces']} faces on '{name}' "
+                f"(thickness={thickness}, depth={depth})")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def flip_normals(
+    ctx: Context,
+    name: str,
+    face_indices: str = None,
+) -> str:
+    """
+    Flip face normals on a mesh (reverses which side is the outside).
+
+    Parameters:
+    - name: Mesh object name
+    - face_indices: Comma-separated face indices (flips ALL faces if omitted)
+    """
+    try:
+        blender = get_blender_connection()
+        idx_list = [int(i.strip()) for i in face_indices.split(",")] \
+                   if face_indices else None
+        result = blender.send_command("flip_normals", {
+            "name": name, "face_indices": idx_list,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Flipped {result['flipped_faces']} normals on '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def merge_vertices(
+    ctx: Context,
+    name: str,
+    distance: float = 0.001,
+) -> str:
+    """
+    Merge (weld) vertices that are within a distance threshold of each other.
+    Equivalent to 'Merge by Distance' in Blender — useful for cleaning up
+    imported meshes or fixing seams after boolean operations.
+
+    Parameters:
+    - name: Mesh object name
+    - distance: Maximum distance between vertices to merge (default 0.001)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("merge_vertices", {
+            "name": name, "distance": distance,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Merged {result['removed']} vertices on '{name}' "
+                f"({result['vertices_before']} → {result['vertices_after']})")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def triangulate_mesh(
+    ctx: Context,
+    name: str,
+    method: str = "BEAUTY",
+) -> str:
+    """
+    Triangulate all faces of a mesh (convert quads/ngons to triangles).
+    Useful before export to game engines or 3D printing.
+
+    Parameters:
+    - name: Mesh object name
+    - method: BEAUTY (best quality, default), FIXED, FIXED_ALTERNATE,
+              SHORTEST_DIAGONAL
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("triangulate_mesh", {
+            "name": name, "method": method,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Triangulated '{name}': {result['triangles']} triangles"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def subdivide_mesh(
+    ctx: Context,
+    name: str,
+    cuts: int = 1,
+    smoothness: float = 0.0,
+) -> str:
+    """
+    Subdivide all faces of a mesh (equivalent to Subdivide in Edit Mode).
+
+    Parameters:
+    - name: Mesh object name
+    - cuts: Number of cuts per edge (default 1)
+    - smoothness: Smooth factor 0..1 (default 0.0 = flat)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("subdivide_mesh", {
+            "name": name, "cuts": cuts, "smoothness": smoothness
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Subdivided '{name}' with {cuts} cuts → "
+                f"{result['vertices']} verts, {result['faces']} faces")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def apply_modifier(ctx: Context, name: str, modifier_name: str) -> str:
+    """
+    Apply a named modifier on a mesh object, collapsing it into the mesh data.
+
+    Parameters:
+    - name: Object name
+    - modifier_name: Exact modifier name as shown in Blender's Properties panel
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_modifier", {
+            "name": name, "modifier_name": modifier_name
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Applied modifier '{modifier_name}' on '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_mesh_stats(ctx: Context, name: str) -> str:
+    """
+    Return detailed topology statistics for a mesh object.
+
+    Parameters:
+    - name: Mesh object name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_mesh_stats", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Camera management ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_camera(
+    ctx: Context,
+    name: str = "Camera",
+    location: str = "0,-5,3",
+    look_at: str = "0,0,0",
+    lens: float = 50.0,
+    cam_type: str = "PERSP",
+) -> str:
+    """
+    Add a new camera to the Blender scene.
+
+    Parameters:
+    - name: Name for the camera object
+    - location: Comma-separated x,y,z position (default "0,-5,3")
+    - look_at: Comma-separated x,y,z target point (default "0,0,0")
+    - lens: Focal length in mm (default 50.0)
+    - cam_type: PERSP or ORTHO (default PERSP)
+    """
+    try:
+        blender = get_blender_connection()
+        loc = [float(v) for v in location.split(",")]
+        lat = [float(v) for v in look_at.split(",")]
+        result = blender.send_command("create_camera", {
+            "name": name, "location": loc, "look_at": lat,
+            "lens": lens, "cam_type": cam_type,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Created camera '{result['name']}' at {result['location']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_active_camera(ctx: Context, name: str) -> str:
+    """
+    Set the active render camera to an existing camera object.
+
+    Parameters:
+    - name: Camera object name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_active_camera", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Active camera set to '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def render_from_camera(
+    ctx: Context,
+    camera_name: str = None,
+    width: int = 1920,
+    height: int = 1080,
+    samples: int = 32,
+) -> Image:
+    """
+    Render a still from the specified (or active) camera.
+
+    Parameters:
+    - camera_name: Camera to render from (uses scene active camera if omitted)
+    - width: Render width in pixels (default 1920)
+    - height: Render height in pixels (default 1080)
+    - samples: Cycles sample count, ignored for EEVEE (default 32)
+    """
+    try:
+        blender = get_blender_connection()
+        temp_path = os.path.join(tempfile.gettempdir(), f"blender_render_{os.getpid()}.png")
+        result = blender.send_command("render_from_camera", {
+            "camera_name": camera_name,
+            "filepath": temp_path,
+            "width": width,
+            "height": height,
+            "samples": samples,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        with open(temp_path, "rb") as f:
+            data = f.read()
+        os.remove(temp_path)
+        return Image(data=data, format="png")
+    except Exception as e:
+        logger.error(f"render_from_camera error: {e}")
+        raise Exception(f"render_from_camera failed: {e}")
+
+
+@mcp.tool()
+def render_all_cameras(
+    ctx: Context,
+    width: int = 1920,
+    height: int = 1080,
+    samples: int = 32,
+    output_dir: str = None,
+) -> Image:
+    """
+    Render a still from every camera in the scene simultaneously and return
+    a contact sheet with all results labelled by camera name.
+
+    Parameters:
+    - width: Render width per camera in pixels (default 1920)
+    - height: Render height per camera in pixels (default 1080)
+    - samples: Cycles sample count (default 32, ignored for EEVEE)
+    - output_dir: Directory to save individual renders (temp dir if omitted)
+
+    Returns a composited contact sheet image. Individual renders are also
+    saved to output_dir so you can access them at full resolution.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("render_all_cameras", {
+            "width": width, "height": height,
+            "samples": samples, "output_dir": output_dir,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+
+        renders = result.get("renders", [])
+        successful = [r for r in renders if r.get("success") and
+                      r.get("filepath") and os.path.exists(r["filepath"])]
+
+        if not successful:
+            raise Exception(
+                f"No renders succeeded. "
+                f"Cameras found: {result.get('total_cameras', 0)}. "
+                f"Details: {renders}"
+            )
+
+        # Build contact sheet with PIL if available, otherwise return first image
+        if _PIL_AVAILABLE and len(successful) > 1:
+            # Thumbnail each render to a consistent tile size
+            TILE_W, TILE_H = 960, 540
+            LABEL_H = 28
+            cols = min(len(successful), 3)
+            rows = (len(successful) + cols - 1) // cols
+
+            sheet = PILImage.new(
+                "RGB",
+                (cols * TILE_W, rows * (TILE_H + LABEL_H)),
+                (20, 20, 20),
+            )
+
+            for i, r in enumerate(successful):
+                tile = PILImage.open(r["filepath"]).convert("RGB")
+                tile = tile.resize((TILE_W, TILE_H), PILImage.LANCZOS)
+                x = (i % cols) * TILE_W
+                y = (i // cols) * (TILE_H + LABEL_H)
+                sheet.paste(tile, (x, y + LABEL_H))
+                draw = ImageDraw.Draw(sheet)
+                draw.rectangle([x, y, x + TILE_W, y + LABEL_H], fill=(40, 40, 40))
+                draw.text((x + 6, y + 6), r["camera"], fill=(220, 220, 100))
+
+            out_path = os.path.join(
+                tempfile.gettempdir(),
+                f"blender_all_cameras_{os.getpid()}.png",
+            )
+            sheet.save(out_path)
+            with open(out_path, "rb") as f:
+                data = f.read()
+            os.remove(out_path)
+
+            logger.info(
+                f"render_all_cameras: {len(successful)}/{result['total_cameras']} "
+                f"cameras rendered"
+            )
+            return Image(data=data, format="png")
+
+        # Fallback: return the first render as-is
+        with open(successful[0]["filepath"], "rb") as f:
+            data = f.read()
+        return Image(data=data, format="png")
+
+    except Exception as e:
+        logger.error(f"render_all_cameras error: {e}")
+        raise Exception(f"render_all_cameras failed: {e}")
+
+
+# ─── Scene analysis ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+def find_objects_by_type(ctx: Context, obj_type: str = "MESH") -> str:
+    """
+    List all objects in the scene that match the given type.
+
+    Parameters:
+    - obj_type: Blender object type: MESH, CURVE, CAMERA, LIGHT, EMPTY, ARMATURE, etc.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("find_objects_by_type", {"obj_type": obj_type})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def measure_distance(ctx: Context, name_a: str, name_b: str) -> str:
+    """
+    Measure the Euclidean distance between the origins of two objects.
+
+    Parameters:
+    - name_a: First object name
+    - name_b: Second object name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("measure_distance", {"name_a": name_a, "name_b": name_b})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Distance from '{name_a}' to '{name_b}': {result['distance']} units"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Lighting ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_light(
+    ctx: Context,
+    light_type: str = "POINT",
+    name: str = None,
+    location: str = "0,0,5",
+    energy: float = 1000.0,
+    color: str = "1,1,1",
+    radius: float = 0.1,
+) -> str:
+    """
+    Add a light to the Blender scene.
+
+    Parameters:
+    - light_type: POINT, SUN, SPOT, or AREA
+    - name: Name for the light object (optional)
+    - location: Comma-separated x,y,z (default "0,0,5")
+    - energy: Light power in watts (default 1000)
+    - color: Comma-separated r,g,b in 0..1 range (default "1,1,1")
+    - radius: Shadow soft radius (default 0.1)
+    """
+    try:
+        blender = get_blender_connection()
+        loc = [float(v) for v in location.split(",")]
+        col = [float(v) for v in color.split(",")]
+        result = blender.send_command("add_light", {
+            "light_type": light_type, "name": name,
+            "location": loc, "energy": energy, "color": col, "radius": radius,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Added {light_type} light '{result['name']}' at {loc} with energy {energy}W"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_world_background(
+    ctx: Context,
+    color: str = "0.05,0.05,0.05",
+    strength: float = 1.0,
+    hdri_path: str = None,
+) -> str:
+    """
+    Set the scene world background to a solid colour or an HDRI environment map.
+
+    Parameters:
+    - color: Comma-separated r,g,b in 0..1 range (used when hdri_path is not given)
+    - strength: Background emission strength (default 1.0)
+    - hdri_path: Absolute path to a .hdr or .exr file (overrides color)
+    """
+    try:
+        blender = get_blender_connection()
+        col = [float(v) for v in color.split(",")]
+        result = blender.send_command("set_world_background", {
+            "color": col, "strength": strength, "hdri_path": hdri_path,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if result.get("mode") == "hdri":
+            return f"World background set to HDRI: {hdri_path}"
+        return f"World background set to color rgb({col[0]},{col[1]},{col[2]}) strength {strength}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def add_3point_lighting(
+    ctx: Context,
+    subject_name: str = None,
+    key_energy: float = 1500.0,
+    fill_energy: float = 500.0,
+    back_energy: float = 800.0,
+) -> str:
+    """
+    Add a classic 3-point lighting rig (key, fill, back/rim) centred on a subject.
+
+    Parameters:
+    - subject_name: Object to light (uses scene origin if omitted)
+    - key_energy: Key light power in watts (default 1500)
+    - fill_energy: Fill light power in watts (default 500)
+    - back_energy: Back/rim light power in watts (default 800)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_3point_lighting", {
+            "subject_name": subject_name,
+            "key_energy": key_energy,
+            "fill_energy": fill_energy,
+            "back_energy": back_energy,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Added 3-point lighting: {result['lights']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Export / import ─────────────────────────────────────────────────────────
+
+@mcp.tool()
+def export_object(
+    ctx: Context,
+    name: str = None,
+    filepath: str = None,
+    file_format: str = "glb",
+) -> str:
+    """
+    Export an object (or the full scene) to a 3D file.
+
+    Parameters:
+    - name: Object to export; exports entire scene if omitted
+    - filepath: Output file path (auto-generated in temp dir if omitted)
+    - file_format: glb, gltf, fbx, obj, stl, ply (default glb)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("export_object", {
+            "name": name, "filepath": filepath, "file_format": file_format,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Exported to: {result['filepath']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def import_file(ctx: Context, filepath: str) -> str:
+    """
+    Import a 3D file into the current Blender scene.
+    Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend
+
+    Parameters:
+    - filepath: Absolute path to the file to import
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("import_file", {"filepath": filepath})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Imported {filepath}. New objects: {result.get('imported_objects', [])}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def save_blend(ctx: Context, filepath: str = None) -> str:
+    """
+    Save the current Blender project as a .blend file.
+
+    Parameters:
+    - filepath: Absolute path to save to (e.g. "C:/projects/my_scene.blend").
+                If omitted, saves over the currently open file. If the file has
+                never been saved, a temporary path is used and returned.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("save_blend", {"filepath": filepath} if filepath else {})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Saved: {result['filepath']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def load_blend(ctx: Context, filepath: str) -> str:
+    """
+    Open a .blend file, replacing the current Blender scene.
+    Unsaved changes to the current file will be lost — save first if needed.
+
+    Parameters:
+    - filepath: Absolute path to the .blend file to open
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("load_blend", {"filepath": filepath})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Opened '{filepath}'. "
+                f"Scene: {result['scene_name']}, {result['object_count']} objects.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Primitives & object management ─────────────────────────────────────────
+
+@mcp.tool()
+def add_primitive(
+    ctx: Context,
+    primitive_type: str = "cube",
+    location: str = "0,0,0",
+    size: float = 2.0,
+    name: str = None,
+    rotation: str = "0,0,0",
+) -> str:
+    """
+    Add a standard mesh primitive to the Blender scene.
+
+    Parameters:
+    - primitive_type: cube, plane, circle, sphere, ico_sphere, cylinder, cone, torus, monkey
+    - location: Comma-separated x,y,z (default "0,0,0")
+    - size: Overall size in Blender units (default 2.0)
+    - name: Optional name for the new object
+    - rotation: Comma-separated x,y,z rotation in degrees (default "0,0,0")
+    """
+    try:
+        import math
+        blender = get_blender_connection()
+        loc = [float(v) for v in location.split(",")]
+        rot = [math.radians(float(v)) for v in rotation.split(",")]
+        result = blender.send_command("add_primitive", {
+            "primitive_type": primitive_type, "location": loc, "size": size,
+            "name": name, "rotation": rot,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Added {primitive_type} '{result['name']}' at {result['location']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def delete_object(ctx: Context, name: str) -> str:
+    """
+    Delete an object from the scene and purge orphaned mesh/material data.
+
+    Parameters:
+    - name: Object name to delete
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_object", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Deleted '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def duplicate_object(
+    ctx: Context,
+    name: str,
+    new_name: str = None,
+    offset: str = "0.5,0.5,0",
+    linked: bool = False,
+) -> str:
+    """
+    Duplicate an object.
+
+    Parameters:
+    - name: Source object name
+    - new_name: Name for the duplicate (auto-assigned if omitted)
+    - offset: Comma-separated x,y,z displacement from original (default "0.5,0.5,0")
+    - linked: If True, shares mesh data with original (instance); False = full copy
+    """
+    try:
+        blender = get_blender_connection()
+        off = [float(v) for v in offset.split(",")]
+        result = blender.send_command("duplicate_object", {
+            "name": name, "new_name": new_name, "offset": off, "linked": linked,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Duplicated '{name}' → '{result['duplicate']}' "
+                f"at {result['location']} ({'linked' if linked else 'independent'})")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def join_objects(ctx: Context, names: str, result_name: str = None) -> str:
+    """
+    Join multiple mesh objects into one.
+
+    Parameters:
+    - names: Comma-separated list of object names to join
+    - result_name: Name for the joined object (defaults to the first object's name)
+    """
+    try:
+        blender = get_blender_connection()
+        name_list = [n.strip() for n in names.split(",") if n.strip()]
+        result = blender.send_command("join_objects", {
+            "names": name_list, "result_name": result_name,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Joined {result['merged_count']} objects → '{result['result']}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def separate_mesh(ctx: Context, name: str, method: str = "LOOSE") -> str:
+    """
+    Separate a mesh object into multiple objects.
+
+    Parameters:
+    - name: Mesh object name
+    - method: LOOSE (by disconnected geometry), MATERIAL (by material slot),
+              SELECTED (by face selection)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("separate_mesh", {"name": name, "method": method})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Separated '{name}' by {method}. New objects: {result['new_objects']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def rename_object(ctx: Context, old_name: str, new_name: str) -> str:
+    """
+    Rename an object and its mesh data block.
+
+    Parameters:
+    - old_name: Current object name
+    - new_name: Desired new name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("rename_object", {
+            "old_name": old_name, "new_name": new_name,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Renamed '{old_name}' → '{result['new_name']}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_origin(ctx: Context, name: str, origin_type: str = "ORIGIN_GEOMETRY") -> str:
+    """
+    Set an object's origin point.
+
+    Parameters:
+    - name: Object name
+    - origin_type: ORIGIN_GEOMETRY (centre of mesh),
+                   ORIGIN_CURSOR (3D cursor position),
+                   ORIGIN_CENTER_OF_MASS,
+                   ORIGIN_CENTER_OF_VOLUME
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_origin", {
+            "name": name, "origin_type": origin_type,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Origin of '{name}' set ({origin_type}). New location: {result['new_location']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def snap_to_ground(ctx: Context, name: str, ground_z: float = 0.0) -> str:
+    """
+    Move an object so its lowest bounding-box point rests on the ground plane.
+
+    Parameters:
+    - name: Object name
+    - ground_z: Z value of the ground plane (default 0.0)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("snap_to_ground", {"name": name, "ground_z": ground_z})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"'{name}' snapped to ground Z={ground_z}. New Z origin: {result['location_z']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_smooth_shading(
+    ctx: Context,
+    name: str,
+    smooth: bool = True,
+    auto_smooth: bool = True,
+    angle: float = 30.0,
+) -> str:
+    """
+    Toggle smooth or flat shading on a mesh object.
+
+    Parameters:
+    - name: Mesh object name
+    - smooth: True for smooth shading, False for flat
+    - auto_smooth: Enable auto-smooth (smooths only edges below angle threshold)
+    - angle: Auto-smooth threshold in degrees (default 30°)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_smooth_shading", {
+            "name": name, "smooth": smooth, "auto_smooth": auto_smooth, "angle": angle,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        mode = "smooth" if smooth else "flat"
+        return f"'{name}' set to {mode} shading" + (f" (auto-smooth {angle}°)" if smooth and auto_smooth else "")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def parent_object(
+    ctx: Context,
+    child_name: str,
+    parent_name: str,
+    keep_transform: bool = True,
+) -> str:
+    """
+    Parent one object to another, creating a hierarchy.
+
+    Parameters:
+    - child_name: Object that becomes the child
+    - parent_name: Object that becomes the parent
+    - keep_transform: Preserve the child's world-space position (default True)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("parent_object", {
+            "child_name": child_name, "parent_name": parent_name,
+            "keep_transform": keep_transform,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Parented '{child_name}' → '{parent_name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def select_objects(
+    ctx: Context,
+    names: str = None,
+    action: str = "SELECT",
+    obj_type: str = None,
+) -> str:
+    """
+    Select or deselect objects by name list and/or type.
+
+    Parameters:
+    - names: Comma-separated object names (if omitted, applies to all or filtered by type)
+    - action: SELECT, DESELECT, TOGGLE
+    - obj_type: Filter by type when names is omitted: MESH, CAMERA, LIGHT, CURVE, etc.
+    """
+    try:
+        blender = get_blender_connection()
+        name_list = [n.strip() for n in names.split(",") if n.strip()] if names else None
+        result = blender.send_command("select_objects", {
+            "names": name_list, "action": action, "obj_type": obj_type,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if "selected_count" in result:
+            return f"{action} all: {result['selected_count']} objects selected"
+        return f"{action}: {result.get('names', [])}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def align_objects(
+    ctx: Context,
+    names: str,
+    axis: str = "X",
+    align_to: str = "FIRST",
+) -> str:
+    """
+    Align multiple objects' origins along one axis.
+
+    Parameters:
+    - names: Comma-separated object names
+    - axis: X, Y, or Z
+    - align_to: FIRST, LAST, MIN, MAX, AVERAGE
+    """
+    try:
+        blender = get_blender_connection()
+        name_list = [n.strip() for n in names.split(",") if n.strip()]
+        result = blender.send_command("align_objects", {
+            "names": name_list, "axis": axis, "align_to": align_to,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Aligned {len(name_list)} objects on {axis}-axis to "
+                f"{align_to} ({result['value']:.4f})")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Materials ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_material(
+    ctx: Context,
+    name: str,
+    base_color: str = "0.8,0.8,0.8",
+    metallic: float = 0.0,
+    roughness: float = 0.5,
+    emission_color: str = None,
+    emission_strength: float = 1.0,
+    alpha: float = 1.0,
+    assign_to: str = None,
+) -> str:
+    """
+    Create (or replace) a PBR material using Principled BSDF.
+
+    Parameters:
+    - name: Material name
+    - base_color: Comma-separated r,g,b in 0..1 (default "0.8,0.8,0.8")
+    - metallic: 0.0 (dielectric) to 1.0 (fully metallic)
+    - roughness: 0.0 (mirror) to 1.0 (fully rough)
+    - emission_color: Comma-separated r,g,b to enable glow (e.g. "1,0.5,0")
+    - emission_strength: Emission multiplier (default 1.0)
+    - alpha: Opacity 0..1 (values < 1 enable alpha blending)
+    - assign_to: Object name to auto-assign this material to (slot 0)
+    """
+    try:
+        blender = get_blender_connection()
+        bc = [float(v) for v in base_color.split(",")]
+        ec = [float(v) for v in emission_color.split(",")] if emission_color else None
+        result = blender.send_command("create_material", {
+            "name": name, "base_color": bc, "metallic": metallic,
+            "roughness": roughness, "emission_color": ec,
+            "emission_strength": emission_strength, "alpha": alpha,
+            "assign_to": assign_to,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Created material '{result['material']}'"
+        if assign_to:
+            msg += f" and assigned to '{assign_to}'"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def assign_material(
+    ctx: Context,
+    object_name: str,
+    material_name: str,
+    slot: int = 0,
+) -> str:
+    """
+    Assign an existing material to an object's material slot.
+
+    Parameters:
+    - object_name: Target object
+    - material_name: Material to assign (must already exist)
+    - slot: Material slot index (default 0)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("assign_material", {
+            "object_name": object_name, "material_name": material_name, "slot": slot,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Assigned '{material_name}' to '{object_name}' slot {slot}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def load_texture(
+    ctx: Context,
+    material_name: str,
+    image_path: str,
+    texture_slot: str = "Base Color",
+    uv_scale: float = 1.0,
+) -> str:
+    """
+    Load an image file and wire it into a material's texture slot.
+
+    Parameters:
+    - material_name: Target material (must have a Principled BSDF node)
+    - image_path: Absolute path to the image file
+    - texture_slot: 'Base Color', 'Roughness', 'Metallic', 'Normal', 'Emission Color'
+    - uv_scale: Uniform UV tiling scale (default 1.0)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("load_texture", {
+            "material_name": material_name, "image_path": image_path,
+            "texture_slot": texture_slot, "uv_scale": uv_scale,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Loaded '{result['image']}' → '{material_name}' "
+                f"slot '{result['texture_slot']}'")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Modifiers ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_modifier(
+    ctx: Context,
+    name: str,
+    modifier_type: str,
+    modifier_name: str = None,
+    params: str = None,
+) -> str:
+    """
+    Add a modifier to an object with optional parameters.
+
+    Parameters:
+    - name: Object name
+    - modifier_type: MIRROR, BEVEL, ARRAY, SOLIDIFY, SUBSURF, DECIMATE,
+                     DISPLACE, SHRINKWRAP, WIREFRAME, SKIN, LATTICE, CAST, etc.
+    - modifier_name: Display name for the modifier (auto-generated if omitted)
+    - params: JSON string of modifier properties, e.g.:
+        MIRROR:   '{"use_axis": [true, false, false], "use_clip": true}'
+        BEVEL:    '{"width": 0.1, "segments": 3}'
+        ARRAY:    '{"count": 4, "relative_offset_displace": [1, 0, 0]}'
+        SOLIDIFY: '{"thickness": 0.05}'
+        SUBSURF:  '{"levels": 2, "render_levels": 3}'
+
+    Returns the modifier name so you can reference it later with apply_modifier.
+    """
+    try:
+        blender = get_blender_connection()
+        kwargs = json.loads(params) if params else {}
+        result = blender.send_command("add_modifier", {
+            "name": name, "modifier_type": modifier_type,
+            "modifier_name": modifier_name, **kwargs,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Added {result['type']} modifier '{result['modifier']}' to '{name}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def boolean_operation(
+    ctx: Context,
+    target_name: str,
+    cutter_name: str,
+    operation: str = "DIFFERENCE",
+    solver: str = "EXACT",
+    apply: bool = True,
+) -> str:
+    """
+    Perform a boolean operation between two mesh objects.
+
+    Parameters:
+    - target_name: Object to modify (the base mesh)
+    - cutter_name: Object used as the cutting/joining tool
+    - operation: DIFFERENCE (subtract), UNION (merge), INTERSECT (keep overlap)
+    - solver: EXACT (better quality) or FAST (faster but less reliable)
+    - apply: If True (default), applies the modifier and deletes the cutter object
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("boolean_operation", {
+            "target_name": target_name, "cutter_name": cutter_name,
+            "operation": operation, "solver": solver, "apply": apply,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Boolean {operation}: '{target_name}' ∩/− '{cutter_name}' "
+                f"({'applied' if apply else 'modifier added only'})")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Render settings ──────────────────────────────────────────────────────────
+
+@mcp.tool()
+def set_render_settings(
+    ctx: Context,
+    engine: str = None,
+    width: int = None,
+    height: int = None,
+    samples: int = None,
+    output_path: str = None,
+    file_format: str = None,
+    transparent_background: bool = None,
+) -> str:
+    """
+    Configure scene render settings.
+
+    Parameters:
+    - engine: CYCLES (ray-traced, photorealistic), BLENDER_EEVEE (real-time),
+              BLENDER_WORKBENCH (solid view)
+    - width / height: Render resolution in pixels
+    - samples: Number of render samples (affects quality/noise)
+    - output_path: File path for saved renders (e.g. "C:/renders/frame_####.png")
+    - file_format: PNG, JPEG, EXR, TIFF
+    - transparent_background: True to render with alpha instead of background colour
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_render_settings", {
+            "engine": engine, "width": width, "height": height,
+            "samples": samples, "output_path": output_path,
+            "file_format": file_format,
+            "transparent_background": transparent_background,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Render settings: engine={result['engine']}, "
+                f"resolution={result['resolution']}, "
+                f"transparent={result['transparent']}, "
+                f"output={result['output']}")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Animation ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def add_keyframe(
+    ctx: Context,
+    name: str,
+    data_path: str = "location",
+    frame: int = None,
+    value: str = None,
+) -> str:
+    """
+    Insert an animation keyframe on an object property.
+
+    Parameters:
+    - name: Object name
+    - data_path: Property to key — 'location', 'rotation_euler', 'scale',
+                 or any animatable path like 'data.energy'
+    - frame: Frame number (uses current frame if omitted)
+    - value: Comma-separated values to set before keying, e.g. "1,2,3" for location.
+             Rotation values are in degrees and converted automatically.
+    """
+    try:
+        blender = get_blender_connection()
+        val = [float(v) for v in value.split(",")] if value else None
+        result = blender.send_command("add_keyframe", {
+            "name": name, "data_path": data_path,
+            "frame": frame, "value": val,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Keyframe on '{name}.{data_path}' at frame {result['frame']}"
+                + (f" = {val}" if val else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_frame(ctx: Context, frame: int) -> str:
+    """
+    Set the current scene frame (scrubs the timeline).
+
+    Parameters:
+    - frame: Target frame number
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_frame", {"frame": frame})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Frame set to {result['frame']}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Collections ─────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def create_collection(
+    ctx: Context,
+    name: str,
+    parent_collection: str = None,
+) -> str:
+    """
+    Create a new collection for scene organisation.
+
+    Parameters:
+    - name: Collection name
+    - parent_collection: Optional parent collection name (nests inside it)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_collection", {
+            "name": name, "parent_collection": parent_collection,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Collection '{result['collection']}' created"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def move_to_collection(
+    ctx: Context,
+    object_names: str,
+    collection_name: str,
+) -> str:
+    """
+    Move objects into a collection (removes them from all other collections).
+
+    Parameters:
+    - object_names: Comma-separated object names
+    - collection_name: Target collection (must already exist)
+    """
+    try:
+        blender = get_blender_connection()
+        names = [n.strip() for n in object_names.split(",") if n.strip()]
+        result = blender.send_command("move_to_collection", {
+            "object_names": names, "collection_name": collection_name,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Moved {result['moved']} → collection '{result['collection']}'"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Image-to-3D (local TripoSR, loadable/unloadable) ────────────────────────
+
+@mcp.tool()
+def load_img_to_3d_model(ctx: Context, model_dir: str = None) -> str:
+    """
+    Start the local image-to-3D inference server (TripoSR).
+    The server process is kept running until unload_img_to_3d_model() is called.
+    Frees VRAM when unloaded — load only when you need it.
+
+    Parameters:
+    - model_dir: Path to TripoSR weights directory (uses IMG_TO_3D_MODEL_DIR env var if omitted)
+    """
+    global _img_to_3d_process
+    if _img_to_3d_process is not None and _img_to_3d_process.poll() is None:
+        return f"Image-to-3D server is already running on port {_IMG_TO_3D_PORT}"
+
+    server_script = Path(__file__).parent.parent.parent / "img_to_3d_server.py"
+    if not server_script.exists():
+        return (f"img_to_3d_server.py not found at {server_script}. "
+                "Please ensure it is present in the blender_mcp root directory.")
+
+    env = {**os.environ}
+    if model_dir:
+        env["IMG_TO_3D_MODEL_DIR"] = model_dir
+    env["IMG_TO_3D_PORT"] = str(_IMG_TO_3D_PORT)
+
+    try:
+        _img_to_3d_process = _subprocess.Popen(
+            ["python", str(server_script)],
+            env=env,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.PIPE,
+        )
+        # Wait up to 30 s for the server to become ready
+        for _ in range(60):
+            _time.sleep(0.5)
+            try:
+                r = _requests.get(f"{_IMG_TO_3D_URL}/status", timeout=1)
+                if r.status_code == 200:
+                    return f"Image-to-3D server started on port {_IMG_TO_3D_PORT} (pid {_img_to_3d_process.pid})"
+            except Exception:
+                pass
+            if _img_to_3d_process.poll() is not None:
+                err = _img_to_3d_process.stderr.read(2000).decode(errors="replace")
+                return f"Image-to-3D server crashed on startup: {err}"
+        return "Image-to-3D server did not become ready within 30 s — check logs"
+    except Exception as e:
+        return f"Failed to start image-to-3D server: {e}"
+
+
+@mcp.tool()
+def unload_img_to_3d_model(ctx: Context) -> str:
+    """
+    Stop the local image-to-3D server, freeing VRAM and memory.
+    """
+    global _img_to_3d_process
+    if _img_to_3d_process is None or _img_to_3d_process.poll() is not None:
+        _img_to_3d_process = None
+        return "Image-to-3D server is not running"
+    try:
+        _img_to_3d_process.terminate()
+        _img_to_3d_process.wait(timeout=10)
+    except Exception:
+        _img_to_3d_process.kill()
+    _img_to_3d_process = None
+    return "Image-to-3D server stopped"
+
+
+@mcp.tool()
+def generate_3d_from_image(
+    ctx: Context,
+    image_path: str,
+    output_path: str = None,
+    foreground_ratio: float = 0.85,
+    mc_resolution: int = 256,
+    no_remove_bg: bool = False,
+) -> str:
+    """
+    Generate a 3D mesh (.glb) from a single image using the local TripoSR model.
+    You must call load_img_to_3d_model() first.
+
+    Parameters:
+    - image_path: Absolute path to the input image
+    - output_path: Where to save the .glb file (auto-generated if omitted)
+    - foreground_ratio: Foreground crop ratio for background removal (default 0.85)
+    - mc_resolution: Marching-cubes resolution; higher = more detail but slower (default 256)
+    - no_remove_bg: Skip background removal if the image already has a clean background
+    """
+    global _img_to_3d_process
+    if _img_to_3d_process is None or _img_to_3d_process.poll() is not None:
+        return "Image-to-3D server is not running. Call load_img_to_3d_model() first."
+
+    if not os.path.exists(image_path):
+        return f"Image not found: {image_path}"
+
+    if output_path is None:
+        output_path = os.path.join(tempfile.gettempdir(), f"triposr_{os.getpid()}.glb")
+
+    try:
+        with open(image_path, "rb") as f:
+            img_bytes = f.read()
+
+        resp = _requests.post(
+            f"{_IMG_TO_3D_URL}/generate",
+            files={"image": (os.path.basename(image_path), img_bytes)},
+            data={
+                "foreground_ratio": str(foreground_ratio),
+                "mc_resolution": str(mc_resolution),
+                "no_remove_bg": "1" if no_remove_bg else "0",
+            },
+            timeout=300,
+        )
+        if resp.status_code != 200:
+            return f"Generation failed (HTTP {resp.status_code}): {resp.text[:500]}"
+
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+
+        size_kb = len(resp.content) // 1024
+        return (f"3D model generated: {output_path} ({size_kb} KB). "
+                f"Use import_file('{output_path}') to load it into Blender.")
+    except Exception as e:
+        return f"Error calling image-to-3D server: {e}"
 
 
 @mcp.prompt()
