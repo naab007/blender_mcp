@@ -2,13 +2,13 @@
 
 BlenderMCP connects Blender to AI assistants through the Model Context Protocol (MCP), letting Claude directly control Blender for prompt-assisted 3D modelling, scene creation, rendering, and automation.
 
-This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) with **91 tools**, full Blender 4.x compatibility, and telemetry removed.
+This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) with **92 tools**, full Blender 4.x compatibility, and telemetry removed.
 
 ---
 
 ## What's new in this fork
 
-- **91 tools** across 26 categories (up from the original ~20)
+- **92 tools** across 26 categories (up from the original ~20)
 - **Blender 4.x compatibility** — fixes for BMesh layer API changes, EEVEE engine name, `temp_override` region requirement, compositor node ordering
 - **No telemetry** — all analytics code removed
 - **Auto-restart on addon reload** — server restarts automatically when the addon is cycled in Preferences; no manual click needed
@@ -37,7 +37,7 @@ This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/b
 | Modifiers | `add_modifier`, `boolean_operation` |
 | Rendering | `set_render_settings`, `render_from_camera`, `render_all_cameras` |
 | Viewport capture | `get_viewport_screenshot`, `capture_viewport_angle`, `capture_contact_sheet`, `render_depth_map` |
-| Reference images | `store_reference_image`, `compare_reference_image` |
+| Reference images | `store_reference_image`, `compare_reference_image`, `diff_images` |
 | Animation | `add_keyframe`, `set_frame` |
 | Collections | `create_collection`, `move_to_collection` |
 | Export / import | `export_object`, `import_file`, `save_blend`, `load_blend` |
@@ -137,6 +137,7 @@ Once the addon is running and the MCP server is configured, ask Claude to:
 - "Generate a 3D model of a garden gnome via Hyper3D"
 - "Render depth map of the current scene"
 - "Keyframe this object moving from (0,0,0) to (5,0,0) over 60 frames"
+- "Compare these two renders and show me exactly what changed" → `diff_images(path_a, path_b)`
 
 ---
 
@@ -149,6 +150,16 @@ Once the addon is running and the MCP server is configured, ask Claude to:
 | `IMG_TO_3D_PORT` | `7862` | Port for the local TripoSR server |
 | `IMG_TO_3D_MODEL_DIR` | `stabilityai/TripoSR` | Local weights path or HuggingFace hub ID |
 | `IMG_TO_3D_DEVICE` | auto | `cuda` or `cpu` |
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `mcp[cli]` | ≥1.3.0 | MCP server framework |
+| `pillow` | ≥10.0.0 | Image processing (viewport capture, contact sheets, diff) |
+| `numpy` | ≥1.24.0 | Pixel math for `diff_images` |
+| `flask` | ≥3.0.0 | Local TripoSR inference server |
+| `requests` | ≥2.31.0 | PolyHaven / Sketchfab / Hyper3D API calls |
 
 ---
 

@@ -1,6 +1,6 @@
 # Blender MCP — Tool Reference
 
-91 tools exposed via `@mcp.tool()` in `src/blender_mcp/server.py`.
+92 tools exposed via `@mcp.tool()` in `src/blender_mcp/server.py`.
 
 ---
 
@@ -164,6 +164,27 @@ Capture the viewport and composite it side-by-side with a stored reference image
 | `max_size` | int | 512 | Tile size for each image |
 
 **Returns:** PNG image (reference left, current render right)
+
+---
+
+### `diff_images(image_path_a, image_path_b, threshold, tile_size)`
+Compare two images and produce a 3-panel composite showing differences in bright red.
+The diff panel desaturates Image A to near-grayscale and paints changed regions red with
+a soft glow, making even small differences immediately obvious.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `image_path_a` | str | — | Path to the first image (baseline) |
+| `image_path_b` | str | — | Path to the second image (changed version) |
+| `threshold` | int | 15 | Per-pixel difference (0–255) below which changes are ignored; filters noise |
+| `tile_size` | int | 512 | Width/height of each panel in the composite |
+
+**Returns:** PNG image — three panels: `[Image A] | [Image B] | [Diff (X.X% changed)]`
+
+**Notes:**
+- Images are resized to `tile_size × tile_size` before comparison; aspect ratio is not preserved
+- Diff mask is amplified 6× before thresholding so subtle changes become visible
+- Requires `numpy` and `Pillow` (both included in default deps)
 
 ---
 
