@@ -9,22 +9,29 @@ from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List
 import os
+import sys
+import glob as _glob
+import shutil as _shutil
+import subprocess as _subprocess
+import time as _time
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
 import io
+import requests as _requests
 
 # Optional PIL — used for image safety guards and compositing
 try:
-    from PIL import Image as PILImage, ImageDraw, ImageFont
+    from PIL import Image as PILImage, ImageDraw
     _PIL_AVAILABLE = True
 except ImportError:
     PILImage = None  # type: ignore
     ImageDraw = None  # type: ignore
-    ImageFont = None  # type: ignore
     _PIL_AVAILABLE = False
 
-_SAFE_IMAGE_MAX_PIXELS = 8_000_000  # ~2828×2828 at 1:1 aspect
+_SAFE_IMAGE_MAX_PIXELS = 8_000_000   # ~2828×2828 at 1:1 aspect
+_SAFE_IMAGE_MAX_DIM = 8000            # API per-dimension ceiling
+_SAFE_IMAGE_MAX_BYTES = 4 * 1024 * 1024  # stay under the ~5 MB per-image API limit
 
 # Configure logging early so _safe_image_return can use logger
 logging.basicConfig(level=logging.INFO,
@@ -32,18 +39,33 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("BlenderMCPServer")
 
 
-def _safe_image_return(data: bytes, fmt: str = "png"):
+def _encode_image(img, fmt: str) -> bytes:
+    """Encode a PIL image to bytes; PNG keeps alpha, JPEG is flattened."""
+    buf = io.BytesIO()
+    if fmt == "jpeg":
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+    else:
+        if img.mode not in ("RGB", "RGBA", "L", "LA"):
+            img = img.convert("RGBA" if "A" in img.mode or img.mode == "P" else "RGB")
+        img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _safe_image_return(data: bytes, fmt: str = "png") -> Image:
     """
-    Validate and, if necessary, resize image bytes before returning them
-    to Claude's API.
+    Validate and, if necessary, shrink image bytes before returning them to
+    Claude's API, then wrap them in an MCP ``Image``.
 
     - Raises ValueError when data is empty or None.
-    - When PIL is available and the image exceeds _SAFE_IMAGE_MAX_PIXELS total
-      pixels, resizes proportionally with LANCZOS and re-encodes to PNG.
-    - When PIL is unavailable and the file is > 5 MB, logs a warning but still
-      returns the data so the caller at least gets something.
-
-    Returns (bytes, format_str) — always PNG when PIL performs a resize.
+    - The real format is read from the bytes; ``fmt`` is only a fallback when
+      PIL cannot identify the image (so a PNG labelled "jpeg" is corrected).
+    - Downscales proportionally (LANCZOS, alpha preserved) when the image
+      exceeds _SAFE_IMAGE_MAX_PIXELS total pixels or _SAFE_IMAGE_MAX_DIM on
+      either side, and keeps halving until the encoded size is under
+      _SAFE_IMAGE_MAX_BYTES.
+    - Without PIL the byte-size check still runs but can only warn.
     """
     if not data:
         raise ValueError("Image data is empty — Blender may not have written the file")
@@ -51,31 +73,105 @@ def _safe_image_return(data: bytes, fmt: str = "png"):
     if _PIL_AVAILABLE:
         try:
             img = PILImage.open(io.BytesIO(data))
+            detected = (img.format or "").lower()
+            if detected in ("png", "jpeg"):
+                fmt = detected
+            elif detected:
+                fmt = "png"  # webp/bmp/etc. → re-encode as PNG
             w, h = img.size
             total = w * h
+            scale = 1.0
             if total > _SAFE_IMAGE_MAX_PIXELS:
                 scale = (_SAFE_IMAGE_MAX_PIXELS / total) ** 0.5
-                new_w = max(1, int(w * scale))
-                new_h = max(1, int(h * scale))
-                logger.info(
-                    f"_safe_image_return: resizing {w}×{h} → {new_w}×{new_h} "
-                    f"({total:,} px > {_SAFE_IMAGE_MAX_PIXELS:,} px limit)"
-                )
-                img = img.convert("RGB").resize((new_w, new_h), PILImage.LANCZOS)
-                buf = io.BytesIO()
-                img.save(buf, format="PNG", optimize=True)
-                data = buf.getvalue()
-                fmt = "png"
+            if max(w, h) * scale > _SAFE_IMAGE_MAX_DIM:
+                scale = _SAFE_IMAGE_MAX_DIM / max(w, h)
+            needs_reencode = scale < 1.0 or detected not in ("png", "jpeg")
+            if needs_reencode:
+                img.load()
+                if scale < 1.0:
+                    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+                    logger.info(f"_safe_image_return: resizing {w}×{h} → {new_w}×{new_h}")
+                    img = img.resize((new_w, new_h), PILImage.LANCZOS)
+                data = _encode_image(img, fmt)
+            # Byte-size ceiling: halve until it fits (bounded loop).
+            for _ in range(4):
+                if len(data) <= _SAFE_IMAGE_MAX_BYTES:
+                    break
+                img.load()
+                w, h = img.size
+                img = img.resize((max(1, w // 2), max(1, h // 2)), PILImage.LANCZOS)
+                logger.info(f"_safe_image_return: {len(data)/1048576:.1f} MB > limit, halving to {img.size}")
+                data = _encode_image(img, fmt)
         except Exception as e:
             logger.warning(f"_safe_image_return: PIL check failed ({e}), returning raw data")
-    else:
-        if len(data) > 5 * 1024 * 1024:
-            logger.warning(
-                f"_safe_image_return: image is {len(data) / 1024 / 1024:.1f} MB but "
-                "PIL is not available — cannot resize; API may reject it"
-            )
+    elif len(data) > _SAFE_IMAGE_MAX_BYTES:
+        logger.warning(
+            f"_safe_image_return: image is {len(data) / 1024 / 1024:.1f} MB but "
+            "PIL is not available — cannot resize; API may reject it"
+        )
 
     return Image(data=data, format=fmt)
+
+
+def _read_and_remove(path: str) -> bytes:
+    """Read a temp file Blender wrote and delete it; a locked file is not fatal."""
+    with open(path, "rb") as f:
+        data = f.read()
+    _remove_quiet(path)
+    return data
+
+
+def _remove_quiet(*paths: str) -> None:
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except OSError as e:
+            logger.warning(f"Could not remove temp file {p}: {e}")
+
+
+def _pil_to_png_bytes(img) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _fit_to_box(img, box_w: int, box_h: int, fill=(0, 0, 0)):
+    """Scale ``img`` to fit inside box_w×box_h keeping aspect, letterboxed."""
+    img = img.convert("RGB")
+    ratio = min(box_w / img.width, box_h / img.height)
+    nw, nh = max(1, int(img.width * ratio)), max(1, int(img.height * ratio))
+    canvas = PILImage.new("RGB", (box_w, box_h), fill)
+    canvas.paste(img.resize((nw, nh), PILImage.LANCZOS), ((box_w - nw) // 2, (box_h - nh) // 2))
+    return canvas
+
+
+def _compose_grid(tiles, columns: int, tile_w: int, tile_h: int, labels=None, gap: int = 4,
+                  fill=(20, 20, 20)):
+    """Lay PIL images out on a grid (letterboxed into tile_w×tile_h cells)."""
+    n = len(tiles)
+    columns = max(1, min(columns, n))
+    rows = (n + columns - 1) // columns
+    sheet = PILImage.new("RGB", (columns * tile_w + (columns - 1) * gap,
+                                 rows * tile_h + (rows - 1) * gap), fill)
+    draw = ImageDraw.Draw(sheet)
+    for i, tile in enumerate(tiles):
+        x = (i % columns) * (tile_w + gap)
+        y = (i // columns) * (tile_h + gap)
+        sheet.paste(_fit_to_box(tile, tile_w, tile_h), (x, y))
+        if labels and i < len(labels) and labels[i]:
+            draw.rectangle([x, y, x + 8 + 7 * len(labels[i]), y + 16], fill=(0, 0, 0))
+            draw.text((x + 4, y + 2), labels[i], fill=(255, 255, 255))
+    return sheet
+
+
+def _probe_port(host: str, port: int, timeout: float = 1.0) -> bool:
+    """True if something accepts a TCP connection on host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 # Default configuration
@@ -130,16 +226,18 @@ class BlenderConnection:
                         break
                     
                     chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
+
+                    # A JSON object can only be complete when the last byte is '}';
+                    # skip the (O(n)) parse attempt for every intermediate chunk.
+                    if not chunk.rstrip().endswith(b'}'):
+                        continue
                     try:
                         data = b''.join(chunks)
                         json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        # Incomplete JSON (or a multi-byte char split across chunks), continue receiving
                         continue
                 except socket.timeout:
                     # If we hit a timeout during receiving, break the loop and try to use what we have
@@ -238,7 +336,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Try to connect to Blender on startup to verify it's available
         try:
             # This will initialize the global connection if needed
-            blender = get_blender_connection()
+            get_blender_connection()
             logger.info("Successfully connected to Blender on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Blender on startup: {str(e)}")
@@ -271,37 +369,30 @@ _polyhaven_enabled = False  # Add this global variable
 _blender_process = None
 
 def get_blender_connection():
-    """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
-    if _blender_connection is not None:
-        try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
-            return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _blender_connection.disconnect()
-            except:
-                pass
-            _blender_connection = None
-    
-    # Create a new connection if needed
-    if _blender_connection is None:
-        host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-        port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-    
+    """Get or create a persistent Blender connection.
+
+    Liveness is not probed with an extra round-trip on every call: a dead
+    socket surfaces as an exception from the real command, which resets the
+    connection so the next call reconnects.
+    """
+    global _blender_connection, _polyhaven_enabled
+
+    if _blender_connection is not None and _blender_connection.sock is not None:
+        return _blender_connection
+
+    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
+    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    conn = BlenderConnection(host=host, port=port)
+    if not conn.connect():
+        _blender_connection = None
+        logger.error("Failed to connect to Blender")
+        raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+    _blender_connection = conn
+    logger.info("Created new persistent connection to Blender")
+    try:
+        _polyhaven_enabled = bool(conn.send_command("get_polyhaven_status").get("enabled", False))
+    except Exception as e:
+        logger.warning(f"Could not read PolyHaven status on connect: {e}")
     return _blender_connection
 
 
@@ -364,15 +455,8 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
         
         if not os.path.exists(temp_path):
             raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
 
-        # Delete the temp file
-        os.remove(temp_path)
-
-        return _safe_image_return(image_bytes)
+        return _safe_image_return(_read_and_remove(temp_path))
         
     except Exception as e:
         logger.error(f"Error capturing screenshot: {str(e)}")
@@ -747,7 +831,7 @@ def get_sketchfab_model_preview(
         
         # Decode base64 image data
         image_data = base64.b64decode(result["image_data"])
-        img_format = result.get("format", "jpeg")
+        img_format = result.get("format", "jpeg")  # corrected from the bytes by _safe_image_return
         
         # Log model info
         model_name = result.get("model_name", "Unknown")
@@ -1125,8 +1209,6 @@ def import_generated_asset_hunyuan(
 
 # ─── Blender process management ──────────────────────────────────────────────
 
-import glob as _glob
-import shutil as _shutil
 
 
 def _find_blender_exe(hint: str = None) -> str | None:
@@ -1170,8 +1252,33 @@ def _find_blender_exe(hint: str = None) -> str | None:
     return None
 
 
+def _blender_host_port() -> tuple[str, int]:
+    return os.getenv("BLENDER_HOST", DEFAULT_HOST), int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+
+
+def _drop_connection() -> None:
+    """Forget the persistent connection so the next tool call reconnects."""
+    global _blender_connection
+    if _blender_connection:
+        try:
+            _blender_connection.disconnect()
+        except Exception:
+            pass
+    _blender_connection = None
+
+
+async def _wait_for_exit(proc, timeout: float) -> bool:
+    """Poll a Popen without blocking the event loop. True if it exited."""
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        await asyncio.sleep(0.2)
+    return proc.poll() is not None
+
+
 @mcp.tool()
-def start_blender(
+async def start_blender(
     ctx: Context,
     blend_file: str = None,
     blender_exe: str = None,
@@ -1192,8 +1299,11 @@ def start_blender(
                       jobs that don't use the addon.
     - python_expr: Optional Python expression passed to Blender via --python-expr,
                    e.g. "import bpy; bpy.ops.wm.quit_blender()" for scripted batch runs.
+
+    Blender console output goes to blender_mcp_blender.log in the temp folder; it
+    must never share this process stdio, which carries the MCP transport.
     """
-    global _blender_process, _blender_connection
+    global _blender_process
 
     if _blender_process is not None and _blender_process.poll() is None:
         return f"Blender is already running (pid {_blender_process.pid}). Call close_blender() first."
@@ -1216,23 +1326,21 @@ def start_blender(
     if python_expr:
         cmd += ["--python-expr", python_expr]
 
+    log_path = os.path.join(tempfile.gettempdir(), "blender_mcp_blender.log")
     try:
-        _blender_process = _subprocess.Popen(
-            cmd,
-            stdout=_subprocess.DEVNULL if background else None,
-            stderr=_subprocess.DEVNULL if background else None,
-        )
-        logger.info(f"Blender started: pid={_blender_process.pid}  cmd={cmd}")
+        with open(log_path, "ab") as log_fh:
+            _blender_process = _subprocess.Popen(
+                cmd,
+                stdin=_subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=_subprocess.STDOUT,
+            )
+        logger.info(f"Blender started: pid={_blender_process.pid}  cmd={cmd}  log={log_path}")
     except Exception as e:
         return f"Failed to launch Blender: {e}"
 
     # Reset any stale connection so get_blender_connection() reconnects fresh
-    if _blender_connection:
-        try:
-            _blender_connection.disconnect()
-        except Exception:
-            pass
-        _blender_connection = None
+    _drop_connection()
 
     if not wait_for_addon or background:
         return (
@@ -1242,79 +1350,85 @@ def start_blender(
         )
 
     # Poll port 9876 until the addon TCP server is up
-    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-    for _ in range(60):   # 30 s total
-        _time.sleep(0.5)
+    host, port = _blender_host_port()
+    deadline = _time.monotonic() + 30.0
+    while _time.monotonic() < deadline:
         if _blender_process.poll() is not None:
-            return f"Blender exited unexpectedly (code {_blender_process.returncode})"
-        try:
-            test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test.settimeout(0.5)
-            test.connect((host, port))
-            test.close()
+            return (f"Blender exited unexpectedly (code {_blender_process.returncode}). "
+                    f"See {log_path}")
+        if _probe_port(host, port, 0.5):
             return (
                 f"Blender started (pid {_blender_process.pid}) and addon is ready on port {port}."
                 + (f" Opened: {blend_file}" if blend_file else "")
             )
-        except (ConnectionRefusedError, OSError):
-            pass
+        await asyncio.sleep(0.5)
 
     return (
         f"Blender launched (pid {_blender_process.pid}) but the MCP addon did not respond "
         f"on port {port} within 30 s. Make sure the BlenderMCP addon is installed and enabled "
-        "in Blender Preferences → Add-ons."
+        f"in Blender Preferences -> Add-ons. Blender log: {log_path}"
     )
 
 
 @mcp.tool()
-def close_blender(
+async def close_blender(
     ctx: Context,
     force: bool = False,
+    save: bool = False,
 ) -> str:
     """
-    Close the Blender instance that was started with start_blender().
+    Close Blender. Works for an instance started with start_blender() and, via the
+    addon socket, for one the user launched by hand.
 
     Parameters:
-    - force: If True, kills the process immediately instead of asking Blender
-             to quit gracefully via its Python API (default False).
+    - force: If True, kills the managed process immediately instead of asking
+             Blender to quit gracefully via its Python API (default False).
+    - save: If True, save the current .blend (if it has a path) before quitting.
+            Unsaved changes are otherwise discarded without a prompt.
     """
-    global _blender_process, _blender_connection
+    global _blender_process
 
     pid = _blender_process.pid if _blender_process else None
+    host, port = _blender_host_port()
+    graceful = False
 
-    # Graceful path: ask Blender to quit via the addon socket
-    if not force and _blender_connection:
+    # Graceful path: ask Blender to quit via the addon socket (connect if needed)
+    if not force and _probe_port(host, port, 0.5):
         try:
-            _blender_connection.send_command("quit_blender", {"save_prompt": False})
-            # Give it 3 s to actually close
-            if _blender_process:
-                try:
-                    _blender_process.wait(timeout=3)
-                except _subprocess.TimeoutExpired:
-                    pass
-        except Exception:
-            pass   # socket gone = Blender already closing
+            conn = get_blender_connection()
+            conn.send_command("quit_blender", {"save_prompt": False, "save": save})
+            graceful = True
+        except Exception as e:
+            # A dropped socket here usually means Blender is already shutting down
+            logger.info(f"quit_blender via socket: {e}")
+            graceful = "Connection to Blender lost" in str(e) or "Communication error" in str(e)
+        if graceful:
+            if _blender_process is not None:
+                await _wait_for_exit(_blender_process, 8.0)
+            else:
+                deadline = _time.monotonic() + 8.0
+                while _time.monotonic() < deadline and _probe_port(host, port, 0.3):
+                    await asyncio.sleep(0.3)
 
-    # Also disconnect on our side
-    if _blender_connection:
-        try:
-            _blender_connection.disconnect()
-        except Exception:
-            pass
-        _blender_connection = None
+    _drop_connection()
 
-    # Ensure the process is gone
+    # Ensure a managed process is gone
     if _blender_process is not None:
         if _blender_process.poll() is None:
-            try:
-                _blender_process.terminate()
-                _blender_process.wait(timeout=5)
-            except _subprocess.TimeoutExpired:
+            logger.warning("Blender did not quit gracefully; terminating")
+            _blender_process.terminate()
+            if not await _wait_for_exit(_blender_process, 5.0):
                 _blender_process.kill()
+            graceful = False
         _blender_process = None
 
-    return f"Blender closed." + (f" (pid was {pid})" if pid else "")
+    if graceful:
+        how = "gracefully"
+    elif pid or force:
+        how = "process terminated"
+    else:
+        how = "no running instance found"
+    return f"Blender closed ({how})." + (f" (pid was {pid})" if pid else "")
 
 
 @mcp.tool()
@@ -1322,8 +1436,6 @@ def get_blender_status(ctx: Context) -> str:
     """
     Report whether Blender is running, and whether the MCP addon is reachable.
     """
-    global _blender_process
-
     proc_status = "not started via MCP"
     if _blender_process is not None:
         code = _blender_process.poll()
@@ -1332,16 +1444,15 @@ def get_blender_status(ctx: Context) -> str:
         else:
             proc_status = f"exited (code {code})"
 
-    # Try to ping the addon socket
-    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-    try:
-        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        test.settimeout(1.0)
-        test.connect((host, port))
-        test.close()
+    host, port = _blender_host_port()
+    if _probe_port(host, port, 1.0):
         addon_status = f"reachable on {host}:{port}"
-    except (ConnectionRefusedError, OSError):
+        try:
+            get_blender_connection().send_command("get_polyhaven_status")
+            addon_status += " (addon responding)"
+        except Exception as e:
+            addon_status += f" (port open but addon not responding: {e})"
+    else:
         addon_status = f"not reachable on {host}:{port}"
 
     return f"Process: {proc_status}\nAddon socket: {addon_status}"
@@ -1350,9 +1461,6 @@ def get_blender_status(ctx: Context) -> str:
 # ─── Extended tools ──────────────────────────────────────────────────────────
 
 # Subprocess management for the local image-to-3D server
-import subprocess as _subprocess
-import time as _time
-import requests as _requests
 
 _img_to_3d_process = None
 _IMG_TO_3D_PORT = 7862
@@ -1360,6 +1468,14 @@ _IMG_TO_3D_URL = f"http://127.0.0.1:{_IMG_TO_3D_PORT}"
 
 
 # ─── Multi-angle capture ─────────────────────────────────────────────────────
+
+_VALID_ANGLES = ("front", "back", "left", "right", "top", "bottom",
+                 "iso_front_right", "iso_front_left")
+
+
+def _temp_png(tag: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f"blender_{tag}_{os.getpid()}.png")
+
 
 @mcp.tool()
 def capture_viewport_angle(
@@ -1376,8 +1492,11 @@ def capture_viewport_angle(
     - max_size: Maximum pixel dimension (default 800)
     """
     try:
+        if angle not in _VALID_ANGLES:
+            raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
         blender = get_blender_connection()
-        temp_path = os.path.join(tempfile.gettempdir(), f"blender_angle_{angle}_{os.getpid()}.png")
+        temp_path = _temp_png(f"angle_{angle}")
+        _remove_quiet(temp_path)
         result = blender.send_command("capture_viewport_angle", {
             "angle": angle,
             "max_size": max_size,
@@ -1385,13 +1504,10 @@ def capture_viewport_angle(
         })
         if "error" in result:
             raise Exception(result["error"])
-        with open(temp_path, "rb") as f:
-            data = f.read()
-        os.remove(temp_path)
-        return _safe_image_return(data)
+        return _safe_image_return(_read_and_remove(temp_path))
     except Exception as e:
         logger.error(f"capture_viewport_angle error: {e}")
-        raise Exception(f"capture_viewport_angle failed: {e}")
+        raise Exception(f"capture_viewport_angle failed: {e}") from e
 
 
 @mcp.tool()
@@ -1410,8 +1526,14 @@ def capture_contact_sheet(
     Returns a single composited image with all requested angles labelled.
     """
     try:
-        blender = get_blender_connection()
         angle_list = [a.strip() for a in angles.split(",") if a.strip()]
+        bad = [a for a in angle_list if a not in _VALID_ANGLES]
+        if bad:
+            raise Exception(f"Unknown angle(s) {bad}. Valid angles: {', '.join(_VALID_ANGLES)}")
+        if not angle_list:
+            raise Exception("No angles given")
+
+        blender = get_blender_connection()
         result = blender.send_command("capture_contact_sheet", {
             "angles": angle_list,
             "max_size": max_size,
@@ -1420,59 +1542,30 @@ def capture_contact_sheet(
             raise Exception(result["error"])
 
         images_info = result.get("images", {})
+        paths = [(a, images_info.get(a, {}).get("filepath")) for a in angle_list]
+        paths = [(a, fp) for a, fp in paths if fp and os.path.exists(fp)]
+        if not paths:
+            raise Exception("No images were captured")
 
-        # If PIL is available, composite into a grid
-        if _PIL_AVAILABLE:
-            tiles = []
-            for angle in angle_list:
-                info = images_info.get(angle, {})
-                fp = info.get("filepath")
-                if fp and os.path.exists(fp):
-                    tile = PILImage.open(fp).convert("RGB")
-                    tiles.append((angle, tile))
+        try:
+            if not _PIL_AVAILABLE:
+                # Fallback: just return the first captured image
+                with open(paths[0][1], "rb") as f:
+                    return _safe_image_return(f.read())
 
-            if tiles:
-                cols = min(len(tiles), 4)
-                rows = (len(tiles) + cols - 1) // cols
-                tw, th = tiles[0][1].size
-                sheet = PILImage.new("RGB", (cols * tw, rows * th), (30, 30, 30))
-                for i, (label, tile) in enumerate(tiles):
-                    x = (i % cols) * tw
-                    y = (i // cols) * th
-                    sheet.paste(tile, (x, y))
-                    draw = ImageDraw.Draw(sheet)
-                    draw.text((x + 4, y + 4), label, fill=(255, 255, 0))
-
-                out_path = os.path.join(tempfile.gettempdir(), f"blender_contact_{os.getpid()}.png")
-                sheet.save(out_path)
-                with open(out_path, "rb") as f:
-                    data = f.read()
-                os.remove(out_path)
-
-                # Clean up individual tiles
-                for angle, _ in tiles:
-                    fp = images_info[angle].get("filepath")
-                    if fp and os.path.exists(fp):
-                        try:
-                            os.remove(fp)
-                        except Exception:
-                            pass
-
-                return _safe_image_return(data)
-
-        # Fallback: just return the first captured image
-        for angle in angle_list:
-            fp = images_info.get(angle, {}).get("filepath")
-            if fp and os.path.exists(fp):
-                with open(fp, "rb") as f:
-                    data = f.read()
-                os.remove(fp)
-                return _safe_image_return(data)
-
-        raise Exception("No images were captured")
+            tiles, labels = [], []
+            for a, fp in paths:
+                with PILImage.open(fp) as im:
+                    im.load()
+                    tiles.append(im.convert("RGB"))
+                labels.append(a)
+            sheet = _compose_grid(tiles, columns=4, tile_w=max_size, tile_h=max_size, labels=labels)
+            return _safe_image_return(_pil_to_png_bytes(sheet))
+        finally:
+            _remove_quiet(*[fp for _, fp in paths])
     except Exception as e:
         logger.error(f"capture_contact_sheet error: {e}")
-        raise Exception(f"capture_contact_sheet failed: {e}")
+        raise Exception(f"capture_contact_sheet failed: {e}") from e
 
 
 # ─── Depth map ───────────────────────────────────────────────────────────────
@@ -1484,33 +1577,47 @@ def render_depth_map(
 ) -> Image:
     """
     Render a normalised depth map from the active camera using the Blender compositor
-    Z-pass. Closer objects appear lighter.
+    Z-pass. Closer objects appear lighter. Rendered in a throw-away scene copy, so the
+    current scene's compositor and render settings are untouched.
 
     Parameters:
     - max_depth: Depth value (scene units) mapped to black (default 10.0)
     """
     try:
         blender = get_blender_connection()
-        temp_path = os.path.join(tempfile.gettempdir(), f"blender_depth_{os.getpid()}.png")
+        temp_path = _temp_png("depth")
+        _remove_quiet(temp_path)
         result = blender.send_command("render_depth_map", {
             "filepath": temp_path,
             "max_depth": max_depth,
         })
         if "error" in result:
             raise Exception(result["error"])
-        with open(temp_path, "rb") as f:
-            data = f.read()
-        os.remove(temp_path)
-        return _safe_image_return(data)
+        return _safe_image_return(_read_and_remove(temp_path))
     except Exception as e:
         logger.error(f"render_depth_map error: {e}")
-        raise Exception(f"render_depth_map failed: {e}")
+        raise Exception(f"render_depth_map failed: {e}") from e
 
 
 # ─── Reference image ─────────────────────────────────────────────────────────
 
-# Server-side registry so compare_reference_image can find paths without a round-trip
+# Server-side cache; the addon keeps the authoritative copy so a server restart
+# (client reconnect) does not lose references stored earlier in the session.
 _reference_registry: Dict[str, str] = {}
+
+
+def _resolve_reference(blender, name: str) -> str:
+    path = _reference_registry.get(name)
+    if path is None:
+        r = blender.send_command("get_reference_image", {"name": name})
+        path = r.get("filepath")
+        if path:
+            _reference_registry[name] = path
+    if not path:
+        raise Exception(f"Reference '{name}' not found. Call store_reference_image first.")
+    if not os.path.exists(path):
+        raise Exception(f"Reference '{name}' points to a missing file: {path}")
+    return path
 
 
 @mcp.tool()
@@ -1525,11 +1632,11 @@ def store_reference_image(ctx: Context, name: str, filepath: str) -> str:
     try:
         if not os.path.exists(filepath):
             return f"Error: file not found: {filepath}"
-        _reference_registry[name] = filepath
         blender = get_blender_connection()
         result = blender.send_command("store_reference_image", {"name": name, "filepath": filepath})
         if "error" in result:
             return f"Error: {result['error']}"
+        _reference_registry[name] = filepath
         return f"Stored reference '{name}' from {filepath}. All refs: {result.get('stored_refs', [])}"
     except Exception as e:
         return f"Error: {e}"
@@ -1544,7 +1651,7 @@ def compare_reference_image(
 ) -> Image:
     """
     Capture the current viewport from a named angle and composite it side-by-side
-    with a previously stored reference image.
+    with a previously stored reference image. Both tiles keep their aspect ratio.
 
     Parameters:
     - reference_name: Name given to store_reference_image earlier
@@ -1552,10 +1659,13 @@ def compare_reference_image(
     - max_size: Tile size for each image in the composite
     """
     try:
+        if angle not in _VALID_ANGLES:
+            raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
         blender = get_blender_connection()
+        ref_path = _resolve_reference(blender, reference_name)
 
-        # Capture current viewport
-        temp_render = os.path.join(tempfile.gettempdir(), f"blender_cmp_render_{os.getpid()}.png")
+        temp_render = _temp_png("cmp_render")
+        _remove_quiet(temp_render)
         r = blender.send_command("capture_viewport_angle", {
             "angle": angle,
             "max_size": max_size,
@@ -1564,43 +1674,30 @@ def compare_reference_image(
         if "error" in r:
             raise Exception(r["error"])
 
-        ref_path = _reference_registry.get(reference_name)
-        if ref_path is None:
-            raise Exception(f"Reference '{reference_name}' not found. Call store_reference_image first.")
-
         if not _PIL_AVAILABLE:
-            # Just return the render
-            with open(temp_render, "rb") as f:
-                data = f.read()
-            os.remove(temp_render)
-            return _safe_image_return(data)
+            return _safe_image_return(_read_and_remove(temp_render))
 
-        render_img = PILImage.open(temp_render).convert("RGB").resize((max_size, max_size))
-        ref_img    = PILImage.open(ref_path).convert("RGB").resize((max_size, max_size))
+        try:
+            with PILImage.open(temp_render) as im:
+                im.load()
+                render_img = im.convert("RGB")
+        finally:
+            _remove_quiet(temp_render)
+        with PILImage.open(ref_path) as im:
+            im.load()
+            ref_img = im.convert("RGB")
 
-        sheet = PILImage.new("RGB", (max_size * 2 + 8, max_size + 24), (30, 30, 30))
-        sheet.paste(ref_img,    (0,          24))
-        sheet.paste(render_img, (max_size + 8, 24))
-
-        draw = ImageDraw.Draw(sheet)
-        draw.text((4,            4), f"Reference: {reference_name}", fill=(200, 200, 255))
-        draw.text((max_size + 12, 4), f"Current: {angle}",            fill=(255, 200, 100))
-
-        out_path = os.path.join(tempfile.gettempdir(), f"blender_compare_{os.getpid()}.png")
-        sheet.save(out_path)
-        with open(out_path, "rb") as f:
-            data = f.read()
-
-        for p in (temp_render, out_path):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
-
-        return _safe_image_return(data)
+        bar = 24
+        sheet = _compose_grid([ref_img, render_img], columns=2, tile_w=max_size, tile_h=max_size, gap=8)
+        out = PILImage.new("RGB", (sheet.width, sheet.height + bar), (30, 30, 30))
+        out.paste(sheet, (0, bar))
+        draw = ImageDraw.Draw(out)
+        draw.text((4, 4), f"Reference: {reference_name}", fill=(200, 200, 255))
+        draw.text((max_size + 12, 4), f"Current: {angle}", fill=(255, 200, 100))
+        return _safe_image_return(_pil_to_png_bytes(out))
     except Exception as e:
         logger.error(f"compare_reference_image error: {e}")
-        raise Exception(f"compare_reference_image failed: {e}")
+        raise Exception(f"compare_reference_image failed: {e}") from e
 
 
 @mcp.tool()
@@ -1614,13 +1711,14 @@ def diff_images(
     """
     Compare two images and produce a 3-panel composite: [Image A] | [Image B] | [Diff].
     The diff panel desaturates the base image and paints changed regions in bright red,
-    making differences immediately obvious.
+    making differences immediately obvious. Image B is scaled to A's size for the
+    pixel diff; panels keep A's aspect ratio.
 
     Parameters:
     - image_path_a: Path to the first image (treated as the reference/baseline)
     - image_path_b: Path to the second image (treated as the new/changed version)
     - threshold: Pixel difference (0-255) below which changes are ignored (default 15, filters noise)
-    - tile_size: Width/height of each panel in the composite (default 512)
+    - tile_size: Longest side of each panel in the composite (default 512)
     """
     try:
         if not _PIL_AVAILABLE:
@@ -1633,61 +1731,48 @@ def diff_images(
         import numpy as np
         from PIL import ImageChops, ImageEnhance, ImageFilter
 
-        img_a = PILImage.open(image_path_a).convert("RGB").resize((tile_size, tile_size), PILImage.LANCZOS)
-        img_b = PILImage.open(image_path_b).convert("RGB").resize((tile_size, tile_size), PILImage.LANCZOS)
+        with PILImage.open(image_path_a) as im:
+            im.load()
+            img_a = im.convert("RGB")
+        with PILImage.open(image_path_b) as im:
+            im.load()
+            img_b = im.convert("RGB")
+
+        # Work at panel resolution, preserving A's aspect ratio
+        ratio = tile_size / max(img_a.size)
+        tw, th = max(1, int(img_a.width * ratio)), max(1, int(img_a.height * ratio))
+        img_a = img_a.resize((tw, th), PILImage.LANCZOS)
+        img_b = img_b.resize((tw, th), PILImage.LANCZOS)
 
         # --- Build diff mask ---
-        diff = ImageChops.difference(img_a, img_b)
-        diff_gray = diff.convert("L")
-        diff_arr  = np.array(diff_gray, dtype=np.float32)
-
-        # Amplify so subtle changes become visible, then threshold
+        diff_arr = np.array(ImageChops.difference(img_a, img_b).convert("L"), dtype=np.float32)
         amplified = np.clip(diff_arr * 6, 0, 255).astype(np.uint8)
-        mask_arr  = np.where(amplified > threshold, 255, 0).astype(np.uint8)
-
-        # Soft glow: slight blur on the mask so hard edges bleed outward
-        mask_img  = PILImage.fromarray(mask_arr, "L").filter(ImageFilter.GaussianBlur(radius=2))
+        mask_arr = np.where(amplified > threshold, 255, 0).astype(np.uint8)
+        mask_img = PILImage.fromarray(mask_arr, "L").filter(ImageFilter.GaussianBlur(radius=2))
 
         # --- Diff panel: desaturated base + red overlay ---
-        base_desat  = ImageEnhance.Color(img_a).enhance(0.15)   # near-grayscale
-        red_overlay = PILImage.new("RGB", (tile_size, tile_size), (255, 30, 30))
-        diff_panel  = PILImage.composite(red_overlay, base_desat, mask_img)
-
-        # Annotate changed pixel percentage
-        changed_pct = (mask_arr > 0).sum() / (tile_size * tile_size) * 100
+        base_desat = ImageEnhance.Color(img_a).enhance(0.15)
+        red_overlay = PILImage.new("RGB", (tw, th), (255, 30, 30))
+        diff_panel = PILImage.composite(red_overlay, base_desat, mask_img)
+        changed_pct = (mask_arr > 0).sum() / (tw * th) * 100
 
         # --- 3-panel composite ---
-        gap    = 6
-        bar    = 28
-        w      = tile_size * 3 + gap * 2
-        h      = tile_size + bar
-        sheet  = PILImage.new("RGB", (w, h), (20, 20, 20))
-
-        sheet.paste(img_a,      (0,                         bar))
-        sheet.paste(img_b,      (tile_size + gap,           bar))
-        sheet.paste(diff_panel, (tile_size * 2 + gap * 2,   bar))
+        gap, bar = 6, 28
+        sheet = PILImage.new("RGB", (tw * 3 + gap * 2, th + bar), (20, 20, 20))
+        sheet.paste(img_a, (0, bar))
+        sheet.paste(img_b, (tw + gap, bar))
+        sheet.paste(diff_panel, (tw * 2 + gap * 2, bar))
 
         draw = ImageDraw.Draw(sheet)
-        x_a    = tile_size // 2 - 30
-        x_b    = tile_size + gap + tile_size // 2 - 30
-        x_diff = tile_size * 2 + gap * 2 + tile_size // 2 - 50
-        draw.text((x_a,    6), "Image A",                       fill=(200, 200, 200))
-        draw.text((x_b,    6), "Image B",                       fill=(200, 200, 200))
-        draw.text((x_diff, 6), f"Diff  ({changed_pct:.1f}% changed)",  fill=(255, 100, 100))
+        draw.text((max(0, tw // 2 - 30), 6), "Image A", fill=(200, 200, 200))
+        draw.text((tw + gap + max(0, tw // 2 - 30), 6), "Image B", fill=(200, 200, 200))
+        draw.text((tw * 2 + gap * 2 + max(0, tw // 2 - 50), 6),
+                  f"Diff  ({changed_pct:.1f}% changed)", fill=(255, 100, 100))
 
-        out_path = os.path.join(tempfile.gettempdir(), f"blender_diff_{os.getpid()}.png")
-        sheet.save(out_path)
-        with open(out_path, "rb") as f:
-            data = f.read()
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
-
-        return _safe_image_return(data)
+        return _safe_image_return(_pil_to_png_bytes(sheet))
     except Exception as e:
         logger.error(f"diff_images error: {e}")
-        raise Exception(f"diff_images failed: {e}")
+        raise Exception(f"diff_images failed: {e}") from e
 
 
 # ─── Mesh editing ────────────────────────────────────────────────────────────
@@ -2426,11 +2511,12 @@ def render_from_camera(
     - camera_name: Camera to render from (uses scene active camera if omitted)
     - width: Render width in pixels (default 1920)
     - height: Render height in pixels (default 1080)
-    - samples: Cycles sample count, ignored for EEVEE (default 32)
+    - samples: Sample count for Cycles and EEVEE (default 32)
     """
     try:
         blender = get_blender_connection()
-        temp_path = os.path.join(tempfile.gettempdir(), f"blender_render_{os.getpid()}.png")
+        temp_path = _temp_png("render")
+        _remove_quiet(temp_path)
         result = blender.send_command("render_from_camera", {
             "camera_name": camera_name,
             "filepath": temp_path,
@@ -2440,13 +2526,12 @@ def render_from_camera(
         })
         if "error" in result:
             raise Exception(result["error"])
-        with open(temp_path, "rb") as f:
-            data = f.read()
-        os.remove(temp_path)
-        return _safe_image_return(data)
+        if not os.path.exists(temp_path):
+            raise Exception("Render produced no file (render cancelled?)")
+        return _safe_image_return(_read_and_remove(temp_path))
     except Exception as e:
         logger.error(f"render_from_camera error: {e}")
-        raise Exception(f"render_from_camera failed: {e}")
+        raise Exception(f"render_from_camera failed: {e}") from e
 
 
 @mcp.tool()
@@ -2458,17 +2543,18 @@ def render_all_cameras(
     output_dir: str = None,
 ) -> Image:
     """
-    Render a still from every camera in the scene simultaneously and return
-    a contact sheet with all results labelled by camera name.
+    Render a still from every camera in the scene and return a contact sheet with
+    all results labelled by camera name.
 
     Parameters:
     - width: Render width per camera in pixels (default 1920)
     - height: Render height per camera in pixels (default 1080)
-    - samples: Cycles sample count (default 32, ignored for EEVEE)
-    - output_dir: Directory to save individual renders (temp dir if omitted)
+    - samples: Sample count for Cycles and EEVEE (default 32)
+    - output_dir: Directory to keep the individual full-resolution renders.
+                  If omitted they are rendered to the temp dir and deleted after
+                  the sheet is built.
 
-    Returns a composited contact sheet image. Individual renders are also
-    saved to output_dir so you can access them at full resolution.
+    Returns a composited contact sheet image.
     """
     try:
         blender = get_blender_connection()
@@ -2482,61 +2568,42 @@ def render_all_cameras(
         renders = result.get("renders", [])
         successful = [r for r in renders if r.get("success") and
                       r.get("filepath") and os.path.exists(r["filepath"])]
+        failed = [f"{r.get('camera')}: {r.get('error', 'no output')}"
+                  for r in renders if r not in successful]
 
         if not successful:
             raise Exception(
                 f"No renders succeeded. "
                 f"Cameras found: {result.get('total_cameras', 0)}. "
-                f"Details: {renders}"
+                f"Details: {failed}"
             )
+        if failed:
+            logger.warning(f"render_all_cameras: some cameras failed: {failed}")
 
-        # Build contact sheet with PIL if available, otherwise return first image
-        if _PIL_AVAILABLE and len(successful) > 1:
-            # Thumbnail each render to a consistent tile size
-            TILE_W, TILE_H = 960, 540
-            LABEL_H = 28
-            cols = min(len(successful), 3)
-            rows = (len(successful) + cols - 1) // cols
+        try:
+            if not _PIL_AVAILABLE or len(successful) == 1:
+                with open(successful[0]["filepath"], "rb") as f:
+                    return _safe_image_return(f.read())
 
-            sheet = PILImage.new(
-                "RGB",
-                (cols * TILE_W, rows * (TILE_H + LABEL_H)),
-                (20, 20, 20),
-            )
-
-            for i, r in enumerate(successful):
-                tile = PILImage.open(r["filepath"]).convert("RGB")
-                tile = tile.resize((TILE_W, TILE_H), PILImage.LANCZOS)
-                x = (i % cols) * TILE_W
-                y = (i // cols) * (TILE_H + LABEL_H)
-                sheet.paste(tile, (x, y + LABEL_H))
-                draw = ImageDraw.Draw(sheet)
-                draw.rectangle([x, y, x + TILE_W, y + LABEL_H], fill=(40, 40, 40))
-                draw.text((x + 6, y + 6), r["camera"], fill=(220, 220, 100))
-
-            out_path = os.path.join(
-                tempfile.gettempdir(),
-                f"blender_all_cameras_{os.getpid()}.png",
-            )
-            sheet.save(out_path)
-            with open(out_path, "rb") as f:
-                data = f.read()
-            os.remove(out_path)
-
-            logger.info(
-                f"render_all_cameras: {len(successful)}/{result['total_cameras']} "
-                f"cameras rendered"
-            )
-            return _safe_image_return(data)
-
-        # Fallback: return the first render as-is
-        with open(successful[0]["filepath"], "rb") as f:
-            data = f.read()
-        return _safe_image_return(data)
+            # Tile size follows the render aspect ratio
+            tile_w = 960
+            tile_h = max(1, int(tile_w * height / max(1, width)))
+            tiles, labels = [], []
+            for r in successful:
+                with PILImage.open(r["filepath"]) as im:
+                    im.load()
+                    tiles.append(im.convert("RGB"))
+                labels.append(r["camera"])
+            sheet = _compose_grid(tiles, columns=3, tile_w=tile_w, tile_h=tile_h, labels=labels)
+            logger.info(f"render_all_cameras: {len(successful)}/{result.get('total_cameras')} cameras rendered")
+            return _safe_image_return(_pil_to_png_bytes(sheet))
+        finally:
+            if not output_dir:
+                _remove_quiet(*[r["filepath"] for r in successful])
 
     except Exception as e:
         logger.error(f"render_all_cameras error: {e}")
-        raise Exception(f"render_all_cameras failed: {e}")
+        raise Exception(f"render_all_cameras failed: {e}") from e
 
 
 # ─── Scene analysis ──────────────────────────────────────────────────────────
@@ -3209,14 +3276,19 @@ def add_modifier(
     """
     try:
         blender = get_blender_connection()
-        kwargs = json.loads(params) if params else {}
+        props = json.loads(params) if params else {}
+        if not isinstance(props, dict):
+            return "Error: params must be a JSON object, e.g. '{\"width\": 0.1}'"
         result = blender.send_command("add_modifier", {
             "name": name, "modifier_type": modifier_type,
-            "modifier_name": modifier_name, **kwargs,
+            "modifier_name": modifier_name, "props": props,
         })
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Added {result['type']} modifier '{result['modifier']}' to '{name}'"
+        msg = f"Added {result['type']} modifier '{result['modifier']}' to '{name}'"
+        if result.get("unset"):
+            msg += f". Could not set: {result['unset']}"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -3315,12 +3387,16 @@ def add_keyframe(
     - data_path: Property to key — 'location', 'rotation_euler', 'scale',
                  or any animatable path like 'data.energy'
     - frame: Frame number (uses current frame if omitted)
-    - value: Comma-separated values to set before keying, e.g. "1,2,3" for location.
+    - value: Value(s) to set before keying: "1,2,3" for a vector property such as
+             location, or a single number such as "500" for a scalar like data.energy.
              Rotation values are in degrees and converted automatically.
     """
     try:
         blender = get_blender_connection()
-        val = [float(v) for v in value.split(",")] if value else None
+        val = None
+        if value is not None and str(value).strip() != "":
+            parts = [float(v) for v in str(value).split(",") if v.strip()]
+            val = parts[0] if len(parts) == 1 else parts
         result = blender.send_command("add_keyframe", {
             "name": name, "data_path": data_path,
             "frame": frame, "value": val,
@@ -3406,8 +3482,24 @@ def move_to_collection(
 
 # ─── Image-to-3D (local TripoSR, loadable/unloadable) ────────────────────────
 
+def _find_img_to_3d_script() -> Path | None:
+    """Locate img_to_3d_server.py for editable installs and deployed copies alike."""
+    env = os.environ.get("IMG_TO_3D_SERVER_SCRIPT")
+    candidates = [Path(env)] if env else []
+    here = Path(__file__).resolve()
+    candidates += [
+        here.parent.parent.parent / "img_to_3d_server.py",   # repo / editable install
+        here.parent / "img_to_3d_server.py",                  # packaged next to server.py
+        Path.cwd() / "img_to_3d_server.py",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
 @mcp.tool()
-def load_img_to_3d_model(ctx: Context, model_dir: str = None) -> str:
+async def load_img_to_3d_model(ctx: Context, model_dir: str = None, timeout: float = 600.0) -> str:
     """
     Start the local image-to-3D inference server (TripoSR).
     The server process is kept running until unload_img_to_3d_model() is called.
@@ -3415,43 +3507,69 @@ def load_img_to_3d_model(ctx: Context, model_dir: str = None) -> str:
 
     Parameters:
     - model_dir: Path to TripoSR weights directory (uses IMG_TO_3D_MODEL_DIR env var if omitted)
+    - timeout: Seconds to wait for the server to come up (default 600; the first run
+               downloads the weights). Its console output goes to img_to_3d_server.log
+               in the temp folder.
     """
     global _img_to_3d_process
     if _img_to_3d_process is not None and _img_to_3d_process.poll() is None:
         return f"Image-to-3D server is already running on port {_IMG_TO_3D_PORT}"
 
-    server_script = Path(__file__).parent.parent.parent / "img_to_3d_server.py"
-    if not server_script.exists():
-        return (f"img_to_3d_server.py not found at {server_script}. "
-                "Please ensure it is present in the blender_mcp root directory.")
+    server_script = _find_img_to_3d_script()
+    if server_script is None:
+        return ("img_to_3d_server.py not found. Put it next to the blender_mcp package or "
+                "set IMG_TO_3D_SERVER_SCRIPT to its path.")
 
     env = {**os.environ}
     if model_dir:
         env["IMG_TO_3D_MODEL_DIR"] = model_dir
     env["IMG_TO_3D_PORT"] = str(_IMG_TO_3D_PORT)
+    python = os.environ.get("IMG_TO_3D_PYTHON") or sys.executable
+    log_path = os.path.join(tempfile.gettempdir(), "img_to_3d_server.log")
 
     try:
-        _img_to_3d_process = _subprocess.Popen(
-            ["python", str(server_script)],
-            env=env,
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.PIPE,
-        )
-        # Wait up to 30 s for the server to become ready
-        for _ in range(60):
-            _time.sleep(0.5)
-            try:
-                r = _requests.get(f"{_IMG_TO_3D_URL}/status", timeout=1)
-                if r.status_code == 200:
-                    return f"Image-to-3D server started on port {_IMG_TO_3D_PORT} (pid {_img_to_3d_process.pid})"
-            except Exception:
-                pass
-            if _img_to_3d_process.poll() is not None:
-                err = _img_to_3d_process.stderr.read(2000).decode(errors="replace")
-                return f"Image-to-3D server crashed on startup: {err}"
-        return "Image-to-3D server did not become ready within 30 s — check logs"
+        with open(log_path, "ab") as log_fh:
+            _img_to_3d_process = _subprocess.Popen(
+                [python, str(server_script)],
+                env=env,
+                stdin=_subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=_subprocess.STDOUT,
+            )
     except Exception as e:
         return f"Failed to start image-to-3D server: {e}"
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if _img_to_3d_process.poll() is not None:
+            code = _img_to_3d_process.returncode
+            _img_to_3d_process = None
+            return f"Image-to-3D server exited on startup (code {code}). See {log_path}"
+        try:
+            r = await asyncio.to_thread(_requests.get, f"{_IMG_TO_3D_URL}/status", timeout=1)
+            if r.status_code == 200:
+                return (f"Image-to-3D server started on port {_IMG_TO_3D_PORT} "
+                        f"(pid {_img_to_3d_process.pid}, log {log_path})")
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+    # Not ready: do not leave a half-started process behind
+    _stop_img_to_3d_process()
+    return f"Image-to-3D server did not become ready within {timeout:.0f} s — see {log_path}"
+
+
+def _stop_img_to_3d_process() -> None:
+    global _img_to_3d_process
+    proc = _img_to_3d_process
+    _img_to_3d_process = None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=10)
+    except Exception:
+        proc.kill()
 
 
 @mcp.tool()
@@ -3459,21 +3577,15 @@ def unload_img_to_3d_model(ctx: Context) -> str:
     """
     Stop the local image-to-3D server, freeing VRAM and memory.
     """
-    global _img_to_3d_process
     if _img_to_3d_process is None or _img_to_3d_process.poll() is not None:
-        _img_to_3d_process = None
+        _stop_img_to_3d_process()
         return "Image-to-3D server is not running"
-    try:
-        _img_to_3d_process.terminate()
-        _img_to_3d_process.wait(timeout=10)
-    except Exception:
-        _img_to_3d_process.kill()
-    _img_to_3d_process = None
+    _stop_img_to_3d_process()
     return "Image-to-3D server stopped"
 
 
 @mcp.tool()
-def generate_3d_from_image(
+async def generate_3d_from_image(
     ctx: Context,
     image_path: str,
     output_path: str = None,
@@ -3492,7 +3604,6 @@ def generate_3d_from_image(
     - mc_resolution: Marching-cubes resolution; higher = more detail but slower (default 256)
     - no_remove_bg: Skip background removal if the image already has a clean background
     """
-    global _img_to_3d_process
     if _img_to_3d_process is None or _img_to_3d_process.poll() is not None:
         return "Image-to-3D server is not running. Call load_img_to_3d_model() first."
 
@@ -3500,13 +3611,15 @@ def generate_3d_from_image(
         return f"Image not found: {image_path}"
 
     if output_path is None:
-        output_path = os.path.join(tempfile.gettempdir(), f"triposr_{os.getpid()}.glb")
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        output_path = os.path.join(tempfile.gettempdir(), f"triposr_{stem}_{int(_time.time())}.glb")
 
     try:
         with open(image_path, "rb") as f:
             img_bytes = f.read()
 
-        resp = _requests.post(
+        resp = await asyncio.to_thread(
+            _requests.post,
             f"{_IMG_TO_3D_URL}/generate",
             files={"image": (os.path.basename(image_path), img_bytes)},
             data={

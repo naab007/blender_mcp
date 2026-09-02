@@ -12,13 +12,12 @@ This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/b
 - **Blender 4.x compatibility** — fixes for BMesh layer API changes, EEVEE engine name, `temp_override` region requirement, compositor node ordering
 - **No telemetry** — all analytics code removed
 - **Auto-restart on addon reload** — server restarts automatically when the addon is cycled in Preferences; no manual click needed
-- **`deploy.py`** — one-command script to copy `addon.py` to Blender's installed addons path
 - **`img_to_3d_server.py`** — local image-to-3D inference via TripoSR (optional, loads/unloads on demand to free VRAM)
-- **`TOOLS.md`** — full reference for all 91 tools with parameters
+- **`TOOLS.md`** — full reference for all 92 tools with parameters
 
 ---
 
-## Tool categories (91 tools)
+## Tool categories (92 tools)
 
 | Category | Tools |
 |---|---|
@@ -78,11 +77,9 @@ uv pip install -e .
 3. Select `addon.py` and enable **Interface: Blender MCP**
 4. In the 3D View sidebar (N), open the **BlenderMCP** tab and click **Start MCP Server**
 
-> After the first install, use `deploy.py` to push addon updates in one command:
-> ```bash
-> .venv/Scripts/python.exe deploy.py
-> ```
-> Edit the destination path in `deploy.py` to match your Blender version.
+> To update after the first install, copy the new `addon.py` over the installed one
+> (`<Blender config>/scripts/addons/addon.py`) and cycle the add-on off/on in
+> Preferences — the MCP server restarts automatically.
 
 ### 3. Configure your AI client
 

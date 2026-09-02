@@ -13,18 +13,20 @@ import traceback
 import os
 import shutil
 import zipfile
-from bpy.props import IntProperty, BoolProperty
+from bpy.props import IntProperty
 import io
 from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
-from contextlib import redirect_stdout, suppress
+from contextlib import redirect_stdout, suppress, contextmanager
+import array
+import bmesh
 
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 2),
-    "blender": (3, 0, 0),
+    "version": (1, 6, 0),
+    "blender": (4, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
@@ -32,9 +34,21 @@ bl_info = {
 
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
 
-# Set to True by unregister() when the server was running at reload time,
-# so register() can auto-restart it (off/on cycle on addon reload).
-_restart_server_on_register = False
+# unregister() records "the server was running" so register() can auto-restart it
+# after an addon reload. The flag lives in bpy.app.driver_namespace, not a module
+# global: a reload re-executes this module, which would reset a global.
+_RESTART_FLAG = "blendermcp_restart_server_on_register"
+
+
+def _restart_flag_get() -> bool:
+    return bool(bpy.app.driver_namespace.get(_RESTART_FLAG, False))
+
+
+def _restart_flag_set(value: bool) -> None:
+    if value:
+        bpy.app.driver_namespace[_RESTART_FLAG] = True
+    else:
+        bpy.app.driver_namespace.pop(_RESTART_FLAG, None)
 
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
@@ -60,7 +74,7 @@ class BlenderMCPServer:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
+            self.socket.listen(5)
 
             # Start server thread
             self.server_thread = threading.Thread(target=self._server_loop)
@@ -143,13 +157,31 @@ class BlenderMCPServer:
                         break
 
                     buffer += data
+                    # A JSON object can only be complete when the buffer ends with '}'
+                    if not buffer.rstrip().endswith(b'}'):
+                        continue
                     try:
-                        # Try to parse command
-                        command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
+                        text = buffer.decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue  # multi-byte character split across chunks
+                    decoder = json.JSONDecoder()
+                    pos = 0
+                    while True:
+                        while pos < len(text) and text[pos].isspace():
+                            pos += 1
+                        if pos >= len(text):
+                            buffer = b''
+                            break
+                        try:
+                            command, end = decoder.raw_decode(text, pos)
+                        except json.JSONDecodeError:
+                            # Incomplete trailing command, keep what is left
+                            buffer = text[pos:].encode('utf-8')
+                            break
+                        pos = end
 
                         # Execute command in Blender's main thread
-                        def execute_wrapper():
+                        def execute_wrapper(command=command):
                             try:
                                 response = self.execute_command(command)
                                 response_json = json.dumps(response)
@@ -172,9 +204,6 @@ class BlenderMCPServer:
 
                         # Schedule execution in main thread
                         bpy.app.timers.register(execute_wrapper, first_interval=0.0)
-                    except json.JSONDecodeError:
-                        # Incomplete data, wait for more
-                        pass
                 except Exception as e:
                     print(f"Error receiving data: {str(e)}")
                     break
@@ -197,66 +226,57 @@ class BlenderMCPServer:
             traceback.print_exc()
             return {"status": "error", "message": str(e)}
 
-    def _execute_command_internal(self, command):
-        """Internal command execution with proper context"""
-        cmd_type = command.get("type")
-        params = command.get("params", {})
+    # Integration handlers are only reachable while the matching scene toggle is on.
+    _GATED_COMMANDS = {
+        "get_polyhaven_categories": "blendermcp_use_polyhaven",
+        "search_polyhaven_assets": "blendermcp_use_polyhaven",
+        "download_polyhaven_asset": "blendermcp_use_polyhaven",
+        "set_texture": "blendermcp_use_polyhaven",
+        "create_rodin_job": "blendermcp_use_hyper3d",
+        "poll_rodin_job_status": "blendermcp_use_hyper3d",
+        "import_generated_asset": "blendermcp_use_hyper3d",
+        "search_sketchfab_models": "blendermcp_use_sketchfab",
+        "get_sketchfab_model_preview": "blendermcp_use_sketchfab",
+        "download_sketchfab_model": "blendermcp_use_sketchfab",
+        "create_hunyuan_job": "blendermcp_use_hunyuan3d",
+        "poll_hunyuan_job_status": "blendermcp_use_hunyuan3d",
+        "import_generated_asset_hunyuan": "blendermcp_use_hunyuan3d",
+    }
+    _GATE_LABELS = {
+        "blendermcp_use_polyhaven": "PolyHaven",
+        "blendermcp_use_hyper3d": "Hyper3D",
+        "blendermcp_use_sketchfab": "Sketchfab",
+        "blendermcp_use_hunyuan3d": "Hunyuan3D",
+    }
 
-        # Add a handler for checking PolyHaven status
-        if cmd_type == "get_polyhaven_status":
-            return {"status": "success", "result": self.get_polyhaven_status()}
-
-        # Base handlers that are always available
+    def _build_handlers(self):
         handlers = {
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
-            "get_telemetry_consent": self.get_telemetry_consent,
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
+            # PolyHaven
+            "get_polyhaven_categories": self.get_polyhaven_categories,
+            "search_polyhaven_assets": self.search_polyhaven_assets,
+            "download_polyhaven_asset": self.download_polyhaven_asset,
+            "set_texture": self.set_texture,
+            # Hyper3D
+            "create_rodin_job": self.create_rodin_job,
+            "poll_rodin_job_status": self.poll_rodin_job_status,
+            "import_generated_asset": self.import_generated_asset,
+            # Sketchfab
+            "search_sketchfab_models": self.search_sketchfab_models,
+            "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
+            "download_sketchfab_model": self.download_sketchfab_model,
+            # Hunyuan3D
+            "create_hunyuan_job": self.create_hunyuan_job,
+            "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
+            "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan,
         }
-
-        # Add Polyhaven handlers only if enabled
-        if bpy.context.scene.blendermcp_use_polyhaven:
-            polyhaven_handlers = {
-                "get_polyhaven_categories": self.get_polyhaven_categories,
-                "search_polyhaven_assets": self.search_polyhaven_assets,
-                "download_polyhaven_asset": self.download_polyhaven_asset,
-                "set_texture": self.set_texture,
-            }
-            handlers.update(polyhaven_handlers)
-
-        # Add Hyper3d handlers only if enabled
-        if bpy.context.scene.blendermcp_use_hyper3d:
-            polyhaven_handlers = {
-                "create_rodin_job": self.create_rodin_job,
-                "poll_rodin_job_status": self.poll_rodin_job_status,
-                "import_generated_asset": self.import_generated_asset,
-            }
-            handlers.update(polyhaven_handlers)
-
-        # Add Sketchfab handlers only if enabled
-        if bpy.context.scene.blendermcp_use_sketchfab:
-            sketchfab_handlers = {
-                "search_sketchfab_models": self.search_sketchfab_models,
-                "get_sketchfab_model_preview": self.get_sketchfab_model_preview,
-                "download_sketchfab_model": self.download_sketchfab_model,
-            }
-            handlers.update(sketchfab_handlers)
-        
-        # Add Hunyuan3d handlers only if enabled
-        if bpy.context.scene.blendermcp_use_hunyuan3d:
-            hunyuan_handlers = {
-                "create_hunyuan_job": self.create_hunyuan_job,
-                "poll_hunyuan_job_status": self.poll_hunyuan_job_status,
-                "import_generated_asset_hunyuan": self.import_generated_asset_hunyuan
-            }
-            handlers.update(hunyuan_handlers)
-
-        # Add extended handlers (always available)
         extended_handlers = {
             # Multi-angle capture
             "capture_viewport_angle": self.capture_viewport_angle,
@@ -265,6 +285,7 @@ class BlenderMCPServer:
             "render_depth_map": self.render_depth_map,
             # Reference image
             "store_reference_image": self.store_reference_image,
+            "get_reference_image": self.get_reference_image,
             # Mesh editing
             "move_object": self.move_object,
             "scale_object": self.scale_object,
@@ -340,6 +361,22 @@ class BlenderMCPServer:
             "move_to_collection": self.move_to_collection,
         }
         handlers.update(extended_handlers)
+        return handlers
+
+    def _execute_command_internal(self, command):
+        """Internal command execution with proper context"""
+        cmd_type = command.get("type")
+        params = command.get("params", {}) or {}
+
+        handlers = getattr(self, "_handlers", None)
+        if handlers is None:
+            handlers = self._handlers = self._build_handlers()
+
+        gate = self._GATED_COMMANDS.get(cmd_type)
+        if gate and not getattr(bpy.context.scene, gate, False):
+            return {"status": "error",
+                    "message": f"{self._GATE_LABELS[gate]} integration is disabled. "
+                               f"Enable it in the BlenderMCP panel (N sidebar) first."}
 
         handler = handlers.get(cmd_type)
         if handler:
@@ -417,7 +454,7 @@ class BlenderMCPServer:
         """Get detailed information about a specific object"""
         obj = bpy.data.objects.get(name)
         if not obj:
-            raise ValueError(f"Object not found: {name}")
+            return {"error": f"Object not found: {name}"}
 
         # Basic object info
         obj_info = {
@@ -526,90 +563,159 @@ class BlenderMCPServer:
 
 
 
+    # ─── Shared helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_object_mode(obj):
+        """Leave edit/sculpt mode on obj so its mesh data can be read and written."""
+        if obj.mode != 'OBJECT':
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+    def _select_only(self, obj):
+        """Make obj the sole selected + active object, in object mode."""
+        self._ensure_object_mode(obj)
+        for o in bpy.context.view_layer.objects:
+            if o.select_get():
+                o.select_set(False)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+
+    @staticmethod
+    def _check_indices(indices, count, label):
+        """Return an error dict when any index is outside [0, count), else None."""
+        try:
+            bad = [i for i in indices if not (0 <= int(i) < count)]
+        except (TypeError, ValueError):
+            return {"error": f"{label} indices must be integers, got {indices!r}"}
+        if bad:
+            plural = {"vertex": "vertices"}.get(label.lower(), label.lower() + "s")
+            return {"error": f"{label} indices out of range: {bad} (mesh has {count} {plural})"}
+        return None
+
+    @contextmanager
+    def _bmesh_edit(self, obj, write=True):
+        """
+        Yield a BMesh built from obj.data with lookup tables ready.
+        Writes it back on success (write=True) and always frees it.
+        """
+        self._ensure_object_mode(obj)
+        mesh = obj.data
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            yield bm
+            if write:
+                bm.to_mesh(mesh)
+                mesh.update()
+        finally:
+            bm.free()
+
+    @staticmethod
+    def _op_exists(op):
+        """bpy.ops attributes resolve lazily, so hasattr() is always True; ask RNA instead."""
+        try:
+            op.get_rna_type()
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _reference_images():
+        """Reference registry, kept in driver_namespace so an addon reload does not drop it."""
+        return bpy.app.driver_namespace.setdefault("blendermcp_reference_images", {})
+
     # ─── Multi-angle viewport capture ────────────────────────────────────────
 
-    # Predefined view presets: (view_axis, negative)
+    # Predefined view presets: view3d.view_axis type, or None for the isometric views
     _VIEW_PRESETS = {
-        "front":            ("FRONT",  False),
-        "back":             ("FRONT",  True),
-        "left":             ("RIGHT",  True),
-        "right":            ("RIGHT",  False),
-        "top":              ("TOP",    False),
-        "bottom":           ("TOP",    True),
-        "iso_front_right":  None,   # handled specially
-        "iso_front_left":   None,
+        "front":  "FRONT",  "back":   "BACK",
+        "left":   "LEFT",   "right":  "RIGHT",
+        "top":    "TOP",    "bottom": "BOTTOM",
+        "iso_front_right": None,
+        "iso_front_left":  None,
     }
 
     def capture_viewport_angle(self, angle="front", max_size=800, filepath=None):
         """
         Capture the 3D viewport from a named angle.
         angle: one of front, back, left, right, top, bottom, iso_front_right, iso_front_left
+        Frames the selected objects, or the whole scene when nothing is selected.
         """
         import math
+        if angle not in self._VIEW_PRESETS:
+            return {"error": f"Unknown angle: {angle}. Choose from: {list(self._VIEW_PRESETS.keys())}"}
+
         area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
         if not area:
             return {"error": "No 3D viewport found"}
-
         space = next((s for s in area.spaces if s.type == 'VIEW_3D'), None)
         if not space:
             return {"error": "No VIEW_3D space found"}
-
         region = next((r for r in area.regions if r.type == 'WINDOW'), None)
         if not region:
             return {"error": "No WINDOW region found in VIEW_3D"}
 
         r3d = space.region_3d
+        prefs_view = bpy.context.preferences.view
 
         # Save original state
         orig_view_matrix = r3d.view_matrix.copy()
         orig_perspective = r3d.view_perspective
+        orig_smooth_view = prefs_view.smooth_view
 
         try:
+            # Smooth-view animates view changes over time; the screenshot is taken
+            # right away, so it must be applied instantly.
+            prefs_view.smooth_view = 0
             with bpy.context.temp_override(area=area, region=region):
-                if angle == "iso_front_right":
+                preset = self._VIEW_PRESETS[angle]
+                if preset is None:
                     r3d.view_perspective = 'PERSP'
-                    bpy.ops.view3d.view_axis(type='FRONT')
-                    # Rotate 45° around Z and 35.264° around X (isometric)
-                    rot = mathutils.Euler((math.radians(54.736), 0, math.radians(45)), 'XYZ')
-                    r3d.view_rotation = rot.to_quaternion()
-                elif angle == "iso_front_left":
-                    r3d.view_perspective = 'PERSP'
-                    bpy.ops.view3d.view_axis(type='FRONT')
-                    rot = mathutils.Euler((math.radians(54.736), 0, math.radians(-45)), 'XYZ')
+                    yaw = 45.0 if angle == "iso_front_right" else -45.0
+                    rot = mathutils.Euler((math.radians(54.736), 0.0, math.radians(yaw)), 'XYZ')
                     r3d.view_rotation = rot.to_quaternion()
                 else:
-                    preset = self._VIEW_PRESETS.get(angle)
-                    if preset is None:
-                        return {"error": f"Unknown angle: {angle}. Choose from: {list(self._VIEW_PRESETS.keys())}"}
-                    axis, negative = preset
-                    bpy.ops.view3d.view_axis(type=axis, align_active=False)
-                    if negative:
-                        bpy.ops.view3d.view_axis(type=axis, align_active=False)
-                        r3d.view_rotation = (-r3d.view_rotation).normalized()
+                    bpy.ops.view3d.view_axis(type=preset, align_active=False)
 
-                bpy.ops.view3d.view_selected(use_all_regions=False)
+                if bpy.context.selected_objects:
+                    bpy.ops.view3d.view_selected(use_all_regions=False)
+                else:
+                    bpy.ops.view3d.view_all(use_all_regions=False, center=False)
 
             if not filepath:
-                import tempfile
                 filepath = os.path.join(tempfile.gettempdir(), f"blender_angle_{angle}_{os.getpid()}.png")
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
             with bpy.context.temp_override(area=area, region=region):
+                # Make sure the new view is drawn before it is read back
+                with suppress(Exception):
+                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
                 bpy.ops.screen.screenshot_area(filepath=filepath)
+            if not os.path.exists(filepath):
+                return {"error": "Screenshot was not written"}
 
             # Resize if needed
             img = bpy.data.images.load(filepath)
-            w, h = img.size
-            if max(w, h) > max_size:
-                scale = max_size / max(w, h)
-                img.scale(int(w * scale), int(h * scale))
-                img.file_format = 'PNG'
-                img.save()
+            try:
                 w, h = img.size
-            bpy.data.images.remove(img)
+                if max(w, h) > max_size:
+                    scale = max_size / max(w, h)
+                    img.scale(max(1, int(w * scale)), max(1, int(h * scale)))
+                    img.file_format = 'PNG'
+                    img.save()
+                    w, h = img.size
+            finally:
+                bpy.data.images.remove(img)
 
             return {"success": True, "angle": angle, "filepath": filepath, "width": w, "height": h}
 
         finally:
+            prefs_view.smooth_view = orig_smooth_view
             r3d.view_matrix = orig_view_matrix
             r3d.view_perspective = orig_perspective
 
@@ -621,7 +727,6 @@ class BlenderMCPServer:
         if angles is None:
             angles = ["front", "right", "top", "iso_front_right"]
 
-        import tempfile
         results = {}
         for angle in angles:
             fp = os.path.join(tempfile.gettempdir(), f"blender_cs_{angle}_{os.getpid()}.png")
@@ -635,136 +740,101 @@ class BlenderMCPServer:
     def render_depth_map(self, filepath=None, max_depth=10.0):
         """
         Render a normalised depth map from the active camera using the compositor Z-pass.
-        Returns the filepath of the saved PNG.
+        Renders in a throw-away copy of the scene (objects are shared, settings are not),
+        so the user's compositor tree, passes and render settings are never touched.
         """
-        import tempfile
         if not filepath:
             filepath = os.path.join(tempfile.gettempdir(), f"blender_depth_{os.getpid()}.png")
 
-        import copy
+        src = bpy.context.scene
+        if src.camera is None:
+            return {"error": "Scene has no active camera. Create one with create_camera / set_active_camera."}
 
-        scene = bpy.context.scene
-        orig_use_nodes  = scene.use_nodes
-        orig_use_pass_z = scene.view_layers[0].use_pass_z
-        orig_render_path = scene.render.filepath
-        orig_file_format = scene.render.image_settings.file_format
-
-        # Snapshot the existing compositor node tree so we can restore it.
-        # We serialise each node's type/location/values and all links.
-        tree = scene.node_tree
-        if tree is None:
-            scene.use_nodes = True          # creates the node_tree attribute
-            tree = scene.node_tree
-
-        def _snapshot_tree(tree):
-            snap_nodes = []
-            for n in tree.nodes:
-                nd = {"type": n.type, "name": n.name, "loc": (n.location.x, n.location.y),
-                      "inputs": {}}
-                for inp in n.inputs:
-                    try:
-                        nd["inputs"][inp.name] = inp.default_value
-                    except Exception:
-                        pass
-                snap_nodes.append(nd)
-            snap_links = [(lk.from_node.name, lk.from_socket.name,
-                           lk.to_node.name,   lk.to_socket.name)
-                          for lk in tree.links]
-            return snap_nodes, snap_links
-
-        def _restore_tree(tree, snap_nodes, snap_links):
-            tree.nodes.clear()
-            created = {}
-            for nd in snap_nodes:
-                try:
-                    n = tree.nodes.new(f"CompositorNode{nd['type'].title().replace('_','')}")
-                except Exception:
-                    try:
-                        n = tree.nodes.new(nd['type'])
-                    except Exception:
-                        continue
-                n.name = nd["name"]
-                n.location = nd["loc"]
-                for inp_name, val in nd["inputs"].items():
-                    try:
-                        n.inputs[inp_name].default_value = val
-                    except Exception:
-                        pass
-                created[nd["name"]] = n
-            for fn, fs, tn, ts in snap_links:
-                try:
-                    tree.links.new(created[fn].outputs[fs], created[tn].inputs[ts])
-                except Exception:
-                    pass
-
-        orig_snap = _snapshot_tree(tree) if orig_use_nodes else ([], [])
-
-        # Enable Z pass BEFORE building the compositor tree so the
-        # RenderLayers node has the "Depth" output when created.
-        scene.view_layers[0].use_pass_z = True
-
-        # Enable compositor nodes
-        scene.use_nodes = True
-        tree = scene.node_tree
-        nodes = tree.nodes
-        links = tree.links
-
-        # Clear existing nodes and build depth-map graph
-        nodes.clear()
-
-        # Build: RenderLayers -> Map Range (0..max_depth → 0..1) -> Invert -> Composite
-        rl = nodes.new("CompositorNodeRLayers")
-        rl.location = (0, 0)
-
-        map_node = nodes.new("CompositorNodeMapRange")
-        map_node.location = (250, 0)
-        map_node.inputs["From Min"].default_value = 0.0
-        map_node.inputs["From Max"].default_value = max_depth
-        map_node.inputs["To Min"].default_value = 0.0
-        map_node.inputs["To Max"].default_value = 1.0
-
-        invert = nodes.new("CompositorNodeInvert")
-        invert.location = (450, 0)
-
-        composite = nodes.new("CompositorNodeComposite")
-        composite.location = (650, 0)
-
-        links.new(rl.outputs["Depth"], map_node.inputs["Value"])
-        links.new(map_node.outputs["Value"], invert.inputs["Color"])
-        links.new(invert.outputs["Color"], composite.inputs["Image"])
-
-        scene.render.filepath = filepath
-        scene.render.image_settings.file_format = 'PNG'
-
+        view_layer_name = bpy.context.view_layer.name
+        tmp = src.copy()
+        tmp.name = f"{src.name}_mcp_depth"
         try:
-            bpy.ops.render.render(write_still=True)
-        finally:
-            # Fully restore: clear depth nodes first, then restore original tree
-            nodes.clear()
-            if orig_use_nodes and orig_snap[0]:
-                try:
-                    _restore_tree(tree, *orig_snap)
-                except Exception as e:
-                    print(f"render_depth_map: node restore warning: {e}")
-            scene.use_nodes   = orig_use_nodes
-            scene.view_layers[0].use_pass_z = orig_use_pass_z
-            scene.render.filepath            = orig_render_path
-            scene.render.image_settings.file_format = orig_file_format
+            # Workbench has no Z pass; fall back to EEVEE (identifier changed in 4.2)
+            if tmp.render.engine == 'BLENDER_WORKBENCH':
+                engines = [e.identifier for e in
+                           bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]
+                for eng in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
+                    if eng in engines:
+                        tmp.render.engine = eng
+                        break
+            # Depth is deterministic: one sample is enough
+            with suppress(Exception):
+                tmp.eevee.taa_render_samples = 1
+            with suppress(Exception):
+                tmp.cycles.samples = 1
 
-        return {"success": True, "filepath": filepath}
+            for vl in tmp.view_layers:
+                vl.use_pass_z = True
+
+            tmp.use_nodes = True
+            tree = tmp.node_tree
+            nodes, links = tree.nodes, tree.links
+            nodes.clear()
+
+            # RenderLayers -> Map Range (0..max_depth -> 0..1) -> Invert -> Composite
+            rl = nodes.new("CompositorNodeRLayers")
+            rl.scene = tmp
+            if view_layer_name in tmp.view_layers:
+                rl.layer = view_layer_name
+            rl.location = (0, 0)
+
+            map_node = nodes.new("CompositorNodeMapRange")
+            map_node.location = (250, 0)
+            map_node.inputs["From Min"].default_value = 0.0
+            map_node.inputs["From Max"].default_value = max_depth
+            map_node.inputs["To Min"].default_value = 0.0
+            map_node.inputs["To Max"].default_value = 1.0
+            map_node.use_clamp = True
+
+            invert = nodes.new("CompositorNodeInvert")
+            invert.location = (450, 0)
+
+            composite = nodes.new("CompositorNodeComposite")
+            composite.location = (650, 0)
+
+            links.new(rl.outputs["Depth"], map_node.inputs["Value"])
+            links.new(map_node.outputs["Value"], invert.inputs["Color"])
+            links.new(invert.outputs["Color"], composite.inputs["Image"])
+
+            tmp.render.filepath = filepath
+            tmp.render.image_settings.file_format = 'PNG'
+            tmp.render.image_settings.color_mode = 'BW'
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+            result = bpy.ops.render.render(write_still=True, scene=tmp.name)
+            if 'FINISHED' not in result or not os.path.exists(filepath):
+                return {"error": f"Depth render did not produce a file (operator returned {set(result)})"}
+        finally:
+            with suppress(Exception):
+                bpy.data.scenes.remove(tmp, do_unlink=True)
+
+        return {"success": True, "filepath": filepath, "max_depth": max_depth}
 
     # ─── Reference image ────────────────────────────────────────────────────
-
-    # Shared storage: maps name → filepath
-    _reference_images: dict = {}
 
     def store_reference_image(self, name, filepath):
         """Register a local image path under a short name for later comparison."""
         if not os.path.exists(filepath):
             return {"error": f"File not found: {filepath}"}
-        BlenderMCPServer._reference_images[name] = filepath
+        refs = self._reference_images()
+        refs[name] = filepath
         return {"success": True, "name": name, "filepath": filepath,
-                "stored_refs": list(BlenderMCPServer._reference_images.keys())}
+                "stored_refs": list(refs.keys())}
+
+    def get_reference_image(self, name):
+        """Look up a reference registered with store_reference_image."""
+        refs = self._reference_images()
+        filepath = refs.get(name)
+        if not filepath:
+            return {"error": f"Reference '{name}' not found. Stored: {list(refs.keys())}"}
+        return {"success": True, "name": name, "filepath": filepath,
+                "exists": os.path.exists(filepath)}
 
     # ─── Mesh editing ───────────────────────────────────────────────────────
 
@@ -829,21 +899,22 @@ class BlenderMCPServer:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        self._ensure_object_mode(obj)
         mesh = obj.data
         mat = obj.matrix_world if world_space else mathutils.Matrix.Identity(4)
 
         if indices is not None:
-            out_of_range = [i for i in indices if i >= len(mesh.vertices)]
-            if out_of_range:
-                return {"error": f"Indices out of range: {out_of_range} (mesh has {len(mesh.vertices)} verts)"}
+            err = self._check_indices(indices, len(mesh.vertices), "Vertex")
+            if err:
+                return err
             verts = [(i, mesh.vertices[i]) for i in indices]
         else:
-            verts = list(enumerate(mesh.vertices))
-            if len(verts) > max_verts:
+            if len(mesh.vertices) > max_verts:
                 return {
                     "error": f"Mesh has {len(mesh.vertices)} vertices — exceeds max_verts={max_verts}. "
                              f"Pass specific indices or increase max_verts."
                 }
+            verts = list(enumerate(mesh.vertices))
 
         positions = [
             {"index": i, "co": [round(v, 6) for v in (mat @ vert.co)]}
@@ -864,9 +935,11 @@ class BlenderMCPServer:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh object"}
+        self._ensure_object_mode(obj)
         mesh = obj.data
-        if vertex_index >= len(mesh.vertices):
-            return {"error": f"Vertex index {vertex_index} out of range ({len(mesh.vertices)} vertices)"}
+        err = self._check_indices([vertex_index], len(mesh.vertices), "Vertex")
+        if err:
+            return err
         local = obj.matrix_world.inverted() @ mathutils.Vector((x, y, z))
         mesh.vertices[vertex_index].co = local
         mesh.update()
@@ -883,6 +956,7 @@ class BlenderMCPServer:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        self._ensure_object_mode(obj)
         mesh = obj.data
         inv = obj.matrix_world.inverted() if world_space else mathutils.Matrix.Identity(4)
 
@@ -894,8 +968,8 @@ class BlenderMCPServer:
             if idx is None or co is None:
                 errors.append(f"Missing 'index' or 'co' in entry: {entry}")
                 continue
-            if idx >= len(mesh.vertices):
-                errors.append(f"Index {idx} out of range")
+            if not (0 <= idx < len(mesh.vertices)):
+                errors.append(f"Index {idx} out of range (mesh has {len(mesh.vertices)} vertices)")
                 continue
             local = inv @ mathutils.Vector(co)
             mesh.vertices[idx].co = local
@@ -974,14 +1048,16 @@ class BlenderMCPServer:
         if obj.type != 'CURVE':
             return {"error": f"{name} is not a curve object"}
         curve = obj.data
+        if not (0 <= spline_index < len(curve.splines)):
+            return {"error": f"Spline index {spline_index} out of range ({len(curve.splines)} splines)"}
         spline = curve.splines[spline_index]
         inv = obj.matrix_world.inverted()
 
         local_co = inv @ mathutils.Vector(co)
 
         if spline.type == 'BEZIER':
-            if point_index >= len(spline.bezier_points):
-                return {"error": f"Point index {point_index} out of range"}
+            if not (0 <= point_index < len(spline.bezier_points)):
+                return {"error": f"Point index {point_index} out of range ({len(spline.bezier_points)} points)"}
             pt = spline.bezier_points[point_index]
             pt.co = local_co
             if handle_left:
@@ -993,8 +1069,8 @@ class BlenderMCPServer:
             if handle_right_type:
                 pt.handle_right_type = handle_right_type
         else:
-            if point_index >= len(spline.points):
-                return {"error": f"Point index {point_index} out of range"}
+            if not (0 <= point_index < len(spline.points)):
+                return {"error": f"Point index {point_index} out of range ({len(spline.points)} points)"}
             pt = spline.points[point_index]
             pt.co = (*local_co, pt.co[3])  # preserve W
 
@@ -1009,22 +1085,37 @@ class BlenderMCPServer:
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────
 
-    def quit_blender(self, save_prompt=False):
+    def quit_blender(self, save_prompt=False, save=False):
         """
-        Quit Blender gracefully.
-        save_prompt=False skips the "save before closing?" dialog.
+        Quit Blender. The quit is deferred to the next timer tick so this reply
+        still reaches the client.
+        save: save the current file first (only when it already has a path).
+        save_prompt=False suppresses the "save changes?" dialog for this session
+        without persisting the preference change.
         """
+        saved = False
+        if save and bpy.data.filepath:
+            bpy.ops.wm.save_mainfile()
+            saved = True
+
         if not save_prompt:
-            # Mark the file as unmodified so Blender doesn't prompt
-            bpy.data.use_fake_user = False
-            for window in bpy.context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type == 'VIEW_3D':
-                        with bpy.context.temp_override(window=window, area=area):
-                            bpy.ops.wm.quit_blender()
-                        return {"success": True}
-        bpy.ops.wm.quit_blender()
-        return {"success": True}
+            prefs = bpy.context.preferences
+            prefs.view.use_save_prompt = False
+            # Do not write this session-only change back to userpref.blend on exit
+            prefs.use_preferences_save = False
+
+        def _do_quit():
+            wm = bpy.context.window_manager
+            win = wm.windows[0] if wm.windows else None
+            if win is not None:
+                with bpy.context.temp_override(window=win, screen=win.screen):
+                    bpy.ops.wm.quit_blender()
+            else:
+                bpy.ops.wm.quit_blender()
+            return None
+
+        bpy.app.timers.register(_do_quit, first_interval=0.3)
+        return {"success": True, "saved": saved, "quitting": True}
 
     # ─── Edge operations ─────────────────────────────────────────────────────
 
@@ -1033,45 +1124,39 @@ class BlenderMCPServer:
         Read edge data: vertex pair, sharpness, crease, and bevel weight.
         indices: list of edge indices; returns all if None (capped at max_edges).
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
 
+        self._ensure_object_mode(obj)
         mesh = obj.data
 
         if indices is None:
             if len(mesh.edges) > max_edges:
                 return {"error": f"Mesh has {len(mesh.edges)} edges — exceeds "
                                   f"max_edges={max_edges}. Pass specific indices or increase max_edges."}
-
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.edges.ensure_lookup_table()
-
-        crease_layer = bm.edges.layers.float.get("crease_edge")
-        bevel_layer  = bm.edges.layers.float.get("bevel_weight_edge")
-
-        edge_list = (
-            [bm.edges[i] for i in indices if i < len(bm.edges)]
-            if indices is not None
-            else list(bm.edges)
-        )
+        else:
+            err = self._check_indices(indices, len(mesh.edges), "Edge")
+            if err:
+                return err
 
         out = []
-        for e in edge_list:
-            out.append({
-                "index":        e.index,
-                "vertices":     [e.verts[0].index, e.verts[1].index],
-                "sharp":        not e.smooth,
-                "seam":         e.seam,
-                "crease":       round(e[crease_layer], 6) if crease_layer else 0.0,
-                "bevel_weight": round(e[bevel_layer],  6) if bevel_layer  else 0.0,
-            })
+        with self._bmesh_edit(obj, write=False) as bm:
+            crease_layer = bm.edges.layers.float.get("crease_edge")
+            bevel_layer  = bm.edges.layers.float.get("bevel_weight_edge")
+            edge_list = [bm.edges[i] for i in indices] if indices is not None else list(bm.edges)
+            for e in edge_list:
+                out.append({
+                    "index":        e.index,
+                    "vertices":     [e.verts[0].index, e.verts[1].index],
+                    "sharp":        not e.smooth,
+                    "seam":         e.seam,
+                    "crease":       round(e[crease_layer], 6) if crease_layer else 0.0,
+                    "bevel_weight": round(e[bevel_layer],  6) if bevel_layer  else 0.0,
+                })
 
-        bm.free()
         return {
             "name":        name,
             "total_edges": len(mesh.edges),
@@ -1086,29 +1171,21 @@ class BlenderMCPServer:
         edge_indices: list of edge indices, or "all"
         sharp: True = hard edge, False = soft edge
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
 
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.edges.ensure_lookup_table()
+        if edge_indices != "all":
+            err = self._check_indices(edge_indices, len(obj.data.edges), "Edge")
+            if err:
+                return err
 
-        if edge_indices == "all":
-            edges = list(bm.edges)
-        else:
-            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
-
-        for e in edges:
-            e.smooth = not sharp   # smooth=False means sharp in Blender
-
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            edges = list(bm.edges) if edge_indices == "all" else [bm.edges[i] for i in edge_indices]
+            for e in edges:
+                e.smooth = not sharp   # smooth=False means sharp in Blender
 
         return {"success": True, "name": name,
                 "marked_edges": len(edges), "sharp": sharp}
@@ -1119,7 +1196,6 @@ class BlenderMCPServer:
         Controls how the Subdivision Surface modifier handles edge sharpness.
         edge_indices: list of edge indices, or "all"
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
@@ -1127,24 +1203,16 @@ class BlenderMCPServer:
             return {"error": f"{name} is not a mesh"}
 
         crease = max(0.0, min(1.0, float(crease)))
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.edges.ensure_lookup_table()
+        if edge_indices != "all":
+            err = self._check_indices(edge_indices, len(obj.data.edges), "Edge")
+            if err:
+                return err
 
-        crease_layer = bm.edges.layers.float.get("crease_edge") or bm.edges.layers.float.new("crease_edge")
-
-        if edge_indices == "all":
-            edges = list(bm.edges)
-        else:
-            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
-
-        for e in edges:
-            e[crease_layer] = crease
-
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            crease_layer = bm.edges.layers.float.get("crease_edge") or bm.edges.layers.float.new("crease_edge")
+            edges = list(bm.edges) if edge_indices == "all" else [bm.edges[i] for i in edge_indices]
+            for e in edges:
+                e[crease_layer] = crease
 
         return {"success": True, "name": name,
                 "updated_edges": len(edges), "crease": crease}
@@ -1155,7 +1223,6 @@ class BlenderMCPServer:
         Used with the Bevel modifier when limit_method is set to WEIGHT.
         edge_indices: list of edge indices, or "all"
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
@@ -1163,24 +1230,16 @@ class BlenderMCPServer:
             return {"error": f"{name} is not a mesh"}
 
         weight = max(0.0, min(1.0, float(weight)))
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.edges.ensure_lookup_table()
+        if edge_indices != "all":
+            err = self._check_indices(edge_indices, len(obj.data.edges), "Edge")
+            if err:
+                return err
 
-        bevel_layer = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
-
-        if edge_indices == "all":
-            edges = list(bm.edges)
-        else:
-            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
-
-        for e in edges:
-            e[bevel_layer] = weight
-
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            bevel_layer = bm.edges.layers.float.get("bevel_weight_edge") or bm.edges.layers.float.new("bevel_weight_edge")
+            edges = list(bm.edges) if edge_indices == "all" else [bm.edges[i] for i in edge_indices]
+            for e in edges:
+                e[bevel_layer] = weight
 
         return {"success": True, "name": name,
                 "updated_edges": len(edges), "bevel_weight": weight}
@@ -1199,14 +1258,14 @@ class BlenderMCPServer:
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
 
+        self._ensure_object_mode(obj)
         mesh = obj.data
         mat  = obj.matrix_world
 
         if indices is not None:
-            out_of_range = [i for i in indices if i >= len(mesh.polygons)]
-            if out_of_range:
-                return {"error": f"Face indices out of range: {out_of_range} "
-                                  f"(mesh has {len(mesh.polygons)} faces)"}
+            err = self._check_indices(indices, len(mesh.polygons), "Face")
+            if err:
+                return err
             polys = [(i, mesh.polygons[i]) for i in indices]
         else:
             if len(mesh.polygons) > max_faces:
@@ -1256,15 +1315,19 @@ class BlenderMCPServer:
             return {"error": f"Material slot {material_index} does not exist "
                               f"(object has {len(obj.material_slots)} slots)"}
 
+        self._ensure_object_mode(obj)
         mesh = obj.data
         if face_indices == "all":
             face_indices = range(len(mesh.polygons))
+        else:
+            err = self._check_indices(face_indices, len(mesh.polygons), "Face")
+            if err:
+                return err
 
         updated = 0
         for i in face_indices:
-            if i < len(mesh.polygons):
-                mesh.polygons[i].material_index = material_index
-                updated += 1
+            mesh.polygons[i].material_index = material_index
+            updated += 1
 
         mesh.update()
         return {"success": True, "name": name, "updated_faces": updated,
@@ -1276,38 +1339,27 @@ class BlenderMCPServer:
         face_indices: list of face indices to extrude
         amount: extrusion distance (negative = inward)
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        if not face_indices:
+            return {"error": "No face indices provided"}
+        err = self._check_indices(face_indices, len(obj.data.polygons), "Face")
+        if err:
+            return err
 
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.faces.ensure_lookup_table()
-
-        valid = [i for i in face_indices if i < len(bm.faces)]
-        if not valid:
-            bm.free()
-            return {"error": "No valid face indices provided"}
-
-        faces = [bm.faces[i] for i in valid]
-
-        result = _bmesh.ops.extrude_face_region(bm, geom=faces)
-        new_verts = [g for g in result["geom"] if isinstance(g, _bmesh.types.BMVert)]
-
-        # Translate each new vert along its normal
-        for v in new_verts:
-            v.co += v.normal * amount
-
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            faces = [bm.faces[i] for i in face_indices]
+            result = bmesh.ops.extrude_face_region(bm, geom=faces)
+            new_verts = [g for g in result["geom"] if isinstance(g, bmesh.types.BMVert)]
+            # Translate each new vert along its normal
+            for v in new_verts:
+                v.co += v.normal * amount
 
         return {"success": True, "name": name,
-                "extruded_faces": len(valid), "amount": amount}
+                "extruded_faces": len(face_indices), "amount": amount}
 
     def inset_faces(self, name, face_indices, thickness=0.1, depth=0.0,
                     use_individual=True):
@@ -1317,67 +1369,49 @@ class BlenderMCPServer:
         depth: push inset faces along their normals (0 = flat inset)
         use_individual: True = inset each face independently
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        if not face_indices:
+            return {"error": "No face indices provided"}
+        err = self._check_indices(face_indices, len(obj.data.polygons), "Face")
+        if err:
+            return err
 
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.faces.ensure_lookup_table()
-
-        valid = [i for i in face_indices if i < len(bm.faces)]
-        if not valid:
-            bm.free()
-            return {"error": "No valid face indices provided"}
-
-        faces = [bm.faces[i] for i in valid]
-
-        if use_individual:
-            _bmesh.ops.inset_individual(bm, faces=faces,
-                                        thickness=thickness, depth=depth,
-                                        use_even_offset=True)
-        else:
-            _bmesh.ops.inset_region(bm, faces=faces,
-                                    thickness=thickness, depth=depth,
-                                    use_even_offset=True)
-
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            faces = [bm.faces[i] for i in face_indices]
+            if use_individual:
+                bmesh.ops.inset_individual(bm, faces=faces,
+                                           thickness=thickness, depth=depth,
+                                           use_even_offset=True)
+            else:
+                bmesh.ops.inset_region(bm, faces=faces,
+                                       thickness=thickness, depth=depth,
+                                       use_even_offset=True)
 
         return {"success": True, "name": name,
-                "inset_faces": len(valid),
+                "inset_faces": len(face_indices),
                 "thickness": thickness, "depth": depth}
 
     def flip_normals(self, name, face_indices=None):
         """
         Flip the normals of specified faces (or all faces if face_indices is None).
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        if face_indices is not None:
+            err = self._check_indices(face_indices, len(obj.data.polygons), "Face")
+            if err:
+                return err
 
-        mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        bm.faces.ensure_lookup_table()
-
-        if face_indices is None:
-            faces = list(bm.faces)
-        else:
-            faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]
-
-        _bmesh.ops.reverse_faces(bm, faces=faces)
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            faces = list(bm.faces) if face_indices is None else [bm.faces[i] for i in face_indices]
+            bmesh.ops.reverse_faces(bm, faces=faces)
 
         return {"success": True, "name": name, "flipped_faces": len(faces)}
 
@@ -1387,7 +1421,6 @@ class BlenderMCPServer:
         Equivalent to 'Merge by Distance' in Blender.
         Returns number of vertices removed.
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
@@ -1395,13 +1428,9 @@ class BlenderMCPServer:
             return {"error": f"{name} is not a mesh"}
 
         mesh = obj.data
-        before = len(mesh.vertices)
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        _bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=distance)
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            before = len(bm.verts)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=distance)
 
         after = len(mesh.vertices)
         return {"success": True, "name": name,
@@ -1413,20 +1442,18 @@ class BlenderMCPServer:
         Triangulate all faces of a mesh.
         method: BEAUTY (best quality), FIXED, FIXED_ALTERNATE, SHORTEST_DIAGONAL
         """
-        import bmesh as _bmesh
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh"}
+        valid_methods = ("BEAUTY", "FIXED", "FIXED_ALTERNATE", "SHORTEST_DIAGONAL", "LONGEST_DIAGONAL")
+        if method not in valid_methods:
+            return {"error": f"Unknown method '{method}'. Choose from: {list(valid_methods)}"}
 
         mesh = obj.data
-        bm = _bmesh.new()
-        bm.from_mesh(mesh)
-        _bmesh.ops.triangulate(bm, faces=bm.faces, quad_method=method, ngon_method='BEAUTY')
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        with self._bmesh_edit(obj) as bm:
+            bmesh.ops.triangulate(bm, faces=bm.faces, quad_method=method, ngon_method='BEAUTY')
 
         return {"success": True, "name": name,
                 "triangles": len(mesh.polygons)}
@@ -1439,12 +1466,13 @@ class BlenderMCPServer:
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh object"}
 
-        # Make active and enter edit mode
-        bpy.context.view_layer.objects.active = obj
+        self._select_only(obj)
         bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.subdivide(number_cuts=cuts, smoothness=smoothness)
-        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.subdivide(number_cuts=cuts, smoothness=smoothness)
+        finally:
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         return {"success": True, "name": name, "cuts": cuts,
                 "vertices": len(obj.data.vertices), "faces": len(obj.data.polygons)}
@@ -1457,8 +1485,9 @@ class BlenderMCPServer:
         mod = obj.modifiers.get(modifier_name)
         if not mod:
             return {"error": f"Modifier '{modifier_name}' not found on {name}"}
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.modifier_apply(modifier=modifier_name)
+        self._select_only(obj)
+        with bpy.context.temp_override(object=obj, active_object=obj):
+            bpy.ops.object.modifier_apply(modifier=modifier_name)
         return {"success": True, "name": name, "applied_modifier": modifier_name}
 
     def get_mesh_stats(self, name):
@@ -1469,7 +1498,10 @@ class BlenderMCPServer:
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh object"}
         mesh = obj.data
-        tri_count = sum(len(p.vertices) - 2 for p in mesh.polygons)
+        n_polys = len(mesh.polygons)
+        loop_totals = array.array('i', [0]) * n_polys
+        mesh.polygons.foreach_get("loop_total", loop_totals)
+        tri_count = sum(loop_totals) - 2 * n_polys
         return {
             "name": name,
             "vertices": len(mesh.vertices),
@@ -1522,114 +1554,105 @@ class BlenderMCPServer:
         bpy.context.scene.camera = obj
         return {"success": True, "active_camera": name}
 
+    @contextmanager
+    def _render_settings(self, scene, width, height, samples, file_format='PNG'):
+        """Temporarily apply render settings, restoring everything afterwards."""
+        r = scene.render
+        cyc = getattr(scene, "cycles", None)
+        eev = getattr(scene, "eevee", None)
+        saved = (scene.camera, r.resolution_x, r.resolution_y, r.resolution_percentage,
+                 r.filepath, r.image_settings.file_format,
+                 cyc.samples if cyc else None,
+                 getattr(eev, "taa_render_samples", None) if eev else None)
+        try:
+            r.resolution_x = int(width)
+            r.resolution_y = int(height)
+            r.resolution_percentage = 100
+            r.image_settings.file_format = file_format
+            if cyc:
+                cyc.samples = int(samples)
+            if eev and hasattr(eev, "taa_render_samples"):
+                eev.taa_render_samples = int(samples)
+            yield
+        finally:
+            (scene.camera, r.resolution_x, r.resolution_y, r.resolution_percentage,
+             r.filepath, r.image_settings.file_format, cyc_s, eev_s) = saved
+            if cyc and cyc_s is not None:
+                cyc.samples = cyc_s
+            if eev and eev_s is not None:
+                eev.taa_render_samples = eev_s
+
+    @staticmethod
+    def _render_to_file(scene, filepath):
+        """Render a still to filepath; raise if Blender produced nothing."""
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        scene.render.filepath = filepath
+        result = bpy.ops.render.render(write_still=True)
+        if 'FINISHED' not in result:
+            raise RuntimeError(f"render operator returned {set(result)}")
+        if not os.path.exists(filepath):
+            raise RuntimeError("render finished but no file was written")
+
     def render_from_camera(self, camera_name=None, filepath=None,
                            width=1920, height=1080, samples=32):
         """
         Render a still from the specified (or current active) camera and save it.
         """
-        import tempfile
         if not filepath:
             filepath = os.path.join(tempfile.gettempdir(),
                                     f"blender_render_{os.getpid()}.png")
 
         scene = bpy.context.scene
-        orig_camera = scene.camera
-        orig_res_x = scene.render.resolution_x
-        orig_res_y = scene.render.resolution_y
-        orig_samples = scene.cycles.samples if scene.render.engine == 'CYCLES' else None
-        orig_filepath = scene.render.filepath
-        orig_format = scene.render.image_settings.file_format
+        cam_obj = scene.camera
+        if camera_name:
+            cam_obj = bpy.data.objects.get(camera_name)
+            if not cam_obj:
+                return {"error": f"Camera not found: {camera_name}"}
+            if cam_obj.type != 'CAMERA':
+                return {"error": f"{camera_name} is not a camera"}
+        if cam_obj is None:
+            return {"error": "Scene has no active camera. Create one with create_camera / set_active_camera."}
 
         try:
-            if camera_name:
-                cam_obj = bpy.data.objects.get(camera_name)
-                if not cam_obj:
-                    return {"error": f"Camera not found: {camera_name}"}
+            with self._render_settings(scene, width, height, samples):
                 scene.camera = cam_obj
+                self._render_to_file(scene, filepath)
+        except Exception as e:
+            return {"error": f"Render failed: {e}"}
 
-            scene.render.resolution_x = width
-            scene.render.resolution_y = height
-            if scene.render.engine == 'CYCLES' and orig_samples is not None:
-                scene.cycles.samples = samples
-            scene.render.filepath = filepath
-            scene.render.image_settings.file_format = 'PNG'
-            bpy.ops.render.render(write_still=True)
-
-        finally:
-            scene.camera = orig_camera
-            scene.render.resolution_x = orig_res_x
-            scene.render.resolution_y = orig_res_y
-            if orig_samples is not None:
-                scene.cycles.samples = orig_samples
-            scene.render.filepath = orig_filepath
-            scene.render.image_settings.file_format = orig_format
-
-        return {"success": True, "filepath": filepath, "width": width, "height": height}
+        return {"success": True, "filepath": filepath, "camera": cam_obj.name,
+                "width": width, "height": height}
 
     def render_all_cameras(self, width=1920, height=1080, samples=32,
                            output_dir=None, file_format="PNG"):
         """
         Render a still from every camera object in the scene.
-        Returns a list of {camera, filepath, success} dicts.
+        Returns a list of {camera, filepath, success[, error]} dicts.
         """
-        import tempfile
-
         cameras = [obj for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
         if not cameras:
             return {"error": "No camera objects found in the scene"}
 
         if output_dir is None:
             output_dir = tempfile.gettempdir()
+        elif not os.path.isdir(output_dir):
+            return {"error": f"output_dir does not exist: {output_dir}"}
 
         scene = bpy.context.scene
-        orig_camera   = scene.camera
-        orig_res_x    = scene.render.resolution_x
-        orig_res_y    = scene.render.resolution_y
-        orig_samples  = scene.cycles.samples if scene.render.engine == 'CYCLES' else None
-        orig_filepath = scene.render.filepath
-        orig_format   = scene.render.image_settings.file_format
-
         results = []
-
-        try:
-            scene.render.resolution_x = width
-            scene.render.resolution_y = height
-            scene.render.image_settings.file_format = file_format
-            if scene.render.engine == 'CYCLES' and orig_samples is not None:
-                scene.cycles.samples = samples
-
+        with self._render_settings(scene, width, height, samples, file_format):
             for cam in cameras:
-                # Sanitise camera name for use in filename
-                safe_name = "".join(c if c.isalnum() or c in "-_." else "_"
-                                    for c in cam.name)
-                filepath = os.path.join(output_dir,
-                                        f"render_{safe_name}_{os.getpid()}.png")
-                scene.camera = cam
-                scene.render.filepath = filepath
-
+                safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in cam.name)
+                filepath = os.path.join(output_dir, f"render_{safe_name}_{os.getpid()}.png")
+                entry = {"camera": cam.name, "filepath": filepath, "success": False}
                 try:
-                    bpy.ops.render.render(write_still=True)
-                    results.append({
-                        "camera":   cam.name,
-                        "filepath": filepath,
-                        "success":  os.path.exists(filepath),
-                    })
+                    scene.camera = cam
+                    self._render_to_file(scene, filepath)
+                    entry["success"] = True
                 except Exception as e:
-                    results.append({
-                        "camera":  cam.name,
-                        "filepath": filepath,
-                        "success": False,
-                        "error":   str(e),
-                    })
-
-        finally:
-            scene.camera                            = orig_camera
-            scene.render.resolution_x               = orig_res_x
-            scene.render.resolution_y               = orig_res_y
-            scene.render.filepath                   = orig_filepath
-            scene.render.image_settings.file_format = orig_format
-            if orig_samples is not None:
-                scene.cycles.samples = orig_samples
+                    entry["error"] = str(e)
+                results.append(entry)
 
         succeeded = [r for r in results if r["success"]]
         return {
@@ -1760,39 +1783,52 @@ class BlenderMCPServer:
         Export an object (or the entire scene if name is None).
         file_format: glb, gltf, fbx, obj, stl, ply
         """
-        import tempfile
-        file_format = file_format.lower()
+        file_format = (file_format or "glb").lower().lstrip(".")
+        supported = ("glb", "gltf", "fbx", "obj", "stl", "ply")
+        if file_format not in supported:
+            return {"error": f"Unsupported format: {file_format}. Choose from: {list(supported)}"}
         if not filepath:
-            ext = "glb" if file_format == "glb" else file_format
             filepath = os.path.join(tempfile.gettempdir(),
-                                    f"blender_export_{os.getpid()}.{ext}")
+                                    f"blender_export_{os.getpid()}.{file_format}")
 
         # Select only the target object if specified
+        selected = name is not None
         if name:
             obj = bpy.data.objects.get(name)
             if not obj:
                 return {"error": f"Object not found: {name}"}
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            bpy.context.view_layer.objects.active = obj
+            self._select_only(obj)
 
-        if file_format in ("glb", "gltf"):
-            bpy.ops.export_scene.gltf(
-                filepath=filepath,
-                export_format="GLB" if file_format == "glb" else "GLTF_SEPARATE",
-                use_selection=(name is not None),
-            )
-        elif file_format == "fbx":
-            bpy.ops.export_scene.fbx(filepath=filepath, use_selection=(name is not None))
-        elif file_format == "obj":
-            bpy.ops.export_scene.obj(filepath=filepath, use_selection=(name is not None))
-        elif file_format == "stl":
-            bpy.ops.export_mesh.stl(filepath=filepath)
-        elif file_format == "ply":
-            bpy.ops.export_mesh.ply(filepath=filepath)
-        else:
-            return {"error": f"Unsupported format: {file_format}"}
+        # Blender 4.x: OBJ/STL/PLY moved from the Python add-ons to wm.* C operators
+        try:
+            if file_format in ("glb", "gltf"):
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    export_format="GLB" if file_format == "glb" else "GLTF_SEPARATE",
+                    use_selection=selected,
+                )
+            elif file_format == "fbx":
+                bpy.ops.export_scene.fbx(filepath=filepath, use_selection=selected)
+            elif file_format == "obj":
+                if self._op_exists(bpy.ops.wm.obj_export):
+                    bpy.ops.wm.obj_export(filepath=filepath, export_selected_objects=selected)
+                else:
+                    bpy.ops.export_scene.obj(filepath=filepath, use_selection=selected)
+            elif file_format == "stl":
+                if self._op_exists(bpy.ops.wm.stl_export):
+                    bpy.ops.wm.stl_export(filepath=filepath, export_selected_objects=selected)
+                else:
+                    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=selected)
+            elif file_format == "ply":
+                if self._op_exists(bpy.ops.wm.ply_export):
+                    bpy.ops.wm.ply_export(filepath=filepath, export_selected_objects=selected)
+                else:
+                    bpy.ops.export_mesh.ply(filepath=filepath, use_selection=selected)
+        except Exception as e:
+            return {"error": f"Export failed: {e}"}
 
+        if not os.path.exists(filepath) and file_format != "gltf":
+            return {"error": f"Exporter finished but {filepath} was not written"}
         return {"success": True, "filepath": filepath, "format": file_format}
 
     def import_file(self, filepath):
@@ -1803,22 +1839,41 @@ class BlenderMCPServer:
             return {"error": f"File not found: {filepath}"}
 
         ext = os.path.splitext(filepath)[1].lower()
+        supported = (".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply", ".blend")
+        if ext not in supported:
+            return {"error": f"Unsupported file extension: {ext}. Choose from: {list(supported)}"}
         before = set(bpy.data.objects.keys())
 
-        if ext in (".glb", ".gltf"):
-            bpy.ops.import_scene.gltf(filepath=filepath)
-        elif ext == ".fbx":
-            bpy.ops.import_scene.fbx(filepath=filepath)
-        elif ext == ".obj":
-            bpy.ops.import_scene.obj(filepath=filepath)
-        elif ext == ".stl":
-            bpy.ops.import_mesh.stl(filepath=filepath)
-        elif ext == ".ply":
-            bpy.ops.import_mesh.ply(filepath=filepath)
-        elif ext == ".blend":
-            bpy.ops.wm.append(filepath=filepath)
-        else:
-            return {"error": f"Unsupported file extension: {ext}"}
+        try:
+            if ext in (".glb", ".gltf"):
+                bpy.ops.import_scene.gltf(filepath=filepath)
+            elif ext == ".fbx":
+                bpy.ops.import_scene.fbx(filepath=filepath)
+            elif ext == ".obj":
+                if self._op_exists(bpy.ops.wm.obj_import):
+                    bpy.ops.wm.obj_import(filepath=filepath)
+                else:
+                    bpy.ops.import_scene.obj(filepath=filepath)
+            elif ext == ".stl":
+                if self._op_exists(bpy.ops.wm.stl_import):
+                    bpy.ops.wm.stl_import(filepath=filepath)
+                else:
+                    bpy.ops.import_mesh.stl(filepath=filepath)
+            elif ext == ".ply":
+                if self._op_exists(bpy.ops.wm.ply_import):
+                    bpy.ops.wm.ply_import(filepath=filepath)
+                else:
+                    bpy.ops.import_mesh.ply(filepath=filepath)
+            elif ext == ".blend":
+                # Append every object from the file (dependencies come along)
+                with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                    data_to.objects = list(data_from.objects)
+                target = bpy.context.collection or bpy.context.scene.collection
+                for o in data_to.objects:
+                    if o is not None:
+                        target.objects.link(o)
+        except Exception as e:
+            return {"error": f"Import failed: {e}"}
 
         after = set(bpy.data.objects.keys())
         new_objects = list(after - before)
@@ -1954,7 +2009,10 @@ class BlenderMCPServer:
                             obj.location.z + offset[2])
         if new_name:
             new_obj.name = new_name
-        bpy.context.scene.collection.objects.link(new_obj)
+        # Keep the copy next to the original in the outliner
+        collections = [c for c in obj.users_collection] or [bpy.context.scene.collection]
+        for col in collections:
+            col.objects.link(new_obj)
         return {"success": True, "original": name, "duplicate": new_obj.name,
                 "location": list(new_obj.location), "linked": linked}
 
@@ -1985,14 +2043,17 @@ class BlenderMCPServer:
         if not obj or obj.type != 'MESH':
             return {"error": f"Mesh object not found: {name}"}
 
+        if method not in ("LOOSE", "MATERIAL", "SELECTED"):
+            return {"error": f"Unknown method '{method}'. Choose from: ['LOOSE', 'MATERIAL', 'SELECTED']"}
         before = set(bpy.data.objects.keys())
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
+        self._select_only(obj)
         bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        bpy.ops.mesh.separate(type=method)
-        bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            if method != "SELECTED":
+                bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.separate(type=method)
+        finally:
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         after = set(bpy.data.objects.keys())
         new_objs = list(after - before)
@@ -2017,9 +2078,7 @@ class BlenderMCPServer:
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
-        bpy.context.view_layer.objects.active = obj
+        self._select_only(obj)
         bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
         return {"success": True, "name": name, "origin_type": origin_type,
                 "new_location": list(obj.location)}
@@ -2035,22 +2094,37 @@ class BlenderMCPServer:
         return {"success": True, "name": name, "location_z": round(obj.location.z, 6)}
 
     def set_smooth_shading(self, name, smooth=True, auto_smooth=True, angle=30.0):
-        """Toggle smooth/flat shading and optionally enable auto-smooth."""
+        """
+        Toggle smooth/flat shading and optionally enable auto-smooth by angle.
+        Blender 4.1+ has no mesh auto-smooth flag; there the "Smooth by Angle"
+        modifier is used instead. The reply says which one was applied.
+        """
         import math
         obj = bpy.data.objects.get(name)
         if not obj or obj.type != 'MESH':
             return {"error": f"Mesh object not found: {name}"}
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.select_all(action='DESELECT')
-        obj.select_set(True)
+        self._select_only(obj)
+        auto_method = None
         if smooth:
-            bpy.ops.object.shade_smooth()
             if auto_smooth and hasattr(obj.data, 'use_auto_smooth'):
+                bpy.ops.object.shade_smooth()
                 obj.data.use_auto_smooth = True
                 obj.data.auto_smooth_angle = math.radians(angle)
+                auto_method = "mesh.use_auto_smooth"
+            elif auto_smooth and self._op_exists(bpy.ops.object.shade_smooth_by_angle):
+                bpy.ops.object.shade_smooth_by_angle(angle=math.radians(angle))
+                auto_method = "smooth_by_angle"
+            elif auto_smooth and self._op_exists(bpy.ops.object.shade_auto_smooth):
+                bpy.ops.object.shade_auto_smooth(use_auto_smooth=True, angle=math.radians(angle))
+                auto_method = "smooth_by_angle_modifier"
+            else:
+                bpy.ops.object.shade_smooth()
         else:
             bpy.ops.object.shade_flat()
-        return {"success": True, "name": name, "smooth": smooth, "auto_smooth_angle": angle}
+        return {"success": True, "name": name, "smooth": smooth,
+                "auto_smooth": auto_method is not None,
+                "auto_smooth_method": auto_method,
+                "auto_smooth_angle": angle if auto_method else None}
 
     def parent_object(self, child_name, parent_name, keep_transform=True):
         """Parent child_name to parent_name, optionally preserving world transform."""
@@ -2160,8 +2234,15 @@ class BlenderMCPServer:
         bsdf.inputs["Alpha"].default_value        = alpha
 
         if alpha < 1.0:
-            mat.blend_method = 'BLEND'
-            mat.shadow_method = 'CLIP'
+            # 4.2+ EEVEE Next uses surface_render_method; older builds use blend/shadow_method
+            if hasattr(mat, "surface_render_method"):
+                mat.surface_render_method = 'BLENDED'
+            if hasattr(mat, "blend_method"):
+                mat.blend_method = 'BLEND'
+            if hasattr(mat, "shadow_method"):
+                mat.shadow_method = 'CLIP'
+            if hasattr(mat, "use_transparent_shadow"):
+                mat.use_transparent_shadow = True
 
         if emission_color:
             # Blender 4.x uses "Emission Color" input; earlier uses separate "Emission"
@@ -2256,12 +2337,13 @@ class BlenderMCPServer:
 
     # ─── Modifiers ───────────────────────────────────────────────────────────
 
-    def add_modifier_ext(self, name, modifier_type, modifier_name=None, **kwargs):
+    def add_modifier_ext(self, name, modifier_type, modifier_name=None, props=None, **kwargs):
         """
         Add a modifier to an object.
         modifier_type: MIRROR, BEVEL, ARRAY, SOLIDIFY, SUBSURF, BOOLEAN,
                        DECIMATE, DISPLACE, SHRINKWRAP, WIREFRAME, SKIN, etc.
-        kwargs: any modifier property name → value pair.
+        props: dict of modifier property name → value (extra kwargs are merged in).
+        Properties that could not be set are reported under "unset".
         Common examples:
           MIRROR:   use_axis=[True,True,False], use_clip=True
           BEVEL:    width=0.1, segments=3, limit_method='ANGLE', angle_limit=0.523
@@ -2273,19 +2355,43 @@ class BlenderMCPServer:
         if not obj:
             return {"error": f"Object not found: {name}"}
 
+        modifier_type = str(modifier_type).upper()
         if modifier_name is None:
             modifier_name = modifier_type.replace("_", " ").title()
 
-        mod = obj.modifiers.new(name=modifier_name, type=modifier_type)
+        try:
+            mod = obj.modifiers.new(name=modifier_name, type=modifier_type)
+        except Exception as e:
+            valid = [i.identifier for i in bpy.types.Modifier.bl_rna.properties['type'].enum_items]
+            return {"error": f"Could not add modifier of type '{modifier_type}': {e}. Valid types: {valid}"}
+        if mod is None:
+            return {"error": f"Modifier type '{modifier_type}' cannot be added to a {obj.type} object"}
 
-        for k, v in kwargs.items():
+        values = dict(props or {})
+        values.update(kwargs)
+        unset = {}
+        for k, v in values.items():
+            if not hasattr(mod, k):
+                unset[k] = "no such property"
+                continue
             try:
-                if hasattr(mod, k):
-                    setattr(mod, k, v)
+                # Object references (e.g. BOOLEAN.object, SHRINKWRAP.target) come in by name
+                if isinstance(v, str) and isinstance(getattr(mod, k), (bpy.types.Object, type(None))) \
+                        and mod.bl_rna.properties[k].type == 'POINTER':
+                    target = bpy.data.objects.get(v)
+                    if target is None:
+                        unset[k] = f"object '{v}' not found"
+                        continue
+                    v = target
+                setattr(mod, k, v)
             except Exception as ex:
-                print(f"[addon] add_modifier_ext: could not set {k}={v}: {ex}")
+                unset[k] = str(ex)
 
-        return {"success": True, "object": name, "modifier": mod.name, "type": modifier_type}
+        result = {"success": True, "object": name, "modifier": mod.name, "type": modifier_type,
+                  "set": [k for k in values if k not in unset]}
+        if unset:
+            result["unset"] = unset
+        return result
 
     def boolean_operation(self, target_name, cutter_name,
                           operation="DIFFERENCE", solver="EXACT", apply=True):
@@ -2378,22 +2484,52 @@ class BlenderMCPServer:
         if frame is not None:
             scene.frame_set(int(frame))
 
+        # Split "a.b[\"c\"].d" into owner path + attribute (last '.' outside brackets)
+        depth, split_at = 0, -1
+        for i, ch in enumerate(data_path):
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+            elif ch == '.' and depth == 0:
+                split_at = i
+        try:
+            if split_at >= 0:
+                owner = obj.path_resolve(data_path[:split_at])
+                attr = data_path[split_at + 1:]
+            else:
+                owner, attr = obj, data_path
+            current = getattr(owner, attr)
+        except Exception as e:
+            return {"error": f"Cannot resolve '{data_path}' on {name}: {e}"}
+
         if value is not None:
-            if data_path == "rotation_euler" and isinstance(value, list):
+            is_vector = hasattr(current, "__len__") and not isinstance(current, str)
+            if attr in ("rotation_euler", "delta_rotation_euler") and isinstance(value, (list, tuple)):
                 value = [math.radians(v) for v in value]
+            if is_vector and not isinstance(value, (list, tuple)):
+                return {"error": f"{data_path} expects {len(current)} values, got a single number"}
+            if not is_vector and isinstance(value, (list, tuple)):
+                if len(value) != 1:
+                    return {"error": f"{data_path} expects a single value, got {len(value)}"}
+                value = value[0]
+            if is_vector and len(value) != len(current):
+                return {"error": f"{data_path} expects {len(current)} values, got {len(value)}"}
             try:
-                prop = obj.path_resolve(data_path)
-                if hasattr(prop, '__setitem__'):
-                    for i, v in enumerate(value):
-                        prop[i] = v
-                else:
-                    setattr(obj, data_path, value)
+                setattr(owner, attr, value)
             except Exception as e:
                 return {"error": f"Could not set {data_path}: {e}"}
 
-        obj.keyframe_insert(data_path=data_path, frame=scene.frame_current)
+        # Key on the ID that owns the property (obj.data for data.*, obj for modifiers[...])
+        try:
+            id_owner = owner if isinstance(owner, bpy.types.ID) else owner.id_data
+            key_path = attr if id_owner is owner else owner.path_from_id(attr)
+            id_owner.keyframe_insert(data_path=key_path, frame=scene.frame_current)
+        except Exception as e:
+            return {"error": f"Could not insert keyframe on {data_path}: {e}"}
+
         return {"success": True, "name": name, "data_path": data_path,
-                "frame": scene.frame_current}
+                "keyed_on": id_owner.name, "frame": scene.frame_current}
 
     def set_frame(self, frame):
         """Set the current scene frame."""
@@ -3117,21 +3253,6 @@ class BlenderMCPServer:
             print(f"Error in set_texture: {str(e)}")
             traceback.print_exc()
             return {"error": f"Failed to apply texture: {str(e)}"}
-
-    def get_telemetry_consent(self):
-        """Get the current telemetry consent status"""
-        try:
-            # Get addon preferences - use the module name
-            addon_prefs = bpy.context.preferences.addons.get(__name__)
-            if addon_prefs:
-                consent = addon_prefs.preferences.telemetry_consent
-            else:
-                # Fallback to default if preferences not available
-                consent = True
-        except (AttributeError, KeyError):
-            # Fallback to default if preferences not available
-            consent = True
-        return {"consent": consent}
 
     def get_polyhaven_status(self):
         """Get the current status of PolyHaven integration"""
@@ -4329,40 +4450,15 @@ class BlenderMCPServer:
                 print(f"Failed to clean up temporary directory {temp_dir}: {e}")
     #endregion
 
-# Blender Addon Preferences
+# Blender Addon Preferences (no settings; everything lives in the sidebar panel)
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
-    
-    telemetry_consent: BoolProperty(
-        name="Allow Telemetry",
-        description="Allow collection of prompts, code snippets, and screenshots to help improve Blender MCP",
-        default=True
-    )
 
     def draw(self, context):
         layout = self.layout
-        
-        # Telemetry section
-        layout.label(text="Telemetry & Privacy:", icon='PREFERENCES')
-        
-        box = layout.box()
-        row = box.row()
-        row.prop(self, "telemetry_consent", text="Allow Telemetry")
-        
-        # Info text
-        box.separator()
-        if self.telemetry_consent:
-            box.label(text="With consent: We collect anonymized prompts, code, and screenshots.", icon='INFO')
-        else:
-            box.label(text="Without consent: We only collect minimal anonymous usage data", icon='INFO')
-            box.label(text="(tool names, success/failure, duration - no prompts or code).", icon='BLANK1')
-        box.separator()
-        box.label(text="All data is fully anonymized. You can change this anytime.", icon='CHECKMARK')
-        
-        # Terms and Conditions link
-        box.separator()
-        row = box.row()
-        row.operator("blendermcp.open_terms", text="View Terms and Conditions", icon='TEXT')
+        layout.label(text="Configure the server port and integrations in the 3D Viewport sidebar (N) > BlenderMCP.",
+                     icon='INFO')
+        layout.label(text="This fork sends no telemetry.", icon='CHECKMARK')
 
 # Blender UI Panel
 class BLENDERMCP_PT_Panel(bpy.types.Panel):
@@ -4454,24 +4550,6 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 
         scene.blendermcp_server_running = False
 
-        return {'FINISHED'}
-
-# Operator to open Terms and Conditions
-class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
-    bl_idname = "blendermcp.open_terms"
-    bl_label = "View Terms and Conditions"
-    bl_description = "Open the Terms and Conditions document"
-
-    def execute(self, context):
-        # Open the Terms and Conditions on GitHub
-        terms_url = "https://github.com/ahujasid/blender-mcp/blob/main/TERMS_AND_CONDITIONS.md"
-        try:
-            import webbrowser
-            webbrowser.open(terms_url)
-            self.report({'INFO'}, "Terms and Conditions opened in browser")
-        except Exception as e:
-            self.report({'ERROR'}, f"Could not open Terms and Conditions: {str(e)}")
-        
         return {'FINISHED'}
 
 # Registration functions
@@ -4603,10 +4681,10 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     # Auto-restart the server if it was running before the reload.
-    if _restart_server_on_register:
+    if _restart_flag_get():
+        _restart_flag_set(False)
         def _deferred_start():
             try:
                 port = bpy.context.scene.blendermcp_port
@@ -4622,9 +4700,8 @@ def register():
     print("BlenderMCP addon registered")
 
 def unregister():
-    global _restart_server_on_register
     # Remember whether the server was running so register() can restart it.
-    _restart_server_on_register = (
+    _restart_flag_set(
         hasattr(bpy.types, "blendermcp_server")
         and bpy.types.blendermcp_server is not None
         and getattr(bpy.context.scene, "blendermcp_server_running", False)
@@ -4638,7 +4715,6 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
-    bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
     del bpy.types.Scene.blendermcp_port
