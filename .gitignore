@@ -14,3 +14,6 @@ wheels/
 
 # Local config secrets
 src/blender_mcp/config.py
+
+# Local test renders
+test_output/
