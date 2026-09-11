@@ -1,0 +1,910 @@
+HARNESS blender=5.2.1 python=3.13.13 numpy=2.3.4 background=True
+HARNESS addon=D:\App Dev\blender_mcp\addon.py git_hash_object=e0329ced83ca1b74e12d0c5b2caaab65c872b94e sha256=6f208e0706746daf80460db60b5dd705e86f7581192c9ac0684790a90381b456
+BlenderMCP addon registered
+STEP 1 PASS [M1] import + register() :: bl_info.version=(2, 0, 0) requests=2.32.3 handlers=85
+STEP 2 PASS [PLAN4] handler table complete :: 85 handlers, 13 gated
+STEP 3 PASS [M7] M7 no bpy.app.version comparisons :: 0 version comparisons in addon.py
+STEP 4 PASS [M12] M12 numpy.array sites carry dtype :: 1 numpy.array sites, all carry dtype (float64 required only where the source is mathutils): ['server.py:1817 dtype=float32']
+STEP 5 PASS [M7] M7b legacy obj/stl operators guarded by _op_exists :: 6 legacy obj/stl operator sites, all under an _op_exists guard
+STEP 6 PASS [F8] F8 no tempfile._cleanup in addon.py :: 0 hits
+STEP 7 PASS [F7] F7 static: SeparateRGB only as _new_node fallback of SeparateColor :: 1 code mention(s) all inside a _new_node try-list with ShaderNodeSeparateColor (comment-only lines: [3338])
+Executing handler for get_polyhaven_status
+Handler execution complete
+Executing handler for get_polyhaven_status
+Handler execution complete
+STEP 8 PASS [PLAN4] scene props registered :: enabled=False
+STEP 9 PASS [PLAN4] unknown command -> error :: Unknown command type: no_such_tool
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+TypeError: BlenderMCPServer.move_object() got an unexpected keyword argument 'bogus'
+Executing handler for move_object
+Error in handler: BlenderMCPServer.move_object() got an unexpected keyword argument 'bogus'
+STEP 10 PASS [PLAN4] bad kwargs -> error not crash :: BlenderMCPServer.move_object() got an unexpected keyword argument 'bogus'
+STEP 11 PASS [PLAN4] integration gates closed by default :: 13 gated commands refuse while toggles are off
+Executing handler for get_scene_info
+Getting scene info...
+Scene info collected: 0 objects
+Handler execution complete
+STEP 12 PASS [PLAN4] get_scene_info empty scene :: objects=0 materials=0
+Executing handler for get_object_info
+Handler execution complete
+Executing handler for get_object_info
+Handler execution complete
+STEP 13 PASS [PLAN4] get_object_info mesh + light :: cube 8/12/6 bbox ok, light has no mesh key
+Executing handler for find_objects_by_type
+Handler execution complete
+Executing handler for find_objects_by_type
+Handler execution complete
+Executing handler for find_objects_by_type
+Handler execution complete
+STEP 14 PASS [PLAN4] find_objects_by_type :: mesh=1 light=1 armature=0
+Executing handler for measure_distance
+Handler execution complete
+Executing handler for measure_distance
+Handler execution complete
+STEP 15 PASS [PLAN4] measure_distance :: 3-4-5 triangle -> 5.0; missing object rejected
+Executing handler for get_object_info
+Handler execution complete
+STEP 16 PASS [PLAN4] get_object_info missing -> error :: Object not found: Nope
+Executing handler for get_scene_info
+Getting scene info...
+Scene info collected: 10 objects
+Handler execution complete
+STEP 17 PASS [PLAN4] get_scene_info caps list at 10 :: object_count=14 listed=10 (cap honoured)
+Executing handler for move_object
+Handler execution complete
+Executing handler for scale_object
+Handler execution complete
+Executing handler for rotate_object
+Handler execution complete
+Executing handler for rotate_object
+Handler execution complete
+Executing handler for scale_object
+Handler execution complete
+Executing handler for move_object
+Handler execution complete
+STEP 18 PASS [PLAN4] move/scale/rotate :: move/scale/rotate applied and reset
+Executing handler for move_object
+Handler execution complete
+STEP 19 PASS [PLAN4] move_object missing -> error :: Object not found: Nope
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 982, in move_object
+    obj.location = (x, y, z)
+    ^^^^^^^^^^^^
+TypeError: bpy_struct: item.attr = val: expected sequence items of type float, not str
+Executing handler for move_object
+Error in handler: bpy_struct: item.attr = val: expected sequence items of type float, not str
+STEP 20 PASS [PLAN4] move_object wrong type -> error :: bpy_struct: item.attr = val: expected sequence items of type float, not str
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 998, in rotate_object
+    obj.rotation_mode = mode
+    ^^^^^^^^^^^^^^^^^
+TypeError: bpy_struct: item.attr = val: enum "NOPE" not found in ('QUATERNION', 'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'AXIS_ANGLE')
+Executing handler for rotate_object
+Error in handler: bpy_struct: item.attr = val: enum "NOPE" not found in ('QUATERNION', 'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'AXIS_ANGLE')
+STEP 21 PASS [PLAN4] rotate_object bad mode -> error :: bpy_struct: item.attr = val: enum "NOPE" not found in ('QUATERNION', 'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'AXIS_ANGLE')
+Executing handler for get_vertex_positions
+Handler execution complete
+Executing handler for get_vertex_positions
+Handler execution complete
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 22 PASS [PLAN4] get_vertex_positions world/local/subset :: world = local + offset for 8 verts; subset order kept
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 23 PASS [PLAN4] get_vertex_positions index 99 -> error :: Vertex indices out of range: [99] (mesh has 8 vertices)
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 24 PASS [PLAN4] get_vertex_positions index -1 -> error :: Vertex indices out of range: [-1] (mesh has 8 vertices)
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 25 PASS [PLAN4] get_vertex_positions non-int index -> error :: Vertex indices must be integers, got ['a']
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 26 PASS [PLAN4] get_vertex_positions max_verts cap -> error :: Mesh has 8 vertices ? exceeds max_verts=4. Pass specific indices or increase max_verts.
+Executing handler for get_vertex_positions
+Handler execution complete
+STEP 27 PASS [PLAN4] get_vertex_positions on light -> error :: Lamp is not a mesh
+Executing handler for set_vertex_position
+Handler execution complete
+STEP 28 PASS [PLAN4] set_vertex_position world->local :: world (5.5,0,0) stored as local (0.5,0,0)
+Executing handler for set_vertex_position
+Handler execution complete
+STEP 29 PASS [PLAN4] set_vertex_position index 8 -> error :: Vertex indices out of range: [8] (mesh has 8 vertices)
+Executing handler for set_vertex_positions
+Handler execution complete
+STEP 30 PASS [PLAN4] set_vertex_positions batch with bad entries :: 1 updated, 2 rejected (index 42, missing index)
+Executing handler for get_control_points
+Handler execution complete
+Executing handler for get_control_points
+Handler execution complete
+STEP 31 PASS [PLAN4] get_control_points bezier + poly :: bezier 3 pts with handles; poly spline index 1
+Executing handler for get_control_points
+Handler execution complete
+STEP 32 PASS [PLAN4] get_control_points spline 5 -> error :: Spline index 5 out of range (2 splines)
+Executing handler for get_control_points
+Handler execution complete
+STEP 33 PASS [PLAN4] get_control_points on mesh -> error :: Cube is not a curve object (type=MESH)
+Executing handler for set_control_point
+Handler execution complete
+Executing handler for set_control_point
+Handler execution complete
+STEP 34 PASS [PLAN4] set_control_point bezier + poly :: bezier co/handles/types and poly co written
+Executing handler for set_control_point
+Handler execution complete
+STEP 35 PASS [PLAN4] set_control_point index 3 -> error :: Point index 3 out of range (3 points)
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 1205, in set_control_point
+    pt.handle_left_type  = handle_left_type
+    ^^^^^^^^^^^^^^^^^^^
+TypeError: bpy_struct: item.attr = val: enum "WOBBLY" not found in ('FREE', 'VECTOR', 'ALIGNED', 'AUTO')
+Executing handler for set_control_point
+Error in handler: bpy_struct: item.attr = val: enum "WOBBLY" not found in ('FREE', 'VECTOR', 'ALIGNED', 'AUTO')
+STEP 36 PASS [PLAN4] set_control_point bad handle type -> error :: bpy_struct: item.attr = val: enum "WOBBLY" not found in ('FREE', 'VECTOR', 'ALIGNED', 'AUTO')
+Executing handler for get_edges
+Handler execution complete
+Executing handler for mark_sharp_edges
+Handler execution complete
+Executing handler for get_edges
+Handler execution complete
+Executing handler for mark_sharp_edges
+Handler execution complete
+Executing handler for get_edges
+Handler execution complete
+Executing handler for set_edge_crease
+Handler execution complete
+Executing handler for set_edge_crease
+Handler execution complete
+Executing handler for get_edges
+Handler execution complete
+Executing handler for set_edge_bevel_weight
+Handler execution complete
+Executing handler for get_edges
+Handler execution complete
+STEP 37 PASS [PLAN4] edge sharp/crease/bevel round trip :: sharp [0,5], crease 0.7/clamped 1.0, bevel 0.25 all read back
+Executing handler for get_edges
+Handler execution complete
+STEP 38 PASS [PLAN4] get_edges index 12 -> error :: Edge indices out of range: [12] (mesh has 12 edges)
+Executing handler for mark_sharp_edges
+Handler execution complete
+STEP 39 PASS [PLAN4] mark_sharp_edges index -3 -> error :: Edge indices out of range: [-3] (mesh has 12 edges)
+Executing handler for set_edge_crease
+Handler execution complete
+STEP 40 PASS [PLAN4] set_edge_crease on curve -> error :: Bez is not a mesh
+Executing handler for get_faces
+Handler execution complete
+Executing handler for get_faces
+Handler execution complete
+STEP 41 PASS [PLAN4] get_faces world/local :: 6 quads, unit normals, world/local centers differ by offset
+Executing handler for get_faces
+Handler execution complete
+STEP 42 PASS [PLAN4] get_faces index 6 -> error :: Face indices out of range: [6] (mesh has 6 faces)
+Executing handler for set_face_material_index
+Handler execution complete
+STEP 43 PASS [PLAN4] set_face_material_index without slots -> error :: Material slot 0 does not exist (object has 0 slots)
+Executing handler for set_face_material_index
+Handler execution complete
+Executing handler for get_faces
+Handler execution complete
+Executing handler for set_face_material_index
+Handler execution complete
+Executing handler for set_face_material_index
+Handler execution complete
+STEP 44 PASS [PLAN4] set_face_material_index :: faces 0,2 -> slot 1; all -> 0; index 9 rejected
+Executing handler for get_faces
+Handler execution complete
+Executing handler for flip_normals
+Handler execution complete
+Executing handler for get_faces
+Handler execution complete
+Executing handler for get_faces
+Handler execution complete
+Executing handler for flip_normals
+Handler execution complete
+Executing handler for get_faces
+Handler execution complete
+Executing handler for flip_normals
+Handler execution complete
+STEP 45 PASS [PLAN4] flip_normals discriminating (hand-flipped face) :: face 0 normal negated then restored by flip-all; others negated
+Executing handler for get_faces
+Handler execution complete
+Executing handler for extrude_faces
+Handler execution complete
+STEP 46 PASS [PLAN4] extrude_faces :: 8->12 verts, 6->10 faces, top moved to z=1.5, no interior face
+Executing handler for extrude_faces
+Handler execution complete
+STEP 47 PASS [PLAN4] extrude_faces empty list -> error :: No face indices provided
+Executing handler for inset_faces
+Handler execution complete
+Executing handler for inset_faces
+Handler execution complete
+STEP 48 PASS [PLAN4] inset_faces individual + region :: individual inset +4 faces; region inset adds faces
+Executing handler for inset_faces
+Handler execution complete
+STEP 49 PASS [PLAN4] inset_faces index 999 -> error :: Face indices out of range: [999] (mesh has 20 faces)
+Executing handler for merge_vertices
+Handler execution complete
+STEP 50 PASS [PLAN4] merge_vertices removes duplicates :: 6 verts with 2 duplicates -> 4
+Executing handler for triangulate_mesh
+Handler execution complete
+Executing handler for triangulate_mesh
+Handler execution complete
+STEP 51 PASS [PLAN4] triangulate_mesh :: 6 quads -> 12 tris; bad method rejected
+Executing handler for subdivide_mesh
+Handler execution complete
+STEP 52 PASS [PLAN4] subdivide_mesh :: cube cuts=1 -> 26 verts 24 faces
+Executing handler for apply_modifier
+Handler execution complete
+Executing handler for apply_modifier
+Handler execution complete
+STEP 53 PASS [PLAN4] apply_modifier :: SUBSURF applied -> 24 faces, modifier list empty
+Executing handler for get_mesh_stats
+Handler execution complete
+STEP 54 PASS [PLAN4] get_mesh_stats :: 12 tris, bbox (0..2), modifier listed
+Executing handler for get_vertex_positions
+Handler execution complete
+Executing handler for set_edge_crease
+Handler execution complete
+STEP 55 PASS [PLAN4] handlers leave edit mode :: handlers left EDIT_MESH -> OBJECT twice
+Executing handler for create_camera
+Handler execution complete
+Executing handler for set_active_camera
+Handler execution complete
+STEP 56 PASS [PLAN4] create_camera + set_active_camera :: camera aims at look_at, lens 35, active
+Executing handler for set_active_camera
+Handler execution complete
+STEP 57 PASS [PLAN4] set_active_camera on mesh -> error :: Cube is not a camera
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 1687, in create_camera
+    cam_data.type = cam_type
+    ^^^^^^^^^^^^^
+TypeError: bpy_struct: item.attr = val: enum "FISHEYE" not found in ('PERSP', 'ORTHO', 'PANO', 'CUSTOM')
+Executing handler for create_camera
+Error in handler: bpy_struct: item.attr = val: enum "FISHEYE" not found in ('PERSP', 'ORTHO', 'PANO', 'CUSTOM')
+STEP 58 PASS [PLAN4] create_camera bad type -> error :: bpy_struct: item.attr = val: enum "FISHEYE" not found in ('PERSP', 'ORTHO', 'PANO', 'CUSTOM')
+Executing handler for set_render_settings
+Handler execution complete
+STEP 59 PASS [PLAN4] set_render_settings workbench/JPEG :: workbench 64x48 JPEG transparent
+Executing handler for set_render_settings
+Handler execution complete
+STEP 60 PASS [M3] M3 set_render_settings engine=BLENDER_EEVEE resolves on this build :: 'BLENDER_EEVEE' -> engine=BLENDER_EEVEE reply=BLENDER_EEVEE taa_render_samples=3 (enum: BLENDER_EEVEE)
+Executing handler for set_render_settings
+Handler execution complete
+STEP 61 PASS [M3] M3 set_render_settings engine=blender_eevee lower-case :: 'blender_eevee' -> engine=BLENDER_EEVEE reply=BLENDER_EEVEE taa_render_samples=3 (enum: BLENDER_EEVEE)
+Executing handler for set_render_settings
+Handler execution complete
+STEP 62 PASS [M3] M3 set_render_settings engine=eevee short alias :: 'eevee' -> engine=BLENDER_EEVEE reply=BLENDER_EEVEE taa_render_samples=3 (enum: BLENDER_EEVEE)
+Executing handler for set_render_settings
+Handler execution complete
+STEP 63 PASS [M13] M13 set_render_settings engine='' -> error :: engine must be a non-empty string; valid: ['BLENDER_EEVEE', 'BLENDER_WORKBENCH', 'CYCLES']
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for set_render_settings
+Handler execution complete
+STEP 64 PASS [M3] M3 set_render_settings lowercase cycles + workbench alias, reply engine key :: 'cycles' -> CYCLES samples=4 reply engine=CYCLES; 'workbench' -> BLENDER_WORKBENCH
+Executing handler for set_render_settings
+Handler execution complete
+STEP 65 PASS [M3] M3 set_render_settings bogus engine -> error listing enum :: error lists live enum: engine 'BLENDER_BOGUS' not valid (tried ['BLENDER_BOGUS', 'BLENDER_BLENDER_BOGUS']); valid: ['BLENDER_EEVEE', 'BLENDER_WORKBENCH', 'CYCLES']. Add-on engines tha
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for set_render_settings
+Handler execution complete
+STEP 66 PASS [M6] M6 set_render_settings still formats :: still formats PNG,JPEG,OPEN_EXR,TIFF
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for set_render_settings
+Handler execution complete
+STEP 67 PASS [M6] M6 set_render_settings FFMPEG video format :: FFMPEG accepted (media_type=VIDEO) then PNG (media_type=IMAGE)
+00:01.719  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\render_a.png'
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for render_from_camera
+Handler execution complete
+STEP 68 PASS [M6] M6 render_from_camera 48x32 PNG + settings restored :: 48x32 std=0.216 clusters=15 alpha_cov=1.00; settings restored (file_format=JPEG media_type=IMAGE)
+Executing handler for render_from_camera
+Handler execution complete
+STEP 69 PASS [PLAN4] render_from_camera missing camera -> error :: Camera not found: Nope
+Executing handler for render_from_camera
+Handler execution complete
+STEP 70 PASS [PLAN4] render_from_camera mesh as camera -> error :: Cube is not a camera
+Executing handler for render_from_camera
+Handler execution complete
+STEP 71 PASS [PLAN4] render_from_camera no active camera -> error :: Scene has no active camera. Create one with create_camera / set_active_camera.
+00:01.750  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\render_CamA_12640.png'
+00:01.750  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\render_CamB_12640.png'
+Executing handler for render_all_cameras
+Handler execution complete
+STEP 72 PASS [PLAN4] render_all_cameras 2 cams :: 2 cameras: 40x30 std=0.208 clusters=13 alpha_cov=1.00 | 40x30 std=0.262 clusters=13 alpha_cov=1.00
+Executing handler for render_all_cameras
+Handler execution complete
+STEP 73 PASS [PLAN4] render_all_cameras bad output_dir -> error :: output_dir does not exist: C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\nope_dir
+00:01.969  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\depth.png'
+Executing handler for set_render_settings
+Handler execution complete
+Executing handler for render_depth_map
+Handler execution complete
+STEP 74 PASS [M4] M4 render_depth_map near>far, no leaks :: 16x16 center=0.667 corner=0.000, no leaks, user scene + use_pass_z untouched
+Executing handler for render_depth_map
+Handler execution complete
+STEP 75 PASS [M13] M13 render_depth_map no camera -> error :: Scene has no active camera. Create one with create_camera / set_active_camera.
+Executing handler for add_light
+Handler execution complete
+Executing handler for add_light
+Handler execution complete
+Executing handler for add_light
+Handler execution complete
+Executing handler for add_light
+Handler execution complete
+STEP 76 PASS [PLAN4] add_light four types :: POINT/SUN/SPOT/AREA with energy, colour, radius
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 1869, in add_light
+    light_data = bpy.data.lights.new(name=name, type=light_type)
+TypeError: BlendDataLights.new(): error with keyword argument "type" -  enum "LASER" not found in ('POINT', 'SUN', 'SPOT', 'AREA')
+Executing handler for add_light
+Error in handler: BlendDataLights.new(): error with keyword argument "type" -  enum "LASER" not found in ('POINT', 'SUN', 'SPOT', 'AREA')
+STEP 77 PASS [PLAN4] add_light bad type -> error :: BlendDataLights.new(): error with keyword argument "type" -  enum "LASER" not found in ('POINT', 'SUN', 'SPOT', 'AREA')
+Executing handler for set_world_background
+Handler execution complete
+Executing handler for set_world_background
+Handler execution complete
+Executing handler for set_world_background
+Handler execution complete
+STEP 78 PASS [PLAN4] set_world_background colour + hdri :: solid colour node wired; missing HDRI rejected; EXR env wired
+Executing handler for add_3point_lighting
+Handler execution complete
+STEP 79 PASS [PLAN4] add_3point_lighting :: 3 lights with energies 10/20/30
+Executing handler for export_object
+INFO Draco is available, use library at D:\blender-5.2.1-windows-x64\5.2\scripts\addons_core\io_scene_gltf2\bf_intern_draco_bridge.dll
+INFO MeshOptimizer is available, use library at D:\blender-5.2.1-windows-x64\5.2\scripts\addons_core\io_scene_gltf2\bf_intern_meshopt_bridge.dll
+14:44:35 | INFO: Starting glTF 2.0 export
+14:44:35 | INFO: Extracting primitive: RT
+14:44:35 | INFO: Primitives created: 1
+14:44:35 | INFO: Finished glTF 2.0 export in 0.0029087066650390625 s
+
+Handler execution complete
+Executing handler for import_file
+14:44:35 | INFO: Data are loaded, start creating Blender stuff
+14:44:35 | INFO: Blender create Mesh node RT
+14:44:35 | INFO: glTF import finished in 0.00s
+Handler execution complete
+Executing handler for export_object
+14:44:35 | INFO: Starting glTF 2.0 export
+14:44:35 | INFO: Extracting primitive: RT
+14:44:35 | INFO: Primitives created: 1
+14:44:35 | INFO: Finished glTF 2.0 export in 0.0033109188079833984 s
+
+Handler execution complete
+Executing handler for import_file
+14:44:35 | INFO: Data are loaded, start creating Blender stuff
+14:44:35 | INFO: Blender create Mesh node RT
+14:44:35 | INFO: glTF import finished in 0.00s
+Handler execution complete
+Executing handler for export_object
+
+FBX export starting... 'C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_2pg0us3i\\rt_fbx.fbx'
+export finished in 0.0037 sec.
+Handler execution complete
+Executing handler for import_file
+FBX version: 7400
+Handler execution complete
+Executing handler for export_object
+Info: File exported successfully
+Handler execution complete
+Executing handler for import_file
+Handler execution complete
+Executing handler for export_object
+Info: File exported successfully
+Handler execution complete
+Executing handler for import_file
+Handler execution complete
+Executing handler for export_object
+Info: File exported successfully
+Handler execution complete
+Executing handler for import_file
+Handler execution complete
+STEP 80 PASS [PLAN4] export_object/import_file 6 formats round trip :: round trip ok, imported dims 2.0: glb:1392B gltf:1063B fbx:11292B obj:600B stl:684B ply:413B
+Executing handler for export_object
+Handler execution complete
+STEP 81 PASS [PLAN4] export_object bad format -> error :: Unsupported format: dae. Choose from: ['glb', 'gltf', 'fbx', 'obj', 'stl', 'ply']
+Executing handler for export_object
+Handler execution complete
+STEP 82 PASS [PLAN4] export_object missing object -> error :: Object not found: Nope
+Executing handler for import_file
+Handler execution complete
+STEP 83 PASS [PLAN4] import_file missing -> error :: File not found: C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\nope.glb
+Executing handler for import_file
+Handler execution complete
+STEP 84 PASS [PLAN4] import_file .txt -> error :: Unsupported file extension: .txt. Choose from: ['.glb', '.gltf', '.fbx', '.obj', '.stl', '.ply', '.blend']
+Executing handler for import_file
+Handler execution complete
+STEP 85 PASS [PLAN4] import_file .blend append :: appended RT.001 from lib.blend
+Executing handler for save_blend
+Info: Saved as "saved.blend"
+Handler execution complete
+STEP 86 PASS [PLAN4] save_blend adds .blend :: saved to saved.blend (98591 bytes)
+Executing handler for load_blend
+Handler execution complete
+STEP 87 PASS [PLAN4] load_blend missing -> error :: File not found: C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\nope.blend
+Executing handler for load_blend
+Handler execution complete
+STEP 88 PASS [PLAN4] load_blend non-blend -> error :: load_blend only accepts .blend files. Use import_file for 3D model formats.
+00:02.360  blend            | Read blend: "C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\saved.blend"
+Executing handler for load_blend
+Handler execution complete
+Executing handler for get_polyhaven_status
+Handler execution complete
+STEP 89 PASS [PLAN4] load_blend restores saved state :: reloaded: 14 objects, Extra gone, props alive
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+Executing handler for add_primitive
+Handler execution complete
+STEP 90 PASS [PLAN4] add_primitive 9 types :: cube:8v plane:4v circle:32v sphere:482v ico_sphere:42v cylinder:64v cone:33v torus:576v monkey:507v
+Executing handler for add_primitive
+Handler execution complete
+STEP 91 PASS [PLAN4] add_primitive unknown -> error :: Unknown primitive 'dodecahedron'. Choose from: ['cube', 'plane', 'circle', 'sphere', 'ico_sphere', 'cylinder', 'cone', 'torus', 'monkey']
+Executing handler for delete_object
+Info: Deleted 1 data-block(s)
+Info: No orphaned data-blocks to purge
+Info: No orphaned data-blocks to purge
+Handler execution complete
+STEP 92 PASS [PLAN4] delete_object purges :: object and orphan mesh gone
+Executing handler for delete_object
+Handler execution complete
+STEP 93 PASS [PLAN4] delete_object missing -> error :: Object not found: Nope
+Executing handler for duplicate_object
+Handler execution complete
+Executing handler for duplicate_object
+Handler execution complete
+STEP 94 PASS [PLAN4] duplicate_object full + linked :: full copy at +2 with own mesh; linked copy shares mesh
+Executing handler for join_objects
+Handler execution complete
+STEP 95 PASS [PLAN4] join_objects :: 16 verts in Joined
+Executing handler for join_objects
+Handler execution complete
+STEP 96 PASS [PLAN4] join_objects missing -> error :: Object not found: Nope
+Executing handler for separate_mesh
+Handler execution complete
+Executing handler for separate_mesh
+Handler execution complete
+STEP 97 PASS [PLAN4] separate_mesh LOOSE :: LOOSE split into 2 x 8 verts
+Executing handler for rename_object
+Handler execution complete
+Executing handler for rename_object
+Handler execution complete
+STEP 98 PASS [PLAN4] rename_object dotted + clash :: dotted name kept; clash reported as actual name Ground.002
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 2247, in set_origin
+    bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: Converting py args to operator properties: enum "ORIGIN_NOPE" not found in ('GEOMETRY_ORIGIN', 'ORIGIN_GEOMETRY', 'ORIGIN_CURSOR', 'ORIGIN_CENTER_OF_MASS', 'ORIGIN_CENTER_OF_VOLUME')
+Executing handler for set_origin
+Handler execution complete
+Executing handler for set_origin
+Error in handler: Converting py args to operator properties: enum "ORIGIN_NOPE" not found in ('GEOMETRY_ORIGIN', 'ORIGIN_GEOMETRY', 'ORIGIN_CURSOR', 'ORIGIN_CENTER_OF_MASS', 'ORIGIN_CENTER_OF_VOLUME')
+STEP 99 PASS [PLAN4] set_origin :: origin moved to geometry centre (5,0,0); bad type rejected
+Executing handler for snap_to_ground
+Handler execution complete
+STEP 100 PASS [PLAN4] snap_to_ground :: lowest bbox point at z=0.5
+Executing handler for set_smooth_shading
+Handler execution complete
+Executing handler for set_smooth_shading
+Handler execution complete
+STEP 101 PASS [PLAN4] set_smooth_shading :: smooth via smooth_by_angle, then flat
+Executing handler for parent_object
+Handler execution complete
+Executing handler for parent_object
+Handler execution complete
+STEP 102 PASS [PLAN4] parent_object keep transform :: parented, world matrix kept
+Executing handler for select_objects
+Handler execution complete
+Executing handler for select_objects
+Handler execution complete
+Executing handler for select_objects
+Handler execution complete
+Executing handler for select_objects
+Handler execution complete
+Executing handler for select_objects
+Handler execution complete
+STEP 103 PASS [PLAN4] select_objects :: deselect/select/toggle/by-type
+Executing handler for align_objects
+Handler execution complete
+Executing handler for align_objects
+Handler execution complete
+Executing handler for align_objects
+Handler execution complete
+STEP 104 PASS [PLAN4] align_objects :: AVERAGE=4, MAX=9, bad mode rejected
+Executing handler for move_object
+Handler execution complete
+M8 move_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for scale_object
+Handler execution complete
+M8 scale_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for rotate_object
+Handler execution complete
+M8 rotate_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_object_material_color
+Handler execution complete
+M8 set_object_material_color ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_vertex_position
+Handler execution complete
+M8 set_vertex_position ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_vertex_positions
+Handler execution complete
+M8 set_vertex_positions ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for mark_sharp_edges
+Handler execution complete
+M8 mark_sharp_edges ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_edge_crease
+Handler execution complete
+M8 set_edge_crease ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_edge_bevel_weight
+Handler execution complete
+M8 set_edge_bevel_weight ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_face_material_index
+Handler execution complete
+M8 set_face_material_index ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for extrude_faces
+Handler execution complete
+M8 extrude_faces ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for inset_faces
+Handler execution complete
+M8 inset_faces ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for flip_normals
+Handler execution complete
+M8 flip_normals ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for merge_vertices
+Handler execution complete
+M8 merge_vertices ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for triangulate_mesh
+Handler execution complete
+M8 triangulate_mesh ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for subdivide_mesh
+Handler execution complete
+M8 subdivide_mesh ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for add_modifier
+Handler execution complete
+M8 add_modifier ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for apply_modifier
+Handler execution complete
+M8 apply_modifier ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for create_camera
+Handler execution complete
+M8 create_camera ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_active_camera
+Handler execution complete
+M8 set_active_camera ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_render_settings
+Handler execution complete
+M8 set_render_settings ok active=M8Anchor expected=M8Anchor mode=OBJECT
+00:02.594  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\m8r.png'
+Executing handler for render_from_camera
+Handler execution complete
+M8 render_from_camera ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for add_light
+Handler execution complete
+M8 add_light ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_world_background
+Handler execution complete
+M8 set_world_background ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for add_3point_lighting
+Handler execution complete
+M8 add_3point_lighting ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for export_object
+Info: File exported successfully
+Handler execution complete
+M8 export_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for import_file
+Handler execution complete
+M8 import_file ok active=M8Victim.001 expected=result 'M8Victim.001' mode=OBJECT
+Executing handler for add_primitive
+Handler execution complete
+M8 add_primitive ok active=M8Prim expected=result 'M8Prim' mode=OBJECT
+Executing handler for duplicate_object
+Handler execution complete
+M8 duplicate_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for join_objects
+Handler execution complete
+M8 join_objects ok active=M8Dup expected=result 'M8Dup' mode=OBJECT
+Executing handler for separate_mesh
+Handler execution complete
+M8 separate_mesh ok active=M8Dup expected=source 'M8Dup' mode=OBJECT
+Executing handler for rename_object
+Handler execution complete
+M8 rename_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_origin
+Handler execution complete
+M8 set_origin ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for snap_to_ground
+Handler execution complete
+M8 snap_to_ground ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_smooth_shading
+Handler execution complete
+M8 set_smooth_shading ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for parent_object
+Handler execution complete
+M8 parent_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for select_objects
+Handler execution complete
+M8 select_objects ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for align_objects
+Handler execution complete
+M8 align_objects ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for create_material
+Handler execution complete
+M8 create_material ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for assign_material
+Handler execution complete
+M8 assign_material ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for load_texture
+Handler execution complete
+M8 load_texture ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for add_keyframe
+Handler execution complete
+M8 add_keyframe ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for set_frame
+Handler execution complete
+M8 set_frame ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for create_collection
+Handler execution complete
+M8 create_collection ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for move_to_collection
+Handler execution complete
+M8 move_to_collection ok active=M8Anchor expected=M8Anchor mode=OBJECT
+Executing handler for delete_object
+Info: Deleted 5 data-block(s)
+Info: No orphaned data-blocks to purge
+Info: No orphaned data-blocks to purge
+Handler execution complete
+M8 delete_object ok active=M8Anchor expected=M8Anchor mode=OBJECT
+00:02.719  render           | Saved: 'C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\m8d.png'
+Executing handler for render_depth_map
+Handler execution complete
+M8 render_depth_map ok active=M8Anchor expected=M8Anchor mode=OBJECT
+STEP 105 PASS [M8] M8 active object + mode kept after every mutating handler :: 47 handlers: active restored (or = result object for the 4 creators) and OBJECT mode
+Executing handler for create_material
+Handler execution complete
+STEP 106 PASS [PLAN4] create_material full PBR :: PBR inputs set, BLENDED alpha, assigned to P_cube
+Executing handler for assign_material
+Handler execution complete
+Executing handler for assign_material
+Handler execution complete
+STEP 107 PASS [PLAN4] assign_material slot padding :: slot 2 padded with 2 empty slots
+Executing handler for set_object_material_color
+Handler execution complete
+STEP 108 PASS [PLAN4] set_object_material_color creates material :: material created and coloured
+Executing handler for create_material
+Handler execution complete
+Executing handler for load_texture
+Handler execution complete
+Executing handler for load_texture
+Handler execution complete
+Executing handler for load_texture
+Handler execution complete
+Executing handler for load_texture
+Handler execution complete
+STEP 109 PASS [PLAN4] load_texture base + normal :: Base Color linked, Normal via NormalMap Non-Color, bad slot/path rejected
+Executing handler for set_texture
+Loaded texture map: arm - harntex_arm.png
+Image size: 8x8
+Color space: Non-Color
+File format: PNG
+Is packed: True
+Loaded texture map: color - harntex_color.png
+Image size: 8x8
+Color space: sRGB
+File format: PNG
+Is packed: True
+Connected color to Base Color
+Connected ARM.G to Roughness
+Connected ARM.B to Metallic
+Connected ARM.R to AO mix with Base Color
+Handler execution complete
+STEP 110 PASS [F7] F7 runtime: set_texture ARM branch builds a 3-output separate node :: separate node ShaderNodeSeparateColor (SEPARATE_COLOR) with 3 outputs; G->Roughness, B->Metallic, Base Color via ShaderNodeMixRGB
+Executing handler for add_modifier
+Handler execution complete
+Executing handler for add_modifier
+Handler execution complete
+Executing handler for add_modifier
+Handler execution complete
+Executing handler for add_modifier
+Handler execution complete
+STEP 111 PASS [PLAN4] add_modifier props/unset/pointer :: bevel props set + unset reported; boolean object by name; bad type lists enum
+Executing handler for boolean_operation
+Handler execution complete
+STEP 112 PASS [M5] boolean_operation EXACT apply :: EXACT -> reply solver=EXACT (enum FLOAT/EXACT/MANIFOLD), notch wall verts=4 total verts=16
+Executing handler for boolean_operation
+Handler execution complete
+STEP 113 PASS [M5] boolean_operation FAST accepted, reply names live solver :: FAST -> reply solver=FLOAT (enum FLOAT/EXACT/MANIFOLD), notch wall verts=4 total verts=16
+Executing handler for boolean_operation
+Handler execution complete
+STEP 114 PASS [M5] boolean_operation FLOAT accepted, reply names live solver :: FLOAT -> reply solver=FLOAT (enum FLOAT/EXACT/MANIFOLD), notch wall verts=4 total verts=16
+Executing handler for boolean_operation
+Handler execution complete
+STEP 115 PASS [M13] boolean_operation lowercase 'fast' accepted :: fast -> reply solver=FLOAT (enum FLOAT/EXACT/MANIFOLD), notch wall verts=4 total verts=16
+Executing handler for boolean_operation
+Handler execution complete
+STEP 116 PASS [M5] boolean_operation MANIFOLD per ruling :: MANIFOLD passed through on this build, verts=16
+Executing handler for boolean_operation
+Handler execution complete
+STEP 117 PASS [M5] boolean_operation bogus solver -> error listing enum :: error lists live enum, no modifier left, cutter kept: solver 'BOGUS' not valid; valid: ['FLOAT', 'EXACT', 'MANIFOLD'] (FAST and FLOAT are accepted as alia
+Executing handler for boolean_operation
+Handler execution complete
+STEP 118 PASS [BREAK3] boolean_operation apply=False :: modifier kept with solver=FLOAT (== reply), cutter kept
+Executing handler for boolean_operation
+Handler execution complete
+STEP 119 PASS [PLAN4] boolean_operation missing target -> error :: Target not found: Nope
+Executing handler for add_keyframe
+Handler execution complete
+Executing handler for add_keyframe
+Handler execution complete
+Executing handler for add_keyframe
+Handler execution complete
+Executing handler for add_keyframe
+Handler execution complete
+STEP 120 PASS [PLAN4] add_keyframe vector/scalar/dotted :: location interpolates to (2,2,2) at 15; rotation degrees; data.energy keyed on light data
+Executing handler for add_keyframe
+Handler execution complete
+STEP 121 PASS [PLAN4] add_keyframe wrong arity -> error :: location expects 3 values, got a single number
+Executing handler for add_keyframe
+Handler execution complete
+STEP 122 PASS [PLAN4] add_keyframe bad path -> error :: Cannot resolve 'no.such.path' on Anim: Object.path_resolve("no.such") could not be resolved
+Executing handler for add_keyframe
+Handler execution complete
+STEP 123 PASS [PLAN4] add_keyframe missing object -> error :: Object not found: Nope
+Executing handler for set_frame
+Handler execution complete
+STEP 124 PASS [PLAN4] set_frame :: frame 33
+Executing handler for create_collection
+Handler execution complete
+Executing handler for create_collection
+Handler execution complete
+Executing handler for create_collection
+Handler execution complete
+Executing handler for move_to_collection
+Handler execution complete
+Executing handler for move_to_collection
+Handler execution complete
+Executing handler for move_to_collection
+Handler execution complete
+Executing handler for move_to_collection
+Handler execution complete
+STEP 125 PASS [PLAN4] create_collection + move_to_collection :: nested collections; objects moved exclusively; string name accepted
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 557, in execute_code
+    exec(code, namespace)
+    ~~~~^^^^^^^^^^^^^^^^^
+  File "<string>", line 1, in <module>
+ZeroDivisionError: division by zero
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 562, in execute_code
+    raise Exception(f"Code execution error: {str(e)}")
+Exception: Code execution error: division by zero
+Executing handler for execute_code
+Handler execution complete
+Executing handler for execute_code
+Error in handler: Code execution error: division by zero
+STEP 126 PASS [PLAN4] execute_code :: stdout captured; exception surfaced
+Executing handler for store_reference_image
+Handler execution complete
+Executing handler for store_reference_image
+Handler execution complete
+Executing handler for get_reference_image
+Handler execution complete
+Executing handler for get_reference_image
+Handler execution complete
+STEP 127 PASS [PLAN4] store/get_reference_image :: store/get round trip, misses rejected
+Executing handler for get_hyper3d_status
+Handler execution complete
+Executing handler for get_sketchfab_status
+Handler execution complete
+Executing handler for get_hunyuan3d_status
+Handler execution complete
+Executing handler for get_hyper3d_status
+Handler execution complete
+Executing handler for get_hyper3d_status
+Handler execution complete
+Executing handler for get_hunyuan3d_status
+Handler execution complete
+Executing handler for get_hunyuan3d_status
+Handler execution complete
+Executing handler for get_polyhaven_status
+Handler execution complete
+Executing handler for get_polyhaven_categories
+Handler execution complete
+STEP 128 PASS [PLAN4] integration status handlers :: status handlers follow toggles/keys; polyhaven bad asset_type rejected without network
+Executing handler for get_viewport_screenshot
+Handler execution complete
+STEP 129 PASS [LIVE] get_viewport_screenshot headless graceful :: graceful headless error: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect
+Executing handler for get_viewport_screenshot
+Handler execution complete
+STEP 130 PASS [LIVE] get_viewport_screenshot no filepath -> error :: No filepath provided
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 813, in capture_viewport_angle
+    bpy.ops.screen.screenshot_area(filepath=filepath)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+RuntimeError: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect
+Traceback (most recent call last):
+  File "D:\App Dev\blender_mcp\addon.py", line 385, in _execute_command_internal
+    result = handler(**params)
+  File "D:\App Dev\blender_mcp\addon.py", line 848, in capture_contact_sheet
+    r = self.capture_viewport_angle(angle=angle, max_size=max_size, filepath=fp)
+  File "D:\App Dev\blender_mcp\addon.py", line 813, in capture_viewport_angle
+    bpy.ops.screen.screenshot_area(filepath=filepath)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+RuntimeError: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect
+Executing handler for capture_viewport_angle
+Error in handler: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect
+Executing handler for capture_viewport_angle
+Handler execution complete
+Executing handler for capture_contact_sheet
+Error in handler: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect
+STEP 131 PASS [LIVE] capture_viewport_angle/contact_sheet headless graceful :: front: Operator bpy.ops.screen.screenshot_area.poll() fai | bad angle: Unknown angle: sideways. Choose from: ['front', 'b | sheet: Operator bpy.ops.screen.screenshot_area.poll() fai
+Executing handler for quit_blender
+Handler execution complete
+STEP 132 PASS [PLAN4] quit_blender defers via timer :: quit deferred via timer (intercepted), prefs toggled and restored
+STEP 133 PASS [PLAN4] final invariants :: 1 scene, OBJECT mode, no mcp node groups
+STEP 134 PASS [M2] M2 every addon handler exercised :: all 85 handlers exercised through execute_command
+SKIP start_blender :: process management; nobody launches Blender from the harness
+SKIP close_blender :: process management; nobody launches Blender from the harness
+SKIP get_blender_status :: process management; unit-tested in tests/test_server_units.py with the port probe mocked
+SKIP compare_reference_image :: PIL-only server tool; unit-tested in tests/test_server_units.py with generated PNGs
+SKIP diff_images :: PIL-only server tool; unit-tested in tests/test_server_units.py with generated PNGs
+SKIP load_img_to_3d_model :: TripoSR subprocess; out of scope for the migration
+SKIP unload_img_to_3d_model :: TripoSR subprocess; out of scope for the migration
+SKIP generate_3d_from_image :: TripoSR subprocess; out of scope for the migration
+LIVE get_viewport_screenshot :: LIVE PASS REQUIRED, user runs in a 5.2.1 GUI session; headless proves graceful error only
+LIVE capture_viewport_angle :: LIVE PASS REQUIRED, user runs in a 5.2.1 GUI session; headless proves graceful error only
+LIVE capture_contact_sheet :: LIVE PASS REQUIRED, user runs in a 5.2.1 GUI session; headless proves graceful error only
+SUMMARY {"blender": "5.2.1", "addon": "D:\\App Dev\\blender_mcp\\addon.py", "addon_sha256": "6f208e0706746daf80460db60b5dd705e86f7581192c9ac0684790a90381b456", "addon_git_hash_object": "e0329ced83ca1b74e12d0c5b2caaab65c872b94e", "bl_info_version": [2, 0, 0], "handlers": 85, "steps": 134, "passed": 134, "failed": 0, "failed_steps": [], "live_pass_required": ["get_viewport_screenshot", "capture_viewport_angle", "capture_contact_sheet"], "network_not_run": ["create_hunyuan_job", "create_rodin_job", "download_polyhaven_asset", "download_sketchfab_model", "get_polyhaven_categories", "get_sketchfab_model_preview", "import_generated_asset", "import_generated_asset_hunyuan", "poll_hunyuan_job_status", "poll_rodin_job_status", "search_polyhaven_assets", "search_sketchfab_models", "set_texture"], "workdir": "C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_2pg0us3i"}
+HARNESS report written to tests/report_5.2.1.json
+Blender 5.2.1 LTS (hash 9e2066aef7ef built 2026-08-25 02:38:20)
+Writing to C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\rt_obj.obj
+OBJ export of 'rt_obj.obj' took 1.23 ms
+OBJ import of 'rt_obj.obj' took 0.60 ms
+Timer 'STL Export' took 1.65 ms
+Timer 'STL Import' took 0.20 ms
+PLY export of 'rt_ply.ply' took 1.35 ms
+PLY import of 'rt_ply.ply' took 0.19 ms
+Writing to C:\Users\Naabin\AppData\Local\Temp\mcp_harness_2pg0us3i\m8.obj
+OBJ export of 'm8.obj' took 1.90 ms
+OBJ import of 'm8.obj' took 6.68 ms
+
+Blender quit

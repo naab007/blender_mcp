@@ -1,176 +1,95 @@
-# Blender MCP - Terms of Use and Privacy Policy
+# Blender MCP (extended fork) - Terms of Use
 
-**Last Updated: January 2025**
+**Last Updated: September 2026**
 
 ---
 
 ## 1. About This Project
 
-Blender MCP is a free, open-source project maintained by Siddharth Ahuja ("I," "me," "my"). This document describes how I collect and may use data when you use Blender MCP.
+This is an independent, open-source fork of Blender MCP, maintained at
+https://github.com/naab007/blender_mcp. It connects Blender to AI assistants through the
+Model Context Protocol.
 
-By using Blender MCP, you agree to these terms. If you do not agree, please do not use the software.
-
----
-
-## 2. Data I Collect
-
-When you use Blender MCP, I may collect:
-
-- **Prompts and text inputs** you provide to the AI
-- **Generated code** produced in response to your prompts
-- **Scene metadata** such as object names, modifier settings, and configurations
-- **Basic usage data** including timestamps and feature usage
-
-I do **not** collect:
-
-- Screenshots or images of your viewport
-- Your Blender files or 3D models
-- Personal files unrelated to your Blender session
-- Passwords or financial information
-- Data from other applications on your system
+By using this software you agree to these terms. If you do not agree, do not use it.
 
 ---
 
-## 3. How I May Use Your Data
+## 2. No Data Collection
 
-I am currently collecting data for potential future use. This data may be used to:
+This fork collects nothing.
 
-- **Train AI models** for 3D creation and Blender automation
-- **Improve Blender MCP** based on real-world usage
-- **Conduct research** on AI-assisted creative workflows
-- **Share datasets** with the research community (in anonymized or aggregated form)
+- There is no telemetry, analytics, usage reporting or crash reporting.
+- No prompts, generated code, scene data, screenshots, files or metadata are sent to the
+  maintainer or to any third party by this software.
+- All communication happens between the MCP server and the Blender add-on on your own
+  machine, over a loopback socket, unless you configure it otherwise.
 
-Your data may be:
-
-- Stored indefinitely
-- Used to train machine learning models in the future
-- Released as part of an open dataset (anonymized)
-
----
-
-## 4. Data Sharing
-
-I may share collected data with:
-
-- **The open-source/research community** as part of public datasets
-- **Collaborators** working on AI or Blender-related research
-- **Legal authorities** if required by law
-
-I do not sell your data.
+The only network traffic this software initiates on its own is the optional download of
+third-party dependencies you explicitly request (for example model weights for the
+image-to-3D feature).
 
 ---
 
-## 5. Your Rights
+## 3. Third-Party Integrations
 
-You may:
+Some optional features talk to external services when, and only when, you enable them in
+the add-on panel and supply your own credentials: PolyHaven, Sketchfab, Hyper3D (Rodin)
+and Hunyuan3D. When you use one of these, data you send (search terms, prompts, images,
+API keys) goes directly from your machine to that service under that service's own terms
+and privacy policy. This project has no access to it and no agreement with those services.
 
-- **Request access** to the data I've collected from your usage
-- **Request deletion** of your data
-- **Opt out of telemetry** by unchecking the telemetry option in the Blender MCP addon preferences. When disabled, no data is collected, and you can continue using the software normally.
-
-To exercise these rights, contact me at ahujasid@gmail.com.
-
-**Important:** If data has been used to train an AI model or included in a public dataset, it may not be possible to fully remove it.
-
----
-
-## 6. Data Retention
-
-- Data may be retained indefinitely
-- I will make reasonable efforts to honor deletion requests for unprocessed data
-- Anonymized or aggregated data may be retained and shared permanently
+The AI assistant you connect to this software (for example a Claude client) is likewise
+governed by its provider's terms. This project does not see or store that traffic.
 
 ---
 
-## 7. Security
+## 4. Ownership
 
-I take reasonable steps to protect collected data, but this is a solo open-source project, not a company with enterprise security infrastructure. I cannot guarantee absolute security.
+You own everything.
 
----
+- You retain all rights to your prompts, your Blender files, your models, textures,
+  renders, animations and any other content you create or process with this software.
+- You retain all rights to any code, scripts or data generated in response to your
+  prompts while using this software.
+- You grant the maintainer no license of any kind to any of the above. Nothing you do
+  with this software transfers, assigns or licenses any right to anyone.
 
-## 8. Children
-
-Blender MCP is not intended for users under 16. I do not knowingly collect data from children.
-
----
-
-## 9. International Users
-
-Your data may be stored and processed in any country. By using Blender MCP, you consent to international data transfers.
+The source code of this software is licensed separately under the MIT License in the
+`LICENSE` file. That license covers the software only, never your content.
 
 ---
 
-## 10. Intellectual Property
+## 5. No Warranty
 
-### Your Content
+THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
 
-You retain ownership of your original creative work. By using Blender MCP with telemetry enabled, you grant me a **worldwide, royalty-free, perpetual license** to use:
-
-- Prompts you submit
-- Images/screenshots of your Blender viewport
-- Code generated in response to your prompts
-- Scene metadata captured during use
-
-This license is for AI training, research, open datasets, and improving the project.
-
-**Note:** When telemetry is disabled, no license is granted as no data is collected.
-
-### AI-Generated Content
-
-You may use AI-generated code however you like, but it's provided "as is" with no guarantees.
-
-### Blender MCP
-
-The Blender MCP source code is open source under its stated license. These terms apply only to data collection.
+There is no guarantee that the software will work correctly, that AI-generated code will
+be safe or functional, or that any operation it performs on your files is reversible.
+Review generated code before running it and keep backups of your work.
 
 ---
 
-## 11. No Warranty
+## 6. Limitation of Liability
 
-BLENDER MCP IS PROVIDED "AS IS" WITHOUT ANY WARRANTIES.
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE MAINTAINER IS NOT LIABLE FOR ANY DAMAGES
+ARISING FROM YOUR USE OF THIS SOFTWARE, INCLUDING LOSS OF DATA OR WORK.
 
-I do not guarantee that:
-
-- The software will work correctly
-- AI-generated code will be safe or functional
-- Your data will be secure
-
-**You are responsible for reviewing any AI-generated code before using it.**
+This is a free, open-source project maintained in spare time. Use at your own risk.
 
 ---
 
-## 12. Limitation of Liability
+## 7. Changes
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, I AM NOT LIABLE FOR ANY DAMAGES ARISING FROM YOUR USE OF BLENDER MCP.
-
-This is a free, open-source project maintained in my spare time. Use at your own risk.
-
----
-
-## 13. Changes
-
-I may update these terms at any time. Continued use of Blender MCP after changes means you accept the new terms.
+These terms may be updated. Changes are published in the repository. Continued use after a
+change means you accept the updated terms.
 
 ---
 
-## 14. Contact
+## 8. Contact
 
-Questions or requests? Email me at ahujasid@gmail.com.
-
----
-
-## 15. Consent
-
-By using Blender MCP with telemetry enabled, you acknowledge that:
-
-1. You have read and understood these terms
-2. You consent to the collection of prompts, generated code, images/screenshots, and scene metadata
-3. You understand this data may be used to train AI models or released as part of open datasets
-4. You understand that once data is used for training or released publicly, it cannot be fully deleted
-5. You are at least 16 years old
-6. You can disable telemetry at any time in the addon preferences
+Questions or issues: open an issue at https://github.com/naab007/blender_mcp.
 
 ---
 
-*Blender MCP is an independent project and is not affiliated with the Blender Foundation.*
-
+*This project is an independent fork and is not affiliated with the Blender Foundation or
+with the upstream Blender MCP author.*

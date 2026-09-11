@@ -1,0 +1,51 @@
+{
+  "_comment": "Shipped blender-mcp presets. Values are applied through set_settings per scope on the running Blender; keys must exist on Blender 4.3 and 5.2 (no use_gtao, no use_hdr_view). A user preset of the same name in <settings dir>/presets shadows the shipped one.",
+  "presets": {
+    "game_bake": {
+      "description": "Texture baking for game engines: Cycles, 32 samples, no denoise, Standard view transform, 16-bit RGBA PNG",
+      "scopes": {
+        "RENDER": {"engine": "CYCLES", "film_transparent": false},
+        "CYCLES": {"samples": 32, "use_denoising": false},
+        "COLOR": {"view_transform": "Standard", "look": "None", "exposure": 0.0, "gamma": 1.0},
+        "OUTPUT": {"file_format": "PNG", "color_mode": "RGBA", "color_depth": "16", "compression": 15}
+      }
+    },
+    "preview": {
+      "description": "Fast look-development renders: 25% resolution, 16 samples, denoise on, simplify on",
+      "scopes": {
+        "RENDER": {"resolution_percentage": 25, "use_simplify": true, "simplify_subdivision": 1},
+        "CYCLES": {"samples": 16, "use_denoising": true},
+        "EEVEE": {"taa_render_samples": 16}
+      }
+    },
+    "final_eevee": {
+      "description": "Final EEVEE render: 100% resolution, 64 samples",
+      "scopes": {
+        "RENDER": {"engine": "BLENDER_EEVEE", "resolution_percentage": 100, "use_simplify": false},
+        "EEVEE": {"taa_render_samples": 64}
+      }
+    },
+    "final_cycles": {
+      "description": "Final Cycles render: 100% resolution, 256 samples, denoise on, persistent data on",
+      "scopes": {
+        "RENDER": {"engine": "CYCLES", "resolution_percentage": 100, "use_persistent_data": true, "use_simplify": false},
+        "CYCLES": {"samples": 256, "use_denoising": true}
+      }
+    },
+    "sprite_sheet": {
+      "description": "2D sprites from 3D: transparent background, Standard view transform, 8-bit RGBA PNG",
+      "scopes": {
+        "RENDER": {"film_transparent": true},
+        "COLOR": {"view_transform": "Standard", "look": "None"},
+        "OUTPUT": {"file_format": "PNG", "color_mode": "RGBA", "color_depth": "8"}
+      }
+    },
+    "turntable_video": {
+      "description": "Turntable video: FFMPEG H.264 MP4 at 24 fps",
+      "scopes": {
+        "RENDER": {"fps": 24, "fps_base": 1.0},
+        "OUTPUT": {"file_format": "FFMPEG", "color_mode": "RGB", "ffmpeg": {"format": "MPEG4", "codec": "H264", "constant_rate_factor": "MEDIUM"}}
+      }
+    }
+  }
+}

@@ -1,4 +1,8 @@
-# blender_mcp_server.py
+"""BlenderMCP server: the FastMCP tools that drive Blender through the add-on socket.
+
+Lives at src/blender_mcp/server.py and runs through the ``blender-mcp`` entry point.
+Server-side configuration comes from settings.py (settings.json + environment).
+"""
 from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
@@ -11,6 +15,7 @@ from typing import AsyncIterator, Dict, Any, List
 import os
 import sys
 import glob as _glob
+import re as _re
 import shutil as _shutil
 import subprocess as _subprocess
 import time as _time
@@ -18,7 +23,13 @@ from pathlib import Path
 import base64
 from urllib.parse import urlparse
 import io
+import inspect
+import functools
+import threading
 import requests as _requests
+
+from . import __version__, PROTOCOL
+from . import settings as _settings
 
 # Optional PIL — used for image safety guards and compositing
 try:
@@ -29,12 +40,12 @@ except ImportError:
     ImageDraw = None  # type: ignore
     _PIL_AVAILABLE = False
 
-_SAFE_IMAGE_MAX_PIXELS = 8_000_000   # ~2828×2828 at 1:1 aspect
+_SAFE_IMAGE_MAX_PIXELS = _settings.DEFAULTS["image_max_pixels"]   # default; live value via _settings.get
 _SAFE_IMAGE_MAX_DIM = 8000            # API per-dimension ceiling
 _SAFE_IMAGE_MAX_BYTES = 4 * 1024 * 1024  # stay under the ~5 MB per-image API limit
 
 # Configure logging early so _safe_image_return can use logger
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=getattr(logging, str(_settings.get("log_level", "INFO")).upper(), logging.INFO),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BlenderMCPServer")
 
@@ -81,8 +92,9 @@ def _safe_image_return(data: bytes, fmt: str = "png") -> Image:
             w, h = img.size
             total = w * h
             scale = 1.0
-            if total > _SAFE_IMAGE_MAX_PIXELS:
-                scale = (_SAFE_IMAGE_MAX_PIXELS / total) ** 0.5
+            max_pixels = int(_settings.get("image_max_pixels", _SAFE_IMAGE_MAX_PIXELS))
+            if total > max_pixels:
+                scale = (max_pixels / total) ** 0.5
             if max(w, h) * scale > _SAFE_IMAGE_MAX_DIM:
                 scale = _SAFE_IMAGE_MAX_DIM / max(w, h)
             needs_reencode = scale < 1.0 or detected not in ("png", "jpeg")
@@ -165,18 +177,44 @@ def _compose_grid(tiles, columns: int, tile_w: int, tile_h: int, labels=None, ga
     return sheet
 
 
-def _probe_port(host: str, port: int, timeout: float = 1.0) -> bool:
-    """True if something accepts a TCP connection on host:port."""
+def _probe_port(host: str, port: int, timeout: float = None) -> bool:
+    """True if something accepts a TCP connection on host:port.
+
+    Probes exactly the way BlenderConnection.connect connects (an AF_INET socket
+    to the same host string, with connect_timeout from the settings), so
+    get_blender_status and start_blender never disagree with the real connection
+    about reachability (a dual-stack "localhost" lookup used to differ).
+    """
+    if timeout is None:
+        timeout = float(_settings.get("connect_timeout", 5.0))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        return True
     except OSError:
         return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
-# Default configuration
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 9876
+# Connection defaults. Live values come from settings.py: the environment
+# (BLENDER_HOST / BLENDER_PORT) overrides <settings dir>/settings.json, which
+# overrides these. The add-on binds 127.0.0.1, so that is the default host.
+DEFAULT_HOST = _settings.DEFAULTS["host"]
+DEFAULT_PORT = _settings.DEFAULTS["port"]
+
+
+class BlenderCommandError(Exception):
+    """The add-on executed the command and answered status="error".
+
+    The socket is healthy, only the command failed, so the connection is kept.
+    Transport failures raise a plain Exception and drop the socket so the next
+    call reconnects.
+    """
 
 @dataclass
 class BlenderConnection:
@@ -191,6 +229,7 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(float(_settings.get("connect_timeout", 5.0)))
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
@@ -212,8 +251,9 @@ class BlenderConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        # command_timeout from the settings file (default 180 s): how long one reply
+        # may take. The add-on has no timeout of its own to match.
+        sock.settimeout(float(_settings.get("command_timeout", 180.0)))
         
         try:
             while True:
@@ -267,26 +307,44 @@ class BlenderConnection:
         else:
             raise Exception("No data received")
 
+    _send_lock = threading.RLock()   # one command on the wire at a time, whoever calls
+
+    def _send_request(self, payload: bytes) -> None:
+        """Connect if needed and send. A transport failure here means the request never
+        reached the add-on, so one reconnect-and-resend is safe (no double execution)."""
+        for attempt in (1, 2):
+            if not self.sock and not self.connect():
+                raise ConnectionError("Not connected to Blender")
+            try:
+                self.sock.sendall(payload)
+                return
+            except (ConnectionError, BrokenPipeError, ConnectionResetError, OSError) as e:
+                self.disconnect()
+                if attempt == 2:
+                    raise
+                logger.warning(f"send failed before the add-on received the command ({e}); reconnecting once")
+
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Blender and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Blender")
-        
+        with self._send_lock:
+            return self._send_command_locked(command_type, params)
+
+    def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         command = {
             "type": command_type,
             "params": params or {}
         }
-        
+
         try:
             # Log the command being sent
             logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
+
+            # Send the command (reconnects once if the send itself fails)
+            self._send_request(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
+            # Same command_timeout as receive_full_response (settings file, default 180 s)
+            self.sock.settimeout(float(_settings.get("command_timeout", 180.0)))
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -297,9 +355,12 @@ class BlenderConnection:
             
             if response.get("status") == "error":
                 logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Blender"))
+                raise BlenderCommandError(response.get("message", "Unknown error from Blender"))
             
             return response.get("result", {})
+        except BlenderCommandError:
+            # The add-on answered; the socket stays valid for the next command
+            raise
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Blender")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
@@ -356,17 +417,109 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
 # Create the MCP server with lifespan support
 mcp = FastMCP(
     "BlenderMCP",
-    lifespan=server_lifespan
+    lifespan=server_lifespan,
+    instructions=(
+        f"BlenderMCP server {__version__} (protocol {PROTOCOL}). If the Blender add-on "
+        "reports a different version you will be told once in a tool reply; call "
+        "get_version for details."
+    ),
 )
 
-# Resource endpoints
 
-# Global connection for resources (since resources can't access context)
+# ─── One-time notices ───────────────────────────────────────────────────────────
+# A notice is a line prefixed to the NEXT string tool reply, once. Queued by
+# _probe_addon_version() (add-on/server mismatch) and, later, the update check.
+# Popping the dict inside _attach_notice() is the once-only mechanism. No lock:
+# tool bodies run on the single FastMCP event loop and _attach_notice never
+# awaits, so the pop is atomic between coroutines; to_thread work never calls it.
+_pending_notices: Dict[str, str] = {}
+_addon_info: Dict[str, Any] | None = None   # last get_version reply, or a legacy/unreachable marker
+_mismatch_notified = False
+
+
+def _attach_notice(result):
+    if _pending_notices and isinstance(result, str):
+        text = "\n\n".join(_pending_notices[k] for k in ("update", "mismatch") if k in _pending_notices)
+        _pending_notices.clear()
+        return f"{text}\n---\n{result}"
+    return result
+
+
+_orig_tool = mcp.tool
+
+
+def _tool_with_notices(*a, **k):
+    """Drop-in for mcp.tool: same registration (functools.wraps keeps the signature
+    FastMCP reads for the schema and Context injection) plus the notice prefix on
+    str results. Must be installed before the first @mcp.tool() below."""
+    deco = _orig_tool(*a, **k)
+
+    def register(fn):
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def wrapper(*fa, **fk):
+                return _attach_notice(await fn(*fa, **fk))
+        else:
+            @functools.wraps(fn)
+            def wrapper(*fa, **fk):
+                return _attach_notice(fn(*fa, **fk))
+        return deco(wrapper)
+    return register
+
+
+mcp.tool = _tool_with_notices
+
+
+# Process-wide state shared by every tool
 _blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
+_polyhaven_enabled = False
 
 # Managed Blender process (started via start_blender tool)
 _blender_process = None
+
+def _mismatch_text(info) -> str | None:
+    """The mismatch notice for a get_version reply, or None when versions agree
+    or the add-on is unreachable."""
+    if not info or info.get("unreachable"):
+        return None
+    if info.get("legacy"):
+        addon_ver, addon_proto = "pre-2.1", "none"
+    else:
+        addon_ver, addon_proto = str(info.get("addon", "?")), info.get("protocol", "?")
+    if addon_ver == __version__ and addon_proto == PROTOCOL:
+        return None
+    return (f"[blender-mcp mismatch] Server {__version__} / protocol {PROTOCOL} but the Blender "
+            f"add-on reports {addon_ver} / protocol {addon_proto}. Wire formats differ; deploy "
+            f"addon.py and cycle the add-on before continuing.")
+
+
+def _probe_addon_version(conn) -> None:
+    """Ask the add-on for get_version (once per (re)connection, and from the
+    get_version tool) and queue the one-time mismatch notice when the versions or
+    protocol numbers differ. A pre-2.1 add-on answers 'Unknown command type'."""
+    global _addon_info, _mismatch_notified
+    try:
+        info = conn.send_command("get_version")
+        if not isinstance(info, dict):
+            raise BlenderCommandError(f"unexpected get_version reply: {info!r}")
+        _addon_info = dict(info)
+    except BlenderCommandError as e:
+        if "Unknown command type" in str(e):
+            _addon_info = {"legacy": True, "reason": "pre-2.1 add-on (no get_version handler)"}
+        else:
+            _addon_info = {"unreachable": True, "reason": str(e)}
+            return
+    except Exception as e:
+        _addon_info = {"unreachable": True, "reason": str(e)}
+        return
+    mismatch = _mismatch_text(_addon_info)
+    if mismatch:
+        if not _mismatch_notified:
+            _pending_notices["mismatch"] = mismatch
+            _mismatch_notified = True
+    else:
+        _mismatch_notified = False   # versions agree again: re-arm for a later regression
+
 
 def get_blender_connection():
     """Get or create a persistent Blender connection.
@@ -380,8 +533,7 @@ def get_blender_connection():
     if _blender_connection is not None and _blender_connection.sock is not None:
         return _blender_connection
 
-    host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-    port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    host, port = _blender_host_port()
     conn = BlenderConnection(host=host, port=port)
     if not conn.connect():
         _blender_connection = None
@@ -389,6 +541,7 @@ def get_blender_connection():
         raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
     _blender_connection = conn
     logger.info("Created new persistent connection to Blender")
+    _probe_addon_version(conn)
     try:
         _polyhaven_enabled = bool(conn.send_command("get_polyhaven_status").get("enabled", False))
     except Exception as e:
@@ -1211,36 +1364,98 @@ def import_generated_asset_hunyuan(
 
 
 
+_BLENDER_VER_RE = _re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+def _blender_version_key(path: str) -> tuple:
+    """(major, minor, patch) parsed from the folder holding a Blender exe.
+
+    'Blender 4.3' -> (4, 3, 0); 'blender-5.2.1-windows-x64' -> (5, 2, 1);
+    no version in the folder name -> (0, 0, 0). Numeric, so 'Blender 10.0'
+    outranks 'Blender 4.3' (a plain string sort gets that wrong).
+    """
+    folder = os.path.basename(os.path.dirname(path))
+    m = _BLENDER_VER_RE.search(folder)
+    if not m:
+        return (0, 0, 0)
+    return tuple(int(g or 0) for g in m.groups())
+
+
+def _fixed_drive_roots() -> list[str]:
+    """Roots of the fixed (non-removable, non-network) drives on Windows,
+    e.g. ['C:\\', 'D:\\']; empty on other platforms. Never raises."""
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+        roots = []
+        for i in range(26):
+            if mask & (1 << i):
+                root = f"{chr(65 + i)}:\\"
+                if kernel32.GetDriveTypeW(root) == 3:  # DRIVE_FIXED
+                    roots.append(root)
+        return roots
+    except Exception as e:
+        logger.debug(f"_fixed_drive_roots: falling back to a static list ({e})")
+        return [f"{c}:\\" for c in "CDEFGH" if os.path.isdir(f"{c}:\\")]
+
+
 def _find_blender_exe(hint: str = None) -> str | None:
-    """Locate the Blender executable, checking in priority order."""
-    # 1. Explicit hint or env var
-    for candidate in filter(None, [hint, os.environ.get("BLENDER_EXE")]):
+    """Locate the Blender executable. Resolution only: never spawns a process.
+
+    Order:
+      (a) explicit ``hint`` (the ``blender_exe`` tool argument), if it is a file
+      (b) the ``BLENDER_EXE`` environment variable, if it is a file
+      (c) ``blender_exe`` in the settings file (set_server_settings), if it is a file
+      (d) ``blender`` / ``blender.exe`` on PATH
+      (e) one candidate pool of installed copies, highest version wins:
+          Program Files "Blender *" installs plus PORTABLE folders named
+          ``blender-<ver>-windows-x64`` on D:, under the user's home and on the
+          root of every fixed drive (the zip layout from blender.org)
+      (f) the Steam install
+      (g) macOS .app bundles
+    """
+    # (a) + (b) + (c): explicit hint, BLENDER_EXE env var, settings-file blender_exe
+    for candidate in filter(None, [hint, os.environ.get("BLENDER_EXE"), _settings.get("blender_exe")]):
         if os.path.isfile(candidate):
             return candidate
 
-    # 2. PATH
+    # (d) PATH
     found = _shutil.which("blender") or _shutil.which("blender.exe")
     if found:
         return found
 
-    # 3. Windows default install locations (newest version wins)
-    win_patterns = [
+    # (e) Candidate pool: Program Files installs + portable zip folders
+    home = os.path.expanduser("~")
+    patterns = [
         r"C:\Program Files\Blender Foundation\Blender *\blender.exe",
         r"C:\Program Files (x86)\Blender Foundation\Blender *\blender.exe",
         r"C:\Program Files\Blender Foundation\blender.exe",
+        r"D:\blender-*-windows-x64\blender.exe",
+        os.path.join(home, "blender-*-windows-x64", "blender.exe"),
     ]
-    matches = []
-    for pat in win_patterns:
-        matches.extend(_glob.glob(pat))
-    if matches:
-        return sorted(matches)[-1]   # highest version string sorts last
+    patterns += [os.path.join(root, "blender-*-windows-x64", "blender.exe")
+                 for root in _fixed_drive_roots()]
+    seen = set()
+    candidates = []
+    for pat in patterns:
+        for match in _glob.glob(pat):
+            key = os.path.normcase(os.path.abspath(match))
+            if key not in seen and os.path.isfile(match):
+                seen.add(key)
+                candidates.append(match)
+    if candidates:
+        # highest parsed version wins; the path string only breaks exact ties
+        return max(candidates, key=lambda p: (_blender_version_key(p), os.path.normcase(p)))
 
-    # 4. Steam (Windows)
+    # (f) Steam (Windows)
     steam = r"C:\Program Files (x86)\Steam\steamapps\common\Blender\blender.exe"
     if os.path.isfile(steam):
         return steam
 
-    # 5. macOS .app bundle
+    # (g) macOS .app bundle
     mac_paths = [
         "/Applications/Blender.app/Contents/MacOS/Blender",
         "/Applications/Blender/blender.app/Contents/MacOS/Blender",
@@ -1252,8 +1467,24 @@ def _find_blender_exe(hint: str = None) -> str | None:
     return None
 
 
+def _default_output_path(filename: str) -> str | None:
+    """<settings output_dir>/<filename> when output_dir is set (folder created),
+    else None so the caller keeps its previous default. Only for files the user
+    gets to keep (C25): image-returning tools that delete their temp PNG are exempt."""
+    out_dir = _settings.get("output_dir")
+    if not out_dir:
+        return None
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"output_dir {out_dir!r} unusable ({e}); falling back to the tool default")
+        return None
+    return os.path.join(out_dir, filename)
+
+
 def _blender_host_port() -> tuple[str, int]:
-    return os.getenv("BLENDER_HOST", DEFAULT_HOST), int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
+    """Effective host/port: BLENDER_HOST/BLENDER_PORT > settings.json > defaults."""
+    return str(_settings.get("host", DEFAULT_HOST)), int(_settings.get("port", DEFAULT_PORT))
 
 
 def _drop_connection() -> None:
@@ -1277,6 +1508,23 @@ async def _wait_for_exit(proc, timeout: float) -> bool:
     return proc.poll() is not None
 
 
+# --python-expr passed by start_blender(start_server=True). The add-on publishes
+# blendermcp_ensure_server in bpy.app.driver_namespace at register(); calling it
+# starts the socket server if it is not running. One shot: returning None from a
+# bpy.app.timers callback unregisters it.
+_ENSURE_SERVER_EXPR = (
+    "import bpy; "
+    "bpy.app.timers.register("
+    "lambda: (bpy.app.driver_namespace.get('blendermcp_ensure_server', lambda: None)(), None)[1], "
+    "first_interval=1.0)"
+)
+# Background mode: timers never fire, so call the hook directly (no-op when the
+# add-on is not enabled, so a --factory-startup run does not error out).
+_ENSURE_SERVER_EXPR_BACKGROUND = (
+    "import bpy; bpy.app.driver_namespace.get('blendermcp_ensure_server', lambda: None)()"
+)
+
+
 @mcp.tool()
 async def start_blender(
     ctx: Context,
@@ -1285,20 +1533,32 @@ async def start_blender(
     background: bool = False,
     wait_for_addon: bool = True,
     python_expr: str = None,
+    start_server: bool = True,
+    restore_session: str = None,
 ) -> str:
     """
     Launch Blender as a managed subprocess.
 
     Parameters:
     - blend_file: Path to a .blend file to open on startup (optional)
-    - blender_exe: Full path to the Blender executable. Auto-detected if omitted
-                   (checks BLENDER_EXE env var, PATH, then common install locations).
+    - blender_exe: Full path to the Blender executable. Auto-detected if omitted:
+                   the BLENDER_EXE environment variable, then the settings file
+                   (blender_exe), then PATH, then the highest-version copy among
+                   Program Files installs and portable zip folders
+                   (blender-<ver>-windows-x64 on D:, in the user's home or on any
+                   fixed drive root), then Steam. get_blender_status shows the pick.
     - background: True = headless mode (--background), no UI. Useful for rendering.
     - wait_for_addon: Wait up to 30 s for the BlenderMCP addon socket to become
-                      reachable on port 9876 (default True). Set False for background
-                      jobs that don't use the addon.
+                      reachable (default True). Set False for background jobs that
+                      don't use the addon.
     - python_expr: Optional Python expression passed to Blender via --python-expr,
                    e.g. "import bpy; bpy.ops.wm.quit_blender()" for scripted batch runs.
+    - start_server: True (default) also asks the add-on to start its socket server
+                    through a --python-expr hook: 1 s after startup in GUI mode (in
+                    case the autostart preference is off), immediately in background
+                    mode (autostart never opens a port headless; only this does).
+    - restore_session: Name of a session saved with save_session_state (e.g. "last")
+                       to reopen and re-apply once the add-on answers.
 
     Blender console output goes to blender_mcp_blender.log in the temp folder; it
     must never share this process stdio, which carries the MCP transport.
@@ -1312,8 +1572,8 @@ async def start_blender(
     if not exe:
         return (
             "Could not find the Blender executable. "
-            "Set the BLENDER_EXE environment variable to the full path, "
-            "or pass blender_exe='/path/to/blender'."
+            "Set the BLENDER_EXE environment variable to the full path, put blender_exe "
+            "in the settings file (set_server_settings), or pass blender_exe='/path/to/blender'."
         )
 
     cmd = [exe]
@@ -1325,6 +1585,14 @@ async def start_blender(
         cmd.append(blend_file)
     if python_expr:
         cmd += ["--python-expr", python_expr]
+    if start_server:
+        # Belt and braces for an add-on whose autostart preference is off: the
+        # add-on registers bpy.app.driver_namespace["blendermcp_ensure_server"].
+        # GUI: a timer calls it once the UI is up (timers never fire headless).
+        # Background: call it directly; the add-on's autostart never opens a port
+        # in --background, only this explicit call does. A missing hook (add-on
+        # not enabled) is a no-op; the timeout message below names that cause.
+        cmd += ["--python-expr", _ENSURE_SERVER_EXPR_BACKGROUND if background else _ENSURE_SERVER_EXPR]
 
     log_path = os.path.join(tempfile.gettempdir(), "blender_mcp_blender.log")
     try:
@@ -1345,11 +1613,13 @@ async def start_blender(
     if not wait_for_addon or background:
         return (
             f"Blender launched (pid {_blender_process.pid})."
-            + (" Waiting for addon skipped (background mode)." if background else
+            + ((" Background mode: socket server requested through the ensure_server hook, "
+                "not waiting for it; check get_blender_status." if start_server else
+                " Waiting for addon skipped (background mode).") if background else
                " Not waiting for addon (wait_for_addon=False).")
         )
 
-    # Poll port 9876 until the addon TCP server is up
+    # Poll the add-on port until its TCP server is up
     host, port = _blender_host_port()
     deadline = _time.monotonic() + 30.0
     while _time.monotonic() < deadline:
@@ -1357,18 +1627,24 @@ async def start_blender(
             return (f"Blender exited unexpectedly (code {_blender_process.returncode}). "
                     f"See {log_path}")
         if _probe_port(host, port, 0.5):
-            return (
-                f"Blender started (pid {_blender_process.pid}) and addon is ready on port {port}."
+            msg = (
+                f"Blender started (pid {_blender_process.pid}) and addon is ready on {host}:{port}."
                 + (f" Opened: {blend_file}" if blend_file else "")
             )
+            if restore_session:
+                restored = await asyncio.to_thread(restore_session_state, ctx, restore_session, True, True)
+                msg += f" Session restore: {restored}"
+            return msg
         await asyncio.sleep(0.5)
 
     return (
         f"Blender launched (pid {_blender_process.pid}) but the MCP addon did not respond "
-        f"on port {port} within 30 s. Make sure the BlenderMCP addon is installed and enabled "
-        f"in Blender Preferences -> Add-ons. Blender log: {log_path}"
+        f"on {host}:{port} within 30 s. Two causes are possible: (1) the BlenderMCP add-on is "
+        f"not enabled in Edit > Preferences > Add-ons, or (2) its 'Autostart server' preference "
+        f"is off and nobody clicked 'Connect to Claude' in the N sidebar"
+        + ("" if start_server else " (start_server=False, so no automatic start was attempted)")
+        + f". Blender log: {log_path}"
     )
-
 
 @mcp.tool()
 async def close_blender(
@@ -1455,7 +1731,107 @@ def get_blender_status(ctx: Context) -> str:
     else:
         addon_status = f"not reachable on {host}:{port}"
 
-    return f"Process: {proc_status}\nAddon socket: {addon_status}"
+    exe = _find_blender_exe()
+    exe_status = exe if exe else "not found (set BLENDER_EXE or pass blender_exe to start_blender)"
+
+    return f"Process: {proc_status}\nAddon socket: {addon_status}\nBlender exe: {exe_status}"
+
+
+# ─── Version & server settings ────────────────────────────────────────────────
+
+@mcp.tool()
+def get_version(ctx: Context) -> str:
+    """
+    Report the server version, the Blender add-on version (asked over the socket),
+    both protocol numbers with protocol_match, where this server module and its
+    settings file live, and the last update-check result. Never touches the
+    network; the add-on line reads "unreachable" when Blender is not running.
+    """
+    global _addon_info
+    lines = [f"BlenderMCP server {__version__} (protocol {PROTOCOL})",
+             f"Server module: {os.path.abspath(__file__)}",
+             f"Settings file: {_settings.settings_path()} ({_settings.file_state()})"]
+    try:
+        _probe_addon_version(get_blender_connection())
+    except Exception as e:
+        _addon_info = {"unreachable": True, "reason": str(e)}
+    info = _addon_info or {"unreachable": True, "reason": "no connection attempted"}
+    if info.get("unreachable"):
+        lines.append(f"Blender add-on: unreachable ({info.get('reason')})")
+        lines.append("protocol_match: unknown")
+    elif info.get("legacy"):
+        lines.append("Blender add-on: pre-2.1 (no get_version handler), protocol none")
+        lines.append("protocol_match: false")
+    else:
+        lines.append(f"Blender add-on: {info.get('addon')} (protocol {info.get('protocol')}) on Blender "
+                     f"{info.get('blender')}, Python {info.get('python')}"
+                     + (f", file {info['addon_file']}" if info.get("addon_file") else ""))
+        lines.append(f"protocol_match: {'true' if info.get('protocol') == PROTOCOL else 'false'}")
+    mismatch = _mismatch_text(info)
+    if info.get("unreachable"):
+        lines.append("Compatibility: unknown (add-on unreachable)")
+    elif info.get("legacy"):
+        lines.append(f"Compatibility: MISMATCH. {mismatch}")
+    elif mismatch:
+        lines.append(f"Compatibility: MISMATCH. {mismatch}")
+    else:
+        lines.append("Compatibility: OK (versions and protocols match)")
+    lines.append("last_update_check: null")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_server_settings(ctx: Context) -> str:
+    """
+    Show the Python server's own settings (not Blender's) with the source of each
+    value: env, file or default.
+
+    Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,
+    presets_dir, image_max_pixels, log_level, img_to_3d_port. File:
+    <settings dir>/settings.json where the settings dir is ~/.blender_mcp or
+    BLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST, BLENDER_PORT,
+    BLENDER_EXE and IMG_TO_3D_PORT override the file.
+    """
+    lines = [f"Settings file: {_settings.settings_path()} ({_settings.file_state()})",
+             f"Presets dir: {_settings.presets_dir()}"]
+    for key, row in _settings.describe().items():
+        env = f", env {row['env']}" if row["env"] else ""
+        lines.append(f"{key} = {row['value']!r}  [{row['source']}{env}]")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def set_server_settings(ctx: Context, values: str) -> str:
+    """
+    Change the Python server's own settings and persist them to settings.json.
+
+    Parameters:
+    - values: JSON object of key -> value, e.g. '{"port": 9877, "output_dir": "D:/renders"}'.
+      Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,
+      presets_dir, image_max_pixels, log_level, img_to_3d_port. A null value resets
+      a key to its default. Unknown keys and wrong types are reported as rejected.
+      host and port take effect on the next connection (the current one is dropped);
+      the other keys apply immediately. A key set by an environment variable keeps
+      the environment value until that variable is unset (reported as overridden).
+    """
+    try:
+        vals = json.loads(values) if values else {}
+        if not isinstance(vals, dict):
+            return "Error: values must be a JSON object, e.g. '{\"port\": 9877}'"
+        before = _blender_host_port()
+        r = _settings.update(vals)
+        if _blender_host_port() != before:
+            _drop_connection()
+        if "log_level" in r["saved"]:
+            logging.getLogger().setLevel(getattr(logging, str(_settings.get("log_level")).upper(), logging.INFO))
+        msg = f"Saved {r['saved']} to {r['path']}"
+        if r["rejected"]:
+            msg += f". Rejected: {r['rejected']}"
+        if r["overridden_by_env"]:
+            msg += f". Still overridden by the environment: {r['overridden_by_env']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ─── Extended tools ──────────────────────────────────────────────────────────
@@ -1463,14 +1839,29 @@ def get_blender_status(ctx: Context) -> str:
 # Subprocess management for the local image-to-3D server
 
 _img_to_3d_process = None
-_IMG_TO_3D_PORT = 7862
-_IMG_TO_3D_URL = f"http://127.0.0.1:{_IMG_TO_3D_PORT}"
+
+
+def _img_to_3d_port() -> int:
+    """IMG_TO_3D_PORT env > settings.json img_to_3d_port > 7862."""
+    return int(_settings.get("img_to_3d_port", 7862))
+
+
+def _img_to_3d_url() -> str:
+    return f"http://127.0.0.1:{_img_to_3d_port()}"
 
 
 # ─── Multi-angle capture ─────────────────────────────────────────────────────
 
 _VALID_ANGLES = ("front", "back", "left", "right", "top", "bottom",
                  "iso_front_right", "iso_front_left")
+
+
+_VALID_OVERLAYS = ("bones_in_front", "wireframe", "weight_paint")
+
+
+def _check_overlay(overlay):
+    if overlay is not None and overlay not in _VALID_OVERLAYS:
+        raise Exception(f"Unknown overlay '{overlay}'. Valid overlays: {', '.join(_VALID_OVERLAYS)}")
 
 
 def _temp_png(tag: str) -> str:
@@ -1482,6 +1873,7 @@ def capture_viewport_angle(
     ctx: Context,
     angle: str = "front",
     max_size: int = 800,
+    overlay: str = None,
 ) -> Image:
     """
     Capture the Blender 3D viewport from a named angle and return it as an image.
@@ -1490,10 +1882,14 @@ def capture_viewport_angle(
     - angle: View direction. One of: front, back, left, right, top, bottom,
              iso_front_right, iso_front_left
     - max_size: Maximum pixel dimension (default 800)
+    - overlay: Optional rig view: bones_in_front (armatures drawn through meshes),
+               wireframe, weight_paint (active vertex group as a heat map).
+               All viewport state is restored afterwards.
     """
     try:
         if angle not in _VALID_ANGLES:
             raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
+        _check_overlay(overlay)
         blender = get_blender_connection()
         temp_path = _temp_png(f"angle_{angle}")
         _remove_quiet(temp_path)
@@ -1501,6 +1897,7 @@ def capture_viewport_angle(
             "angle": angle,
             "max_size": max_size,
             "filepath": temp_path,
+            "overlay": overlay,
         })
         if "error" in result:
             raise Exception(result["error"])
@@ -1515,6 +1912,7 @@ def capture_contact_sheet(
     ctx: Context,
     angles: str = "front,right,top,iso_front_right",
     max_size: int = 512,
+    overlay: str = None,
 ) -> Image:
     """
     Capture multiple viewport angles and stitch them into a single contact sheet image.
@@ -1522,6 +1920,8 @@ def capture_contact_sheet(
     Parameters:
     - angles: Comma-separated list of angle names (default: front,right,top,iso_front_right)
     - max_size: Pixel size for each individual tile (default 512)
+    - overlay: Optional rig view for every tile: bones_in_front, wireframe or
+               weight_paint (see capture_viewport_angle). State restored afterwards.
 
     Returns a single composited image with all requested angles labelled.
     """
@@ -1532,11 +1932,13 @@ def capture_contact_sheet(
             raise Exception(f"Unknown angle(s) {bad}. Valid angles: {', '.join(_VALID_ANGLES)}")
         if not angle_list:
             raise Exception("No angles given")
+        _check_overlay(overlay)
 
         blender = get_blender_connection()
         result = blender.send_command("capture_contact_sheet", {
             "angles": angle_list,
             "max_size": max_size,
+            "overlay": overlay,
         })
         if "error" in result:
             raise Exception(result["error"])
@@ -2551,12 +2953,14 @@ def render_all_cameras(
     - height: Render height per camera in pixels (default 1080)
     - samples: Sample count for Cycles and EEVEE (default 32)
     - output_dir: Directory to keep the individual full-resolution renders.
-                  If omitted they are rendered to the temp dir and deleted after
+                  If omitted, the server setting output_dir is used; if that is
+                  unset too they are rendered to the temp dir and deleted after
                   the sheet is built.
 
     Returns a composited contact sheet image.
     """
     try:
+        output_dir = output_dir or _settings.get("output_dir") or None
         blender = get_blender_connection()
         result = blender.send_command("render_all_cameras", {
             "width": width, "height": height,
@@ -2753,23 +3157,73 @@ def export_object(
     name: str = None,
     filepath: str = None,
     file_format: str = "glb",
+    include_hierarchy: bool = True,
+    bake_anim: bool = True,
+    add_leaf_bones: bool = False,
+    use_armature_deform_only: bool = True,
+    bake_anim_simplify_factor: float = 0.0,
+    mesh_smooth_type: str = None,
+    primary_bone_axis: str = None,
+    secondary_bone_axis: str = None,
+    apply_scale_options: str = None,
+    export_animations: bool = True,
+    export_skins: bool = True,
+    export_morph: bool = True,
 ) -> str:
     """
-    Export an object (or the full scene) to a 3D file.
+    Export an object (or the full scene) to a 3D file. A skinned mesh exports WITH
+    its armature, children and animation by default (include_hierarchy).
 
     Parameters:
     - name: Object to export; exports entire scene if omitted
-    - filepath: Output file path (auto-generated in temp dir if omitted)
+    - filepath: Output file path. If omitted: <server output_dir>/<name or scene>.<format>
+                when the output_dir setting is set, else a temp-dir path.
     - file_format: glb, gltf, fbx, obj, stl, ply (default glb)
+    - include_hierarchy: Also select the parent armature and all children (default True)
+    FBX only (ignored for other formats, reported):
+    - bake_anim: Bake animation into the FBX (default True)
+    - add_leaf_bones: Add end bones for bone tails (default False, engines do not want them)
+    - use_armature_deform_only: Export only deforming bones (default True)
+    - bake_anim_simplify_factor: Keyframe simplification, 0.0 = keep all (default 0.0)
+    - mesh_smooth_type: OFF, FACE, EDGE (Blender 5.2 adds SMOOTH_GROUP); validated
+                        against this Blender's own list
+    - primary_bone_axis / secondary_bone_axis: X, Y, Z, -X, -Y, -Z (Unreal: Y / X)
+    - apply_scale_options: FBX_SCALE_NONE, FBX_SCALE_UNITS, FBX_SCALE_CUSTOM, FBX_SCALE_ALL
+    glTF/GLB only (ignored for other formats, reported):
+    - export_animations / export_skins / export_morph: Include animations, skinning,
+      shape keys (all default True)
     """
     try:
+        if not filepath:
+            filepath = _default_output_path(f"{name or 'scene'}.{(file_format or 'glb').lower()}")
         blender = get_blender_connection()
         result = blender.send_command("export_object", {
             "name": name, "filepath": filepath, "file_format": file_format,
+            "include_hierarchy": include_hierarchy,
+            "bake_anim": bake_anim, "add_leaf_bones": add_leaf_bones,
+            "use_armature_deform_only": use_armature_deform_only,
+            "bake_anim_simplify_factor": bake_anim_simplify_factor,
+            "mesh_smooth_type": mesh_smooth_type,
+            "primary_bone_axis": primary_bone_axis, "secondary_bone_axis": secondary_bone_axis,
+            "apply_scale_options": apply_scale_options,
+            "export_animations": export_animations, "export_skins": export_skins,
+            "export_morph": export_morph,
         })
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Exported to: {result['filepath']}"
+        msg = f"Exported to: {result.get('filepath')} ({result.get('format', file_format)})"
+        ex = result.get("exported_objects")
+        if isinstance(ex, list):
+            msg += f" {len(ex)} object(s): {', '.join(ex[:8])}{', ...' if len(ex) > 8 else ''}"
+        elif ex:
+            msg += f" ({ex})"
+        opts = result.get("fbx_options") or result.get("gltf_options")
+        if isinstance(opts, dict) and opts:
+            msg += ". Options: " + ", ".join(f"{k}={v}" for k, v in list(opts.items())[:10])
+        ignored = result.get("ignored") or result.get("ignored_params")
+        if ignored:
+            msg += f". Ignored for {result.get('format', file_format)}: {ignored}"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -2778,57 +3232,1907 @@ def export_object(
 def import_file(ctx: Context, filepath: str) -> str:
     """
     Import a 3D file into the current Blender scene.
-    Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend
+    Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend, .bvh (needs the
+    io_anim_bvh add-on; the error names enable_addon when it is off)
 
     Parameters:
     - filepath: Absolute path to the file to import
+
+    Reply lists the new objects and, for rigged files, the armatures, the new
+    actions and any bone-shape helper objects the importer added.
     """
     try:
         blender = get_blender_connection()
         result = blender.send_command("import_file", {"filepath": filepath})
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Imported {filepath}. New objects: {result.get('imported_objects', [])}"
+        msg = f"Imported {filepath}. New objects: {result.get('imported_objects', [])}"
+        if result.get("armatures"):
+            msg += f". Armatures: {result['armatures']}"
+        if result.get("new_actions"):
+            msg += f". New actions: {result['new_actions']}"
+        if result.get("bone_shape_objects"):
+            msg += f". Bone-shape helper objects (not your geometry): {result['bone_shape_objects']}"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def save_blend(ctx: Context, filepath: str = None) -> str:
+def save_blend(
+    ctx: Context,
+    filepath: str = None,
+    compress: bool = None,
+    relative_remap: bool = True,
+    copy: bool = False,
+    incremental: bool = False,
+    backup: bool = True,
+    overwrite: bool = True,
+    purge_orphans: bool = False,
+) -> str:
     """
     Save the current Blender project as a .blend file.
 
     Parameters:
     - filepath: Absolute path to save to (e.g. "C:/projects/my_scene.blend").
                 If omitted, saves over the currently open file. If the file has
-                never been saved, a temporary path is used and returned.
+                never been saved it goes to <server output_dir>/untitled_<stamp>.blend
+                when that setting is set, else to a temporary path (the reply warns).
+    - compress: True/False to force compression; omit (None) to use the Blender
+                preference use_file_compression (on by default since Blender 5.0).
+    - relative_remap: Remap relative paths when the file moves (default True).
+    - copy: True = save a COPY without changing the working file path (default False).
+    - incremental: True = Blender's own numbered save beside the open file
+                   (a.blend -> a1.blend, then a2.blend); do not combine with filepath.
+                   Default False.
+    - backup: True (default) keeps Blender's .blend1 backups per the save_version
+              preference; the reply reports that preference value.
+    - overwrite: False refuses when the target exists (default True).
+    - purge_orphans: True purges orphan data-blocks before saving (default False).
+
+    Reply: path, bytes written, effective compress, is_dirty after, elapsed seconds.
     """
     try:
         blender = get_blender_connection()
-        result = blender.send_command("save_blend", {"filepath": filepath} if filepath else {})
+        payload = {
+            "compress": compress, "relative_remap": relative_remap,
+            "copy": copy, "incremental": incremental, "backup": backup,
+            "overwrite": overwrite, "purge_orphans": purge_orphans,
+        }
+        routed = None   # why an unsaved file went where it went (Ada, C25 condition)
+        if not filepath and not incremental and _settings.get("output_dir"):
+            # A never-saved file would go to the temp dir; with output_dir set it
+            # goes there instead (C25). One cheap read; a pre-2.1 add-on answers
+            # "Unknown command type" and we keep the old behaviour.
+            try:
+                state = blender.send_command("get_file_state")
+                if isinstance(state, dict) and not state.get("is_saved", True):
+                    filepath = _default_output_path(f"untitled_{_time.strftime('%Y%m%d_%H%M%S')}.blend")
+                    if filepath:
+                        routed = f"file had never been saved; placed under the server output_dir setting ({_settings.get('output_dir')})"
+                    else:
+                        routed = "file had never been saved; output_dir is unusable, so Blender used a temp path"
+            except Exception as e:
+                logger.info(f"save_blend: file-state pre-check skipped ({e})")
+                routed = f"file-state pre-check unavailable ({e}); Blender chose the path"
+        if filepath:
+            payload["filepath"] = filepath   # only when given: incremental saves name the file themselves
+        result = blender.send_command("save_blend", payload)
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Saved: {result['filepath']}"
+        path = result.get("path", result.get("filepath", filepath))
+        msg = f"Saved: {path}"
+        details = []
+        if "bytes" in result:
+            details.append(f"{result['bytes']} bytes")
+        if "compress" in result:
+            details.append(f"compress={result['compress']}")
+        if "is_dirty" in result:
+            details.append(f"dirty after={result['is_dirty']}")
+        if "elapsed" in result:
+            details.append(f"{float(result['elapsed']):.2f}s")
+        if result.get("purged") is not None:
+            details.append(f"purged {result['purged']} orphan(s)")
+        if copy:
+            details.append("copy, working file unchanged")
+        if "save_versions" in result:
+            details.append(f"backups kept={result['save_versions']}")
+        if details:
+            msg += " (" + ", ".join(details) + ")"
+        if result.get("warning"):
+            msg += f". Warning: {result['warning']}"
+        if routed:
+            msg += f". Note: {routed}"
+        elif not filepath and result.get("warning") and "temp" in str(result["warning"]).lower():
+            msg += (". Note: no filepath given and the file had never been saved, so Blender used a temp path"
+                    + ("" if _settings.get("output_dir") else "; set the server output_dir setting to choose a folder"))
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def load_blend(ctx: Context, filepath: str) -> str:
+def load_blend(
+    ctx: Context,
+    filepath: str,
+    force: bool = False,
+    save_first: bool = False,
+    load_ui: bool = None,
+    use_scripts: bool = None,
+    revert_on_fail: bool = True,
+) -> str:
     """
     Open a .blend file, replacing the current Blender scene.
-    Unsaved changes to the current file will be lost — save first if needed.
 
     Parameters:
     - filepath: Absolute path to the .blend file to open
+    - force: The current file has unsaved changes -> the call is refused unless
+             force=True (discard them) or save_first=True (save, then open).
+    - save_first: Save the current file before opening the new one (default False).
+    - load_ui: Load the file's UI layout; omit (None) for the preference use_load_ui.
+    - use_scripts: Allow the file's scripts to run; omit (None) for the preference.
+    - revert_on_fail: Reopen the previous file if loading fails (default True).
+
+    Reply: scene name and object count, the previous file, the Blender version that
+    saved the file, and whether unsaved changes were discarded. Files saved by
+    Blender 5.x do not open in 4.3.
     """
     try:
         blender = get_blender_connection()
-        result = blender.send_command("load_blend", {"filepath": filepath})
+        result = blender.send_command("load_blend", {
+            "filepath": filepath, "force": force, "save_first": save_first,
+            "load_ui": load_ui, "use_scripts": use_scripts, "revert_on_fail": revert_on_fail,
+        })
+        if "error" in result:
+            return (f"Error: {result['error']}"
+                    + (f" (reverted to {result['reverted_to']})" if result.get("reverted_to") else ""))
+        msg = (f"Opened '{filepath}'. Scene: {result.get('scene_name')}, "
+               f"{result.get('object_count')} objects.")
+        if result.get("blender_version_of_file"):
+            v = result["blender_version_of_file"]
+            msg += f" Saved by Blender {'.'.join(str(x) for x in v) if isinstance(v, (list, tuple)) else v}."
+        if result.get("previous_file"):
+            msg += f" Previous file: {result['previous_file']}."
+        if result.get("unsaved_changes_discarded"):
+            msg += " Unsaved changes were discarded."
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Shared helpers for the B0 wrappers ───────────────────────────────────────
+
+_SAFE_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")   # preset / session file names
+
+
+def _fmt_version(v) -> str:
+    return ".".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v)
+
+
+def _parse_json_object(text: str, label: str) -> dict | str:
+    """Parse a JSON object argument; returns the dict or an 'Error: ...' string."""
+    if text is None or str(text).strip() == "":
+        return {}
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError as e:
+        return f"Error: {label} is not valid JSON ({e.msg} at position {e.pos})"
+    if not isinstance(obj, dict):
+        return f"Error: {label} must be a JSON object, e.g. '{{\"key\": value}}'"
+    return obj
+
+
+def _split_csv(text: str) -> list[str]:
+    return [p.strip() for p in str(text).split(",") if p.strip()] if text else []
+
+
+# ─── Session state ────────────────────────────────────────────────────────────
+# The add-on captures/applies the state dict; the server persists it as
+# <settings dir>/sessions/<name>.json (C10: the server writes only under ~/.blender_mcp).
+
+_SESSION_INCLUDE_DEFAULT = "FILE,FRAME,CAMERA,SELECTION,ACTIVE,MODE,VIEWPORT,WORKSPACE,SETTINGS_SNAPSHOTS"
+
+
+def _session_path(name: str):
+    if not _SAFE_NAME_RE.match(name or ""):
+        raise ValueError("session name must be 1-64 characters of letters, digits, '_', '.' or '-'")
+    return _settings.settings_dir() / "sessions" / f"{name}.json"
+
+
+def _read_session(name: str) -> dict:
+    path = _session_path(name)
+    if not path.is_file():
+        raise FileNotFoundError(f"no saved session '{name}' ({path})")
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+@mcp.tool()
+def save_session_state(ctx: Context, name: str = "last", include: str = _SESSION_INCLUDE_DEFAULT) -> str:
+    """
+    Save what you are working on so it survives a Blender restart: open file
+    path and dirty flag, frame range and current frame, active camera, selection
+    and active object, mode, each 3D view's view matrix/distance/shading,
+    workspace and the named settings snapshots. Stored as
+    <settings dir>/sessions/<name>.json. Pairs with close_blender /
+    start_blender(restore_session=...).
+
+    Parameters:
+    - name: Session name (default "last")
+    - include: Comma list of FILE, FRAME, CAMERA, SELECTION, ACTIVE, MODE, VIEWPORT,
+               WORKSPACE, SETTINGS_SNAPSHOTS (default: all)
+    """
+    try:
+        path = _session_path(name)
+        blender = get_blender_connection()
+        result = blender.send_command("save_session_state", {"name": name, "include": _split_csv(include)})
         if "error" in result:
             return f"Error: {result['error']}"
-        return (f"Opened '{filepath}'. "
-                f"Scene: {result['scene_name']}, {result['object_count']} objects.")
+        state = result.get("state") or {}
+        doc = {"name": name, "saved_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+               "server_version": __version__, "state": state}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+        f = state.get("file") or {}
+        fr = state.get("frame") or {}
+        return (f"Session '{name}' saved to {path}: file={f.get('filepath') or 'unsaved'}"
+                f"{' (dirty)' if f.get('is_dirty') else ''}, frame={fr.get('current')}, "
+                f"sections={', '.join(k for k in state if k not in ('name', 'saved_at', 'blender'))}")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def restore_session_state(ctx: Context, name: str = "last", load_file: bool = True, force: bool = False) -> str:
+    """
+    Restore a session saved with save_session_state: the add-on reopens its file
+    (with the unsaved-changes guard) and re-applies frame, camera, selection,
+    active object, mode, views, workspace and settings snapshots. Reports what
+    could not be restored.
+
+    Parameters:
+    - name: Session name (default "last")
+    - load_file: Reopen the session's .blend first (default True)
+    - force: Discard unsaved changes in the current file when reopening
+    """
+    try:
+        doc = _read_session(name)
+        state = doc.get("state", {})
+        blender = get_blender_connection()
+        result = blender.send_command("restore_session_state", {
+            "name": name, "state": state, "load_file": load_file, "force": force,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = (f"Session '{name}' restored (saved {doc.get('saved_at')}): "
+               f"file {'reopened' if result.get('file_loaded') else 'not reopened'}")
+        if result.get("not_restored"):
+            msg += f". Could not restore: {result['not_restored']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── File lifecycle ───────────────────────────────────────────────────────────
+# (settings doc 2.1, "File lifecycle" table; inserted before the Primitives banner)
+
+@mcp.tool()
+def get_file_state(ctx: Context) -> str:
+    """
+    Report the state of the open .blend before any destructive step: filepath,
+    is_saved, is_dirty, file_version (the Blender that SAVED the file), the running
+    blender_version, use_autopack, packed_images, missing_files (images and
+    libraries whose path does not exist), libraries (linked .blend paths),
+    autosave_dir with autosave_files (newest first, with mtime), recent_files and
+    backup_files (<name>.blend1.. beside the file). Note: an unsaved factory scene
+    reports is_dirty False on Blender 5.2 and True on 4.3; never assume it.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_file_state")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def new_file(
+    ctx: Context,
+    template: str = None,
+    empty: bool = False,
+    load_ui: bool = False,
+    force: bool = False,
+) -> str:
+    """
+    Start a new file from the startup file (wm.read_homefile).
+
+    Parameters:
+    - template: App template name (omit for the default startup file)
+    - empty: True = an empty scene instead of the startup contents (default False)
+    - load_ui: Load the startup file's UI layout (default False)
+    - force: Unsaved changes in the current file refuse the call unless force=True
+
+    Reply: object count after the reset.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("new_file", {
+            "template": template, "empty": empty, "load_ui": load_ui, "force": force,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"New file{' (empty)' if empty else ''}"
+                + (f" from template '{template}'" if template else "")
+                + f": {result.get('object_count')} objects."
+                + (" Unsaved changes were discarded." if result.get("unsaved_changes_discarded") else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def revert_file(ctx: Context, force: bool = False, use_scripts: bool = None) -> str:
+    """
+    Reload the current file from disk, discarding unsaved changes
+    (wm.revert_mainfile). Refuses when the file was never saved.
+
+    Parameters:
+    - force: Required (True) when there are unsaved changes
+    - use_scripts: Allow the file's scripts to run; omit (None) for the preference
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("revert_file", {"force": force, "use_scripts": use_scripts})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Reverted to '{result.get('filepath')}': {result.get('object_count')} objects, "
+                f"dirty={result.get('is_dirty')}.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def recover_file(
+    ctx: Context,
+    mode: str = "LAST_SESSION",
+    filepath: str = None,
+    force: bool = False,
+) -> str:
+    """
+    Recover work from Blender's session or autosave files.
+
+    Parameters:
+    - mode: LAST_SESSION (wm.recover_last_session, reopens quit.blend) or AUTOSAVE
+            (wm.recover_auto_save with filepath from get_file_state.autosave_files)
+    - filepath: The autosave file to load when mode is AUTOSAVE
+    - force: Required (True) when the current file has unsaved changes
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("recover_file", {
+            "mode": mode, "filepath": filepath, "force": force,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Recovered ({result.get('mode', mode)}): {result.get('filepath') or 'session file'}, "
+                f"{result.get('object_count')} objects.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def save_copy(
+    ctx: Context,
+    filepath: str,
+    compress: bool = None,
+    relative_remap: bool = True,
+    pack_images: bool = False,
+) -> str:
+    """
+    Save a COPY of the working file without changing its path (deliverable-safe
+    export of the current state). Optionally packs images into the copy only.
+
+    Parameters:
+    - filepath: Destination .blend path
+    - compress: True/False, or omit for the preference (on by default since 5.0)
+    - relative_remap: Remap relative paths for the new location (default True)
+    - pack_images: True packs all external images into the copy, then unpacks
+                   them again so the working file is unchanged (default False)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("save_copy", {
+            "filepath": filepath, "compress": compress,
+            "relative_remap": relative_remap, "pack_images": pack_images,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Copy saved: {result.get('filepath', filepath)}"
+        details = []
+        if "bytes" in result:
+            details.append(f"{result['bytes']} bytes")
+        if "compress" in result:
+            details.append(f"compress={result['compress']}")
+        if result.get("packed_images"):
+            details.append(f"{len(result['packed_images'])} image(s) packed in the copy")
+        if details:
+            msg += " (" + ", ".join(details) + ")"
+        return msg + ". Working file unchanged."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def save_version(
+    ctx: Context,
+    note: str = None,
+    pattern: str = "{stem}_v{n:03d}",
+    dir: str = None,
+    copy: bool = True,
+) -> str:
+    """
+    Save a numbered version of the current file (my_scene_v001.blend, _v002, ...)
+    with a sidecar <file>.versions.json recording n, timestamp, note, object count
+    and triangle count. The file must have been saved at least once.
+
+    Parameters:
+    - note: Free text stored with the version entry
+    - pattern: File-name pattern; {stem} = current file name without extension,
+               {n} = version number (default "{stem}_v{n:03d}")
+    - dir: Folder for the versions (default: beside the current file)
+    - copy: True (default) keeps working on the original; False switches the
+            working file to the new version
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("save_version", {
+            "note": note, "pattern": pattern, "dir": dir, "copy": copy,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        v = result.get("version") or {}
+        return (f"Version {v.get('n')} saved: {v.get('path')}"
+                + (f" (note: {v.get('note')})" if v.get("note") else "")
+                + f" ({v.get('object_count')} objects, {v.get('tri_count')} tris)"
+                + f". {result.get('count')} version(s) in {result.get('sidecar')}."
+                + f" Working file: {result.get('working_file')}.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_versions(ctx: Context, filepath: str = None) -> str:
+    """
+    List the numbered versions recorded in <file>.versions.json next to the current
+    file (or the given filepath), with the matching files on disk.
+
+    Parameters:
+    - filepath: A .blend whose sidecar to read (default: the current file)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_versions", {"filepath": filepath})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        versions = result.get("versions", [])
+        base = result.get("file", filepath or "the current file")
+        if not versions:
+            return f"No versions recorded for {base} (sidecar {result.get('sidecar')})."
+        lines = [f"{len(versions)} version(s) of {base} (sidecar {result.get('sidecar')}):"]
+        for v in versions:
+            lines.append(f"  v{v.get('n')}: {v.get('path')}  {v.get('timestamp', '')}"
+                         + (f"  note: {v['note']}" if v.get("note") else "")
+                         + (f"  objects={v.get('object_count')} tris={v.get('tri_count')}" if "object_count" in v else "")
+                         + ("" if v.get("exists", True) else "  [missing on disk]"))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _append_or_link(link: bool, filepath, datablocks, names, kind, collection,
+                    instance_collections, relative, list_only) -> str:
+    blocks = _parse_json_object(datablocks, "datablocks") if datablocks else {}
+    if isinstance(blocks, str):
+        return blocks
+    if names and not kind:
+        return "Error: 'kind' is required with 'names' (objects, collections, materials, node_groups, ...)"
+    try:
+        blender = get_blender_connection()
+        payload = {
+            "filepath": filepath, "datablocks": blocks or None, "names": _split_csv(names) or None,
+            "kind": kind or "objects", "collection": collection,
+            "instance_collections": instance_collections, "relative": relative,
+            "list_only": list_only,
+        }
+        result = blender.send_command("link_from_blend" if link else "append_from_blend", payload)
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if list_only:
+            return json.dumps(result.get("contents", result), indent=2)
+        verb = "Linked" if link else "Appended"
+        got = result.get("appended") or result.get("linked") or {}
+        parts = ([f"{len(v)} {k}" for k, v in got.items()] if isinstance(got, dict)
+                 else [f"{len(got)} item(s)"] if isinstance(got, list) else [])
+        msg = f"{verb} from {filepath}: " + (", ".join(parts) if parts else "nothing")
+        if result.get("missing"):
+            msg += f". Not found in file: {result['missing']}"
+        if result.get("new_objects"):
+            msg += f". New objects: {result['new_objects']}"
+        if result.get("linked_into"):
+            msg += f". Linked into collection: {result['linked_into']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def append_from_blend(
+    ctx: Context,
+    filepath: str,
+    datablocks: str = None,
+    names: str = None,
+    kind: str = None,
+    collection: str = None,
+    instance_collections: bool = False,
+    relative: bool = True,
+    list_only: bool = False,
+) -> str:
+    """
+    Append (copy) data-blocks from another .blend into the current file via
+    bpy.data.libraries.load. Use list_only=True first to see what the file holds.
+
+    Parameters:
+    - filepath: Source .blend
+    - datablocks: JSON object of what to load, e.g.
+        '{"objects": ["Cube"], "collections": ["Kit"], "materials": ["Steel"], "node_groups": ["Rust"]}'
+    - names / kind: Alternative to datablocks: a comma list of names plus one kind
+        (objects, collections, materials, node_groups, meshes, images, actions, ...)
+    - collection: Link appended objects into this collection (default: active)
+    - instance_collections: Appended collections become collection instances
+    - relative: Store the library path relative to the current file (default True)
+    - list_only: True returns the file's contents per data type without loading
+    """
+    return _append_or_link(False, filepath, datablocks, names, kind, collection,
+                           instance_collections, relative, list_only)
+
+
+@mcp.tool()
+def link_from_blend(
+    ctx: Context,
+    filepath: str,
+    datablocks: str = None,
+    names: str = None,
+    kind: str = None,
+    collection: str = None,
+    instance_collections: bool = False,
+    relative: bool = True,
+    list_only: bool = False,
+) -> str:
+    """
+    Link (reference, not copy) data-blocks from another .blend; the same
+    parameters as append_from_blend with link=True. Linked data stays read-only
+    and follows the source file.
+
+    Parameters:
+    - filepath: Source .blend
+    - datablocks: JSON object per data type, e.g. '{"collections": ["Kit"]}'
+    - names / kind: Comma list of names plus one kind, instead of datablocks
+    - collection: Collection to link objects into (default: active)
+    - instance_collections: Linked collections become collection instances (usual for kits)
+    - relative: Store the library path relative to the current file (default True)
+    - list_only: True returns the file's contents per data type without linking
+    """
+    return _append_or_link(True, filepath, datablocks, names, kind, collection,
+                           instance_collections, relative, list_only)
+
+
+@mcp.tool()
+def set_autosave(
+    ctx: Context,
+    enabled: bool = None,
+    interval_minutes: int = None,
+    save_versions: int = None,
+    temp_dir: str = None,
+    persist: bool = False,
+) -> str:
+    """
+    Configure Blender's autosave preferences. Only passed values change.
+
+    Parameters:
+    - enabled: preferences.filepaths.use_auto_save_temporary_files
+    - interval_minutes: auto_save_time (minutes between autosaves)
+    - save_versions: Number of .blend1/.blend2 backups kept on save (save_version)
+    - temp_dir: temporary_directory for autosave files (empty = system temp)
+    - persist: True also writes userpref.blend (consent rule: nothing here is
+               persisted unless you ask); the reply says whether it was persisted
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_autosave", {
+            "enabled": enabled, "interval_minutes": interval_minutes,
+            "save_versions": save_versions, "temp_dir": temp_dir, "persist": persist,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Autosave: enabled={result.get('enabled')}, every {result.get('interval_minutes')} min, "
+            f"backups={result.get('save_versions')}, temp_dir={result.get('temp_dir') or 'system temp'}.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def make_paths_relative(ctx: Context) -> str:
+    """
+    Make every external file path in the current .blend relative to it
+    (bpy.ops.file.make_paths_relative). The file must be saved first.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("make_paths_relative")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Paths: {len(result.get('relative', []))} relative, {len(result.get('absolute', []))} absolute"
+                + (f", missing: {result['missing']}" if result.get("missing") else ", none missing"))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def make_paths_absolute(ctx: Context) -> str:
+    """
+    Make every external file path in the current .blend absolute
+    (bpy.ops.file.make_paths_absolute).
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("make_paths_absolute")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Paths: {len(result.get('absolute', []))} absolute, {len(result.get('relative', []))} relative"
+                + (f", missing: {result['missing']}" if result.get("missing") else ", none missing"))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find_missing_files(ctx: Context, directory: str, find_all: bool = False) -> str:
+    """
+    Search a folder (recursively) for external files the .blend cannot find and
+    relink them (bpy.ops.file.find_missing_files).
+
+    Parameters:
+    - directory: Folder to search
+    - find_all: True re-searches every file, not only the missing ones (default False)
+
+    Reply: how many were found and the list still missing.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("find_missing_files", {
+            "directory": directory, "find_all": find_all,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Found {result.get('found', 0)} file(s) under {directory}; "
+                f"still missing: {result.get('still_missing') or 'none'}")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def pack_all(ctx: Context) -> str:
+    """
+    Pack every external image and other packable file into the .blend
+    (bpy.ops.file.pack_all) so the file is self-contained.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("pack_all")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        imgs = result.get("packed_images", [])
+        return f"Packed: {len(imgs)} image(s) now packed" + (f": {', '.join(imgs[:10])}" if imgs else "")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def unpack_all(ctx: Context, unpack_method: str = "USE_LOCAL") -> str:
+    """
+    Unpack every packed file back to disk (bpy.ops.file.unpack_all).
+
+    Parameters:
+    - unpack_method: USE_LOCAL (default, write next to the .blend into //textures),
+                     WRITE_LOCAL, USE_ORIGINAL, WRITE_ORIGINAL, KEEP, REMOVE
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("unpack_all", {"unpack_method": unpack_method})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Unpacked ({result.get('method', unpack_method)}); "
+                f"{len(result.get('packed_images', []))} image(s) still packed")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Settings, generic ────────────────────────────────────────────────────────
+# (settings doc 2.1, "Settings, generic" table)
+
+_SETTINGS_SCOPES = ("SCENE", "RENDER", "OUTPUT", "CYCLES", "EEVEE", "COLOR", "UNITS",
+                    "VIEWPORT", "PREFS_FILEPATHS", "PREFS_VIEW", "PREFS_EDIT",
+                    "PREFS_SYSTEM", "PREFS_INPUT", "ADDON:<module>", "MCP", "SERVER")
+_SETTINGS_SCOPES_DOC = ", ".join(_SETTINGS_SCOPES)
+
+
+def _server_scope_describe() -> dict:
+    """SERVER scope: the Python server's own settings, in the describe_settings shape."""
+    out = {}
+    for key, row in _settings.describe().items():
+        default = _settings.DEFAULTS[key]
+        out[key] = {
+            "type": type(default).__name__.upper() if default is not None else "STRING",
+            "value": row["value"], "default": default, "source": row["source"],
+            "env": row["env"], "read_only": False,
+            "description": "Python server setting (settings.json); environment overrides the file.",
+        }
+    return out
+
+
+@mcp.tool()
+def describe_settings(ctx: Context, scope: str) -> str:
+    """
+    Describe every property of a settings scope: type, current value, default,
+    enum items, min/max, description and read-only flag. Generated from Blender's
+    own property definitions (bl_rna), so it lists exactly what this Blender has.
+
+    Parameters:
+    - scope: SCENE, RENDER, OUTPUT (image_settings + filepath), CYCLES, EEVEE,
+             COLOR (view + display settings), UNITS, VIEWPORT (shading and
+             overlays of the first 3D view), PREFS_FILEPATHS, PREFS_VIEW,
+             PREFS_EDIT, PREFS_SYSTEM, PREFS_INPUT, ADDON:<module> (that add-on's
+             preferences), MCP (this add-on's preferences), SERVER (the Python
+             server's settings file; answered without Blender)
+    """
+    try:
+        sc = (scope or "").strip()
+        if sc.upper() == "SERVER":
+            return json.dumps({"scope": "SERVER", "properties": _server_scope_describe()}, indent=2)
+        blender = get_blender_connection()
+        result = blender.send_command("describe_settings", {"scope": sc})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_settings(ctx: Context, scope: str, keys: str = None) -> str:
+    """
+    Read current values of a settings scope (values only; enums as strings,
+    vectors as lists, pointers as names).
+
+    Parameters:
+    - scope: One of the scopes listed in describe_settings (SERVER is answered
+             without Blender)
+    - keys: Comma-separated property names to read; omit for all
+    """
+    try:
+        sc = (scope or "").strip()
+        wanted = _split_csv(keys)
+        if sc.upper() == "SERVER":
+            eff = _settings.effective()
+            if wanted:
+                unknown = [k for k in wanted if k not in eff]
+                eff = {k: eff[k] for k in wanted if k in eff}
+                if unknown:
+                    eff["_unknown"] = unknown
+            return json.dumps({"scope": "SERVER", "values": eff}, indent=2)
+        blender = get_blender_connection()
+        result = blender.send_command("get_settings", {"scope": sc, "keys": wanted or None})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_settings(ctx: Context, scope: str, values: str, persist: bool = False) -> str:
+    """
+    Write values into a settings scope. Each value is validated against Blender's
+    property definition (enum membership, numeric range, type) before writing;
+    read-only properties are refused with the reason.
+
+    Parameters:
+    - scope: One of the scopes listed in describe_settings. SERVER writes the
+             Python server's settings.json (same as set_server_settings).
+    - values: JSON object of property -> value, e.g. '{"resolution_x": 1280, "engine": "CYCLES"}'
+    - persist: For PREFS_*, ADDON: and MCP scopes, True also saves userpref.blend
+               (consent rule: preferences are never persisted unless asked)
+
+    Reply: set (applied keys) and unset {key: reason}, like add_modifier.
+    """
+    vals = _parse_json_object(values, "values")
+    if isinstance(vals, str):
+        return vals
+    try:
+        sc = (scope or "").strip()
+        if sc.upper() == "SERVER":
+            return set_server_settings(ctx, json.dumps(vals))
+        blender = get_blender_connection()
+        result = blender.send_command("set_settings", {"scope": sc, "values": vals, "persist": persist})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"{sc}: set {result.get('set', [])}"
+        if result.get("unset"):
+            msg += f". Could not set: {result['unset']}"
+        if "persisted" in result:
+            msg += f". Preferences {'persisted' if result['persisted'] else 'not persisted'}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def settings_snapshot(
+    ctx: Context,
+    name: str,
+    scopes: str = "SCENE,RENDER,OUTPUT,CYCLES,EEVEE,COLOR,UNITS,VIEWPORT",
+    filepath: str = None,
+) -> str:
+    """
+    Capture the current values of the given scopes under a name (kept in the
+    Blender session; survives an add-on reload, dies with Blender) and
+    optionally into a JSON file. Restore with settings_restore.
+
+    Parameters:
+    - name: Snapshot name
+    - scopes: Comma list of scopes (default: the eight scene-level scopes)
+    - filepath: Also write the snapshot to this JSON file
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("settings_snapshot", {
+            "name": name, "scopes": _split_csv(scopes), "filepath": filepath,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        counts = result.get("keys_per_scope", {})
+        return (f"Snapshot '{name}': " + ", ".join(f"{k}={v}" for k, v in counts.items())
+                + (f". Written to {result['filepath']}" if result.get("filepath") else "")
+                + (f". File not written: {result['file_error']}" if result.get("file_error") else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def settings_restore(
+    ctx: Context,
+    name: str = None,
+    filepath: str = None,
+    scopes: str = None,
+) -> str:
+    """
+    Restore a settings snapshot taken with settings_snapshot (by name, or from a
+    JSON file). Reports keys that no longer exist or failed to apply.
+
+    Parameters:
+    - name: Snapshot name (session snapshots)
+    - filepath: JSON file written by settings_snapshot (used when name is omitted)
+    - scopes: Comma list to restore only some scopes (default: all in the snapshot)
+    """
+    if not name and not filepath:
+        return "Error: give a snapshot name or a filepath"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("settings_restore", {
+            "name": name, "filepath": filepath, "scopes": _split_csv(scopes) or None,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Restored snapshot '{name or filepath}': {result.get('restored', 0)} keys"
+        if result.get("failed"):
+            msg += f". Failed: {result['failed']}"
+        if result.get("missing"):
+            msg += f". No longer exist: {result['missing']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_settings_snapshots(ctx: Context) -> str:
+    """
+    List the settings snapshots held in the Blender session with the key count
+    per scope.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_settings_snapshots")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        snaps = result.get("snapshots", {})
+        if not snaps:
+            return "No settings snapshots in this session."
+        return "\n".join(
+            f"{name}: " + ", ".join(f"{sc}={n}" for sc, n in scopes.items())
+            for name, scopes in snaps.items())
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def delete_settings_snapshot(ctx: Context, name: str) -> str:
+    """
+    Delete a session settings snapshot by name.
+
+    Parameters:
+    - name: Snapshot name (see list_settings_snapshots)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_settings_snapshot", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Deleted snapshot '{result.get('deleted', name)}'."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Settings, typed conveniences ─────────────────────────────────────────────
+# (settings doc 2.1, "Settings, typed conveniences" table; all implemented on
+#  set_settings addon-side; the wrappers send only the parameters given)
+
+def _settings_reply(prefix: str, result: dict) -> str:
+    msg = prefix
+    if result.get("set"):
+        msg += f" Set: {result['set']}."
+    if result.get("unset"):
+        msg += f" Could not set: {result['unset']}."
+    if "persisted" in result:
+        msg += f" Preferences {'persisted' if result['persisted'] else 'not persisted'}."
+    return msg.strip()
+
+
+@mcp.tool()
+def set_output_settings(
+    ctx: Context,
+    filepath: str = None,
+    file_format: str = None,
+    color_mode: str = None,
+    color_depth: str = None,
+    compression: int = None,
+    quality: int = None,
+    film_transparent: bool = None,
+    use_stamp: bool = None,
+    use_overwrite: bool = None,
+    use_placeholder: bool = None,
+    ffmpeg: str = None,
+) -> str:
+    """
+    Set the render output path, image format and video settings in one call.
+    Only the parameters you pass are changed.
+
+    Parameters:
+    - filepath: Output path (e.g. "//renders/frame_####"); Blender adds the extension
+    - file_format: PNG, JPEG, OPEN_EXR (EXR accepted), OPEN_EXR_MULTILAYER, TIFF,
+                   BMP, TARGA, WEBP, FFMPEG (video; sets media_type VIDEO on 5.x)
+    - color_mode: BW, RGB or RGBA
+    - color_depth: "8" / "16" (PNG, TIFF) or "16" / "32" (OPEN_EXR)
+    - compression: PNG compression 0-100
+    - quality: JPEG/WEBP quality 0-100
+    - film_transparent: Transparent background (alpha) on/off
+    - use_stamp: Burn metadata into the image
+    - use_overwrite / use_placeholder: Animation output file handling
+    - ffmpeg: JSON for video, e.g. '{"format": "MPEG4", "codec": "H264", "constant_rate_factor": "MEDIUM"}'
+    """
+    ff = _parse_json_object(ffmpeg, "ffmpeg") if ffmpeg else {}
+    if isinstance(ff, str):
+        return ff
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_output_settings", {
+            "filepath": filepath, "file_format": file_format, "color_mode": color_mode,
+            "color_depth": color_depth, "compression": compression, "quality": quality,
+            "film_transparent": film_transparent, "use_stamp": use_stamp,
+            "use_overwrite": use_overwrite, "use_placeholder": use_placeholder,
+            "ffmpeg": ff or None,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply("Output settings:", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_color_management(
+    ctx: Context,
+    view_transform: str = None,
+    look: str = None,
+    exposure: float = None,
+    gamma: float = None,
+    display_device: str = None,
+    sequencer_colorspace: str = None,
+) -> str:
+    """
+    Set scene colour management. Game-asset renders and bakes usually want
+    view_transform "Standard" so colours match the engine (Blender's default is AgX).
+
+    Parameters:
+    - view_transform: Standard, Filmic, AgX, Khronos PBR Neutral, Raw, False Color
+    - look: e.g. "None", "AgX - Medium High Contrast" (names depend on the transform)
+    - exposure / gamma: Floats (0.0 / 1.0 are neutral)
+    - display_device: sRGB, Display P3, Rec.1886, Rec.2020 (or as installed)
+    - sequencer_colorspace: Colour space for the sequencer
+
+    Values are validated by assignment (the enum list is not readable headless).
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_color_management", {
+            "view_transform": view_transform, "look": look, "exposure": exposure,
+            "gamma": gamma, "display_device": display_device,
+            "sequencer_colorspace": sequencer_colorspace,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Colour management: view={result.get('view_transform')} look={result.get('look')} "
+            f"exposure={result.get('exposure')} gamma={result.get('gamma')} "
+            f"display={result.get('display_device')}.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_render_quality(ctx: Context, preset: str = "PREVIEW", engine: str = None) -> str:
+    """
+    Apply a quality preset. The previous values are stored in the settings
+    snapshot "_before_quality" so settings_restore("_before_quality") undoes it.
+
+    Parameters:
+    - preset: PREVIEW (25% resolution, 16 samples, denoise on, simplify on),
+              DRAFT (50%, 64 samples), FINAL (100%, 256 samples or the engine
+              default, persistent data on)
+    - engine: Optionally switch the engine first (CYCLES, BLENDER_EEVEE, BLENDER_WORKBENCH)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_render_quality", {"preset": preset, "engine": engine})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Quality {result.get('preset', preset)}: engine={result.get('engine')} "
+            f"resolution={result.get('resolution_percentage')}% samples={result.get('samples')}. "
+            f"Previous values in snapshot '{result.get('snapshot', '_before_quality')}'.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_render_device(
+    ctx: Context,
+    device: str = "GPU",
+    backend: str = None,
+    persist: bool = False,
+) -> str:
+    """
+    Choose the Cycles render device and compute backend.
+
+    Parameters:
+    - device: GPU or CPU (scene.cycles.device)
+    - backend: OPTIX, CUDA, HIP, ONEAPI, METAL or NONE (Cycles preferences
+               compute_device_type; validated by assignment, then every device of
+               that type is enabled)
+    - persist: True also saves userpref.blend (consent rule)
+
+    Reply: the devices Blender found with their use flag.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_render_device", {
+            "device": device, "backend": backend, "persist": persist,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        lines = [f"Cycles device={result.get('device')} backend={result.get('backend')}."]
+        for d in result.get("devices", []):
+            lines.append(f"  {d.get('name')} [{d.get('type')}] use={d.get('use')}")
+        if result.get("warning"):
+            lines.append(f"Warning: {result['warning']}")
+        lines.append(f"Preferences {'persisted' if result.get('persisted') else 'not persisted'}.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_render_devices(ctx: Context) -> str:
+    """
+    List the compute devices Cycles can see (CPU, CUDA/OPTIX/HIP/ONEAPI/METAL
+    GPUs) with their current use flag and the active backend. Headless sessions
+    may report CPU only.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_render_devices")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        devs = result.get("devices", [])
+        lines = [f"Backend: {result.get('backend')}; scene device: {result.get('scene_device')}; {len(devs)} device(s):"]
+        for d in devs:
+            lines.append(f"  {d.get('name')} [{d.get('type')}] use={d.get('use')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_simplify(
+    ctx: Context,
+    enabled: bool,
+    subdivision: int = None,
+    child_particles: float = None,
+    texture_limit: str = None,
+    volume_resolution: float = None,
+) -> str:
+    """
+    Toggle and configure render Simplify (scene.render.use_simplify and friends).
+
+    Parameters:
+    - enabled: Simplify on/off
+    - subdivision: Max subdivision level for renders (simplify_subdivision)
+    - child_particles: 0.0-1.0 fraction of child particles
+    - texture_limit: OFF, 128, 256, 512, 1024, 2048, 4096, 8192 (Cycles texture limit)
+    - volume_resolution: 0.0-1.0 volume resolution factor
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_simplify", {
+            "enabled": enabled, "subdivision": subdivision, "child_particles": child_particles,
+            "texture_limit": texture_limit, "volume_resolution": volume_resolution,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Simplify {'on' if result.get('use_simplify', enabled) else 'off'}: "
+            f"subdivision={result.get('simplify_subdivision')}.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_frame_range(
+    ctx: Context,
+    start: int = None,
+    end: int = None,
+    fps: float = None,
+    fps_base: float = None,
+    current: int = None,
+) -> str:
+    """
+    Set the scene frame range and frame rate (shared with the animation tools).
+    Only the parameters you pass are changed.
+
+    Parameters:
+    - start / end: Scene frame range
+    - fps / fps_base: Frame rate (24 / 1.0; 24 / 1.001 for 23.976)
+    - current: Also set the current frame
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_frame_range", {
+            "start": start, "end": end, "fps": fps, "fps_base": fps_base, "current": current,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Frames {result.get('frame_start')}-{result.get('frame_end')} at "
+            f"{result.get('fps')}/{result.get('fps_base')} fps.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_scene_units(
+    ctx: Context,
+    preset: str = None,
+    system: str = None,
+    scale_length: float = None,
+    length_unit: str = None,
+    rescale_objects: bool = False,
+) -> str:
+    """
+    Set scene units (shared with the engine-readiness tools), by engine preset
+    or explicitly. Unreal wants centimetres (scale_length 0.01, CENTIMETERS);
+    Unity, Godot, Bevy and glTF want metres (1.0, METERS).
+
+    Parameters:
+    - preset: UNREAL, UNITY, GODOT, BEVY, TIMBERMESH or NONE (sets system,
+              scale_length and length_unit for that engine)
+    - system: METRIC, IMPERIAL or NONE
+    - scale_length: Unit scale (1.0 = metres, 0.01 = centimetres)
+    - length_unit: ADAPTIVE, KILOMETERS, METERS, CENTIMETERS, MILLIMETERS,
+                   MICROMETERS, MILES, FEET, INCHES, THOU
+    - rescale_objects: True also scales the scene's objects so they keep their
+                       real-world size under the new scale_length (default False)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_scene_units", {
+            "preset": preset, "system": system, "scale_length": scale_length,
+            "length_unit": length_unit, "rescale_objects": rescale_objects,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(
+            f"Units: system={result.get('system')} scale_length={result.get('scale_length')} "
+            f"length={result.get('length_unit')}.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_viewport_defaults(
+    ctx: Context,
+    shading: str = None,
+    light: str = None,
+    color_type: str = None,
+    show_overlays: bool = None,
+    show_floor: bool = None,
+    show_stats: bool = None,
+    clip_end: float = None,
+    lens: float = None,
+) -> str:
+    """
+    Apply viewport display settings to EVERY 3D view (the persistent counterpart
+    of the per-capture shading/overlay options). Needs a GUI session.
+
+    Parameters:
+    - shading: WIREFRAME, SOLID, MATERIAL or RENDERED
+    - light: STUDIO, MATCAP or FLAT (solid mode)
+    - color_type: MATERIAL, SINGLE, OBJECT, RANDOM, VERTEX or TEXTURE (solid mode)
+    - show_overlays / show_floor / show_stats: Overlay toggles
+    - clip_end: View clip distance
+    - lens: Viewport focal length in mm
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_viewport_defaults", {
+            "shading": shading, "light": light, "color_type": color_type,
+            "show_overlays": show_overlays, "show_floor": show_floor, "show_stats": show_stats,
+            "clip_end": clip_end, "lens": lens,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        areas = result.get("areas")
+        n = len(areas) if isinstance(areas, (list, dict)) else areas
+        return _settings_reply(f"Viewport defaults applied to {n} 3D view(s).", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Presets and project profile ──────────────────────────────────────────────
+# (settings doc 2.1, "Presets and profiles" table). Preset files are SERVER-side:
+# <settings dir>/presets/<name>.json, values pulled through the add-on's
+# get_settings and pushed back through set_settings. Shipped defaults live in
+# src/blender_mcp/presets_default.json and are shadowed by a user file of the same name.
+
+_SHIPPED_PRESETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets_default.json")
+
+
+def _shipped_presets() -> dict:
+    try:
+        with open(_SHIPPED_PRESETS_FILE, "r", encoding="utf-8") as fh:
+            return json.load(fh).get("presets", {})
+    except Exception as e:
+        logger.warning(f"shipped presets unreadable ({_SHIPPED_PRESETS_FILE}): {e}")
+        return {}
+
+
+def _preset_path(name: str):
+    return _settings.presets_dir() / f"{name}.json"
+
+
+def _user_presets() -> dict:
+    """{name: path} for every JSON file in the presets dir."""
+    d = _settings.presets_dir()
+    if not d.is_dir():
+        return {}
+    return {p.stem: p for p in sorted(d.glob("*.json"))}
+
+
+def _load_preset_file(name_or_path: str) -> tuple[dict | None, str | None]:
+    """Resolve a preset by name (user file, then shipped) or by JSON path.
+    Returns (preset_dict, error)."""
+    p = Path(name_or_path).expanduser()
+    if p.suffix.lower() == ".json" and p.is_file():
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            return None, f"cannot read {p}: {e}"
+        return _normalise_preset(data, p.stem), None
+    name = str(name_or_path).strip()
+    user = _user_presets()
+    if name in user:
+        try:
+            with open(user[name], "r", encoding="utf-8") as fh:
+                return _normalise_preset(json.load(fh), name), None
+        except Exception as e:
+            return None, f"cannot read {user[name]}: {e}"
+    shipped = _shipped_presets()
+    if name in shipped:
+        pr = dict(shipped[name]); pr["name"] = name; pr["shipped"] = True
+        return pr, None
+    return None, (f"no preset '{name}'. Available: "
+                  f"{', '.join(sorted(set(user) | set(shipped))) or 'none'}")
+
+
+def _normalise_preset(data: dict, name: str) -> dict:
+    if not isinstance(data, dict) or not isinstance(data.get("scopes"), dict):
+        raise ValueError("preset JSON must be an object with a 'scopes' object")
+    data.setdefault("name", name)
+    return data
+
+
+def _write_preset(path, preset: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(preset, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+@mcp.tool()
+def save_preset(
+    ctx: Context,
+    name: str,
+    scopes: str = "RENDER,OUTPUT,CYCLES,EEVEE,COLOR",
+    overwrite: bool = False,
+    description: str = None,
+) -> str:
+    """
+    Save the current values of the given settings scopes as a named preset JSON
+    under the server's presets dir (portable across files and Blender versions).
+
+    Parameters:
+    - name: Preset name (letters, digits, _ . -), becomes <name>.json
+    - scopes: Comma list of scopes to capture (default RENDER,OUTPUT,CYCLES,EEVEE,COLOR)
+    - overwrite: True replaces an existing preset of that name (default False)
+    - description: Free text stored in the preset
+    """
+    if not _SAFE_NAME_RE.match(name or ""):
+        return "Error: preset name must be 1-64 characters of letters, digits, '_', '.' or '-'"
+    path = _preset_path(name)
+    if path.exists() and not overwrite:
+        return f"Error: preset '{name}' exists at {path}; pass overwrite=True to replace it"
+    scope_list = _split_csv(scopes)
+    if not scope_list:
+        return "Error: scopes is empty"
+    try:
+        blender = get_blender_connection()
+        captured, failed = {}, {}
+        for sc in scope_list:
+            result = blender.send_command("get_settings", {"scope": sc, "keys": None})
+            if "error" in result:
+                failed[sc] = result["error"]
+            else:
+                captured[sc] = result.get("values", result)
+        if not captured:
+            return f"Error: nothing captured: {failed}"
+        preset = {
+            "name": name, "description": description or "",
+            "created": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "server_version": __version__,
+            "scopes": captured,
+        }
+        _write_preset(path, preset)
+        msg = f"Preset '{name}' saved to {path}: " + ", ".join(f"{k}={len(v)} keys" for k, v in captured.items())
+        if failed:
+            msg += f". Scopes not captured: {failed}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def load_preset(ctx: Context, name: str = None, filepath: str = None, scopes: str = None) -> str:
+    """
+    Apply a preset (user preset by name, shipped preset by name, or any preset
+    JSON by filepath) through set_settings, scope by scope. Keys that this
+    Blender does not have are reported as unset and the rest still apply.
+
+    Parameters:
+    - name: Preset name (see list_presets); shipped: game_bake, preview,
+            final_eevee, final_cycles, sprite_sheet, turntable_video
+    - filepath: A preset JSON file instead of a name
+    - scopes: Comma list to apply only some of the preset's scopes
+    """
+    ref = filepath or name
+    if not ref:
+        return "Error: give a preset name or a filepath"
+    preset, err = _load_preset_file(ref)
+    if err:
+        return f"Error: {err}"
+    wanted = set(s.upper() for s in _split_csv(scopes)) if scopes else None
+    try:
+        blender = get_blender_connection()
+        applied, unset, errors = {}, {}, {}
+        for sc, values in preset["scopes"].items():
+            if wanted and sc.upper() not in wanted:
+                continue
+            result = blender.send_command("set_settings", {"scope": sc, "values": values, "persist": False})
+            if "error" in result:
+                errors[sc] = result["error"]
+                continue
+            applied[sc] = result.get("set", [])
+            if result.get("unset"):
+                unset[sc] = result["unset"]
+        msg = f"Preset '{preset.get('name', ref)}' applied: " + ", ".join(
+            f"{k}={len(v)} set" for k, v in applied.items()) if applied else f"Preset '{ref}': nothing applied"
+        if unset:
+            msg += f". Unset: {unset}"
+        if errors:
+            msg += f". Scope errors: {errors}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_presets(ctx: Context) -> str:
+    """
+    List the shipped presets and the user presets in the server's presets dir
+    (name, description, scopes, origin).
+    """
+    try:
+        lines = [f"Presets dir: {_settings.presets_dir()}"]
+        user = _user_presets()
+        for name, p in user.items():
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                lines.append(f"  {name} [user]: {d.get('description', '')} scopes={','.join(d.get('scopes', {}).keys())}")
+            except Exception as e:
+                lines.append(f"  {name} [user, unreadable: {e}]")
+        for name, d in _shipped_presets().items():
+            tag = "shipped, shadowed by user preset" if name in user else "shipped"
+            lines.append(f"  {name} [{tag}]: {d.get('description', '')} scopes={','.join(d.get('scopes', {}).keys())}")
+        return "\n".join(lines) if len(lines) > 1 else lines[0] + "\nNo presets found."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def delete_preset(ctx: Context, name: str) -> str:
+    """
+    Delete a user preset file. Shipped presets cannot be deleted (a user preset
+    that shadows one can).
+
+    Parameters:
+    - name: Preset name
+    """
+    user = _user_presets()
+    if name not in user:
+        if name in _shipped_presets():
+            return f"Error: '{name}' is a shipped preset and cannot be deleted"
+        return f"Error: no user preset '{name}'"
+    try:
+        user[name].unlink()
+        return f"Deleted preset '{name}' ({user[name]})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def export_preset(ctx: Context, name: str, filepath: str) -> str:
+    """
+    Write a preset (user or shipped) to a JSON file of your choice, e.g. to share
+    it or keep it with a project.
+
+    Parameters:
+    - name: Preset name
+    - filepath: Destination .json path
+    """
+    preset, err = _load_preset_file(name)
+    if err:
+        return f"Error: {err}"
+    try:
+        dest = Path(filepath).expanduser()
+        _write_preset(dest, preset)
+        return f"Preset '{name}' exported to {dest}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def import_preset(ctx: Context, filepath: str, name: str = None, overwrite: bool = False) -> str:
+    """
+    Copy a preset JSON file into the server's presets dir so it can be loaded by name.
+
+    Parameters:
+    - filepath: Source .json (a file written by save_preset or export_preset)
+    - name: Name to store it under (default: the file's stem)
+    - overwrite: True replaces an existing preset of that name
+    """
+    src = Path(filepath).expanduser()
+    if not src.is_file():
+        return f"Error: file not found: {src}"
+    name = name or src.stem
+    if not _SAFE_NAME_RE.match(name):
+        return "Error: preset name must be 1-64 characters of letters, digits, '_', '.' or '-'"
+    preset, err = _load_preset_file(str(src))
+    if err:
+        return f"Error: {err}"
+    dest = _preset_path(name)
+    if dest.exists() and not overwrite:
+        return f"Error: preset '{name}' exists; pass overwrite=True"
+    try:
+        preset["name"] = name
+        preset.pop("shipped", None)
+        _write_preset(dest, preset)
+        return f"Preset '{name}' imported to {dest} (scopes: {', '.join(preset['scopes'])})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def apply_blender_preset(ctx: Context, category: str, name: str) -> str:
+    """
+    Apply one of Blender's own Python presets (script.execute_preset), e.g. the
+    built-in render size presets.
+
+    Parameters:
+    - category: Preset folder, e.g. "render", "cycles/sampling", "cycles/viewport",
+                "cloth", "fluid", "camera" (see list_blender_presets)
+    - name: Preset name as listed, e.g. "HDTV 1080p"
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_blender_preset", {"category": category, "name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Applied Blender preset {result.get('category', category)}/{result.get('name', name)} ({result.get('path')})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_blender_presets(ctx: Context, category: str = "render") -> str:
+    """
+    List Blender's own presets in a category (bpy.utils.preset_paths).
+
+    Parameters:
+    - category: e.g. "render", "cycles/sampling", "cycles/viewport", "cloth",
+                "fluid", "camera", "safe_areas", "tracking_camera"
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_blender_presets", {"category": category})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        presets = result.get("presets", [])
+        names = [p.get("name") if isinstance(p, dict) else str(p) for p in presets]
+        if not names:
+            return f"No Blender presets in category '{category}' (paths searched: {result.get('paths')})"
+        return f"{len(names)} preset(s) in '{category}': " + ", ".join(names)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_project_profile(
+    ctx: Context,
+    engine_target: str,
+    export_dir: str = None,
+    texture_dir: str = None,
+    render_dir: str = None,
+    kit_unit: float = None,
+    naming: str = None,
+    max_triangles: int = None,
+    texture_size: int = None,
+    notes: str = None,
+    apply_units: bool = False,
+) -> str:
+    """
+    Store the project's target engine and conventions in the scene (custom
+    property blendermcp_profile, travels with the file) and mirror them to
+    <file>.mcp-profile.json. Export and texturing tools read their defaults here.
+
+    Parameters:
+    - engine_target: UNITY, UNREAL, GODOT, BEVY, TIMBERMESH or NONE
+    - export_dir / texture_dir / render_dir: Default output folders
+    - kit_unit: Modular kit grid unit in scene units
+    - naming: Naming convention note (e.g. "SM_<Asset>_<Variant>")
+    - max_triangles / texture_size: Budgets the validation tools check against
+    - notes: Free text
+    - apply_units: True also sets scene units for the target (Unreal: centimetres)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_project_profile", {
+            "engine_target": engine_target, "export_dir": export_dir, "texture_dir": texture_dir,
+            "render_dir": render_dir, "kit_unit": kit_unit, "naming": naming,
+            "max_triangles": max_triangles, "texture_size": texture_size, "notes": notes,
+            "apply_units": apply_units,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        profile = result.get("profile", {})
+        units = result.get("units")
+        msg = f"Project profile set: target={profile.get('engine_target', engine_target)}"
+        if isinstance(units, dict) and "error" not in units:
+            msg += f", units applied (system={units.get('system')} scale_length={units.get('scale_length')} {units.get('length_unit')})"
+        elif isinstance(units, dict):
+            msg += f", units NOT applied: {units.get('error')}"
+        if result.get("sidecar"):
+            msg += f", sidecar {result['sidecar']}"
+        if result.get("sidecar_error"):
+            msg += f", sidecar not written ({result['sidecar_error']})"
+        return msg + ". Profile: " + json.dumps(profile)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_project_profile(ctx: Context, apply_units: bool = False) -> str:
+    """
+    Read the project profile stored in the scene (see set_project_profile), or
+    report that none is set.
+
+    Parameters:
+    - apply_units: True also (re)applies the scene units for the profile's
+                   engine_target, e.g. after opening the file on another machine
+                   (default False)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_project_profile", {"apply_units": apply_units})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        if not result.get("profile"):
+            return "No project profile set. Use set_project_profile(engine_target=...)."
+        out = json.dumps(result["profile"], indent=2)
+        if isinstance(result.get("units"), dict):
+            out += "\nUnits applied: " + json.dumps(result["units"])
+        return out
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Add-ons, workspaces, preferences ─────────────────────────────────────────
+# (settings doc 2.1 table; get/set_server_settings landed in L1)
+
+@mcp.tool()
+def list_addons(ctx: Context, enabled_only: bool = False, filter: str = None) -> str:
+    """
+    List installed add-ons: module, name, version, category, enabled,
+    has_preferences, path.
+
+    Parameters:
+    - enabled_only: True lists only enabled add-ons
+    - filter: Case-insensitive substring on module or name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_addons", {"enabled_only": enabled_only, "filter": filter})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        addons = result.get("addons", [])
+        if not addons:
+            return "No add-ons match."
+        lines = [f"{len(addons)} add-on(s):"]
+        for a in addons:
+            ver = a.get("version")
+            ver = ".".join(str(x) for x in ver) if isinstance(ver, (list, tuple)) else ver
+            lines.append(f"  {a.get('module')}  {a.get('name')} {ver or ''}  [{a.get('category', '')}]"
+                         f"  enabled={a.get('enabled')} prefs={a.get('has_preferences')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def enable_addon(ctx: Context, module: str, persist: bool = False) -> str:
+    """
+    Enable an add-on by module name (addon_utils.enable), e.g. "rigify",
+    "io_anim_bvh", "node_wrangler", "cycles".
+
+    Parameters:
+    - module: Add-on module name (see list_addons)
+    - persist: True also saves userpref.blend (consent rule; default False)
+
+    Reply: the add-on's bl_info, or the error text if enabling fails.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("enable_addon", {"module": module, "persist": persist})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        info = result.get("bl_info", {})
+        ver = info.get("version")
+        ver = ".".join(str(x) for x in ver) if isinstance(ver, (list, tuple)) else ver
+        return (f"Enabled '{module}': {info.get('name')} {ver or ''} ({info.get('category')}). "
+                f"Preferences {'persisted' if result.get('persisted') else 'not persisted'}"
+                f"{' (dirty)' if result.get('preferences_dirty') else ''}."
+                + (f" Persist error: {result['persist_error']}" if result.get("persist_error") else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def disable_addon(ctx: Context, module: str, persist: bool = False) -> str:
+    """
+    Disable an add-on by module name (addon_utils.disable).
+
+    Parameters:
+    - module: Add-on module name
+    - persist: True also saves userpref.blend (consent rule; default False)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("disable_addon", {"module": module, "persist": persist})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Disabled '{module}' (enabled now: {result.get('enabled')}). "
+                f"Preferences {'persisted' if result.get('persisted') else 'not persisted'}."
+                + (f" Warnings: {result['warnings']}" if result.get("warnings") else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_addon_preferences(ctx: Context, module: str) -> str:
+    """
+    Read an add-on's preferences (same data as get_settings(scope="ADDON:<module>")).
+
+    Parameters:
+    - module: Add-on module name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_addon_preferences", {"module": module})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_addon_preferences(ctx: Context, module: str, values: str, persist: bool = False) -> str:
+    """
+    Write an add-on's preferences (same machinery as set_settings(scope="ADDON:<module>")).
+
+    Parameters:
+    - module: Add-on module name
+    - values: JSON object of property -> value
+    - persist: True also saves userpref.blend (consent rule; default False)
+    """
+    vals = _parse_json_object(values, "values")
+    if isinstance(vals, str):
+        return vals
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_addon_preferences", {"module": module, "values": vals, "persist": persist})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _settings_reply(f"'{module}' preferences:", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def save_preferences(ctx: Context, confirm: bool = False) -> str:
+    """
+    Write Blender's user preferences to userpref.blend (wm.save_userpref).
+    Refuses without confirm=True and reports preferences.is_dirty and
+    use_preferences_save so you can decide.
+
+    Parameters:
+    - confirm: Must be True to actually save
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("save_preferences", {"confirm": confirm})
+        if "error" in result:
+            extra = ""
+            if "preferences_dirty" in result:
+                extra = (f" (preferences_dirty={result.get('preferences_dirty')}, "
+                         f"use_preferences_save={result.get('use_preferences_save')})")
+            return f"Error: {result['error']}{extra}"
+        return (f"Preferences {'saved to userpref.blend' if result.get('persisted') else 'NOT saved'}; "
+                f"preferences_dirty={result.get('preferences_dirty')}, "
+                f"use_preferences_save={result.get('use_preferences_save')}.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_workspaces(ctx: Context) -> str:
+    """
+    List workspaces with the area types each one contains, and the current workspace.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_workspaces")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        lines = [f"Current: {result.get('current') or 'none (headless)'}"]
+        for ws in result.get("workspaces", []):
+            lines.append(f"  {ws.get('name')}: {', '.join(ws.get('areas', [])) or 'no areas'}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_workspace(ctx: Context, name: str) -> str:
+    """
+    Switch the active workspace, e.g. set_workspace("Layout") to guarantee a 3D
+    view for the capture tools. Needs a GUI session.
+
+    Parameters:
+    - name: Workspace name (see list_workspaces)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_workspace", {"name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return f"Workspace: {result.get('workspace', name)} (areas: {', '.join(result.get('areas', []))})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_addon_settings(ctx: Context) -> str:
+    """
+    Read the BlenderMCP add-on's own preferences: port, autostart_server and
+    which API keys are set (keys are never echoed back; each shows set true/false).
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_addon_settings")
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_addon_settings(ctx: Context, values: str, persist: bool = False) -> str:
+    """
+    Change the BlenderMCP add-on's own preferences.
+
+    Parameters:
+    - values: JSON object, e.g. '{"port": 9877, "autostart_server": true,
+              "hyper3d_api_key": "..."}'. API keys are write-only: the reply says
+              set true/false per key, never the value. A port change applies when
+              the add-on's server is restarted (Disconnect / Connect).
+    - persist: True also saves userpref.blend (consent rule; default False)
+    """
+    vals = _parse_json_object(values, "values")
+    if isinstance(vals, str):
+        return vals
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_addon_settings", {"values": vals, "persist": persist})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = _settings_reply(
+            f"Add-on settings: port={result.get('port')} autostart_server={result.get('autostart_server')} "
+            f"keys set={result.get('keys')}.", result)
+        if result.get("note"):
+            msg += f" {result['note']}."
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -3061,24 +5365,33 @@ def parent_object(
     child_name: str,
     parent_name: str,
     keep_transform: bool = True,
+    parent_type: str = "OBJECT",
+    bone: str = None,
 ) -> str:
     """
-    Parent one object to another, creating a hierarchy.
+    Parent one object to another, creating a hierarchy. For binding a mesh to an
+    armature with weights use bind_armature instead.
 
     Parameters:
     - child_name: Object that becomes the child
     - parent_name: Object that becomes the parent
     - keep_transform: Preserve the child's world-space position (default True)
+    - parent_type: OBJECT (default) or BONE (parent to one bone of an armature)
+    - bone: Bone name, required when parent_type is BONE
     """
     try:
+        pt = (parent_type or "OBJECT").strip().upper()
+        if pt == "BONE" and not bone:
+            return "Error: parent_type=BONE needs a bone name"
         blender = get_blender_connection()
         result = blender.send_command("parent_object", {
             "child_name": child_name, "parent_name": parent_name,
-            "keep_transform": keep_transform,
+            "keep_transform": keep_transform, "parent_type": pt, "bone": bone,
         })
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Parented '{child_name}' → '{parent_name}'"
+        return (f"Parented '{result.get('child', child_name)}' -> '{result.get('parent', parent_name)}'"
+                f" ({result.get('parent_type', pt)}" + (f", bone '{result.get('bone', bone)}'" if result.get("bone") or pt == "BONE" else "") + ")")
     except Exception as e:
         return f"Error: {e}"
 
@@ -3309,7 +5622,9 @@ def boolean_operation(
     - target_name: Object to modify (the base mesh)
     - cutter_name: Object used as the cutting/joining tool
     - operation: DIFFERENCE (subtract), UNION (merge), INTERSECT (keep overlap)
-    - solver: EXACT (better quality) or FAST (faster but less reliable)
+    - solver: EXACT (default), FAST or FLOAT (the fast solver: FAST on Blender 4.x,
+              FLOAT on 5.x, either name accepted), MANIFOLD (Blender 5.2+ only).
+              The reply reports the solver id actually used.
     - apply: If True (default), applies the modifier and deletes the cutter object
     """
     try:
@@ -3321,7 +5636,8 @@ def boolean_operation(
         if "error" in result:
             return f"Error: {result['error']}"
         return (f"Boolean {operation}: '{target_name}' ∩/− '{cutter_name}' "
-                f"({'applied' if apply else 'modifier added only'})")
+                f"({'applied' if apply else 'modifier added only'})"
+                + (f", solver={result['solver']}" if result.get("solver") else ""))
     except Exception as e:
         return f"Error: {e}"
 
@@ -3338,18 +5654,44 @@ def set_render_settings(
     output_path: str = None,
     file_format: str = None,
     transparent_background: bool = None,
+    fps: float = None,
+    fps_base: float = None,
+    frame_start: int = None,
+    frame_end: int = None,
+    resolution_percentage: int = None,
+    color_mode: str = None,
+    color_depth: str = None,
+    compression: int = None,
+    denoise: bool = None,
+    device: str = None,
+    use_persistent_data: bool = None,
+    use_simplify: bool = None,
+    simplify_subdivision: int = None,
 ) -> str:
     """
-    Configure scene render settings.
+    Configure scene render settings. Only the parameters you pass are changed.
+    Every value is validated against Blender's own property definitions (the
+    same path as set_settings(scope="RENDER")); rejected values are listed.
 
     Parameters:
-    - engine: CYCLES (ray-traced, photorealistic), BLENDER_EEVEE (real-time),
-              BLENDER_WORKBENCH (solid view)
+    - engine: CYCLES, BLENDER_EEVEE (alias EEVEE; the 4.x id BLENDER_EEVEE_NEXT
+              is accepted), BLENDER_WORKBENCH. The reply reports the engine id
+              actually set.
     - width / height: Render resolution in pixels
     - samples: Number of render samples (affects quality/noise)
     - output_path: File path for saved renders (e.g. "C:/renders/frame_####.png")
-    - file_format: PNG, JPEG, EXR, TIFF
+    - file_format: PNG, JPEG, OPEN_EXR (EXR accepted), TIFF, BMP, FFMPEG (video)
     - transparent_background: True to render with alpha instead of background colour
+    - fps / fps_base: Frame rate (fps=24, fps_base=1.001 for 23.976)
+    - frame_start / frame_end: Scene frame range
+    - resolution_percentage: 1-100 (render at a fraction of width x height)
+    - color_mode: BW, RGB or RGBA
+    - color_depth: 8 or 16 (PNG/TIFF), 16 or 32 (OPEN_EXR), as a string
+    - compression: PNG compression 0-100
+    - denoise: Cycles denoising on/off
+    - device: Cycles render device, CPU or GPU
+    - use_persistent_data: Keep render data between frames (faster animations)
+    - use_simplify / simplify_subdivision: Simplify toggle and max subdivision level
     """
     try:
         blender = get_blender_connection()
@@ -3358,18 +5700,911 @@ def set_render_settings(
             "samples": samples, "output_path": output_path,
             "file_format": file_format,
             "transparent_background": transparent_background,
+            "fps": fps, "fps_base": fps_base,
+            "frame_start": frame_start, "frame_end": frame_end,
+            "resolution_percentage": resolution_percentage,
+            "color_mode": color_mode, "color_depth": color_depth,
+            "compression": compression, "denoise": denoise, "device": device,
+            "use_persistent_data": use_persistent_data,
+            "use_simplify": use_simplify, "simplify_subdivision": simplify_subdivision,
         })
         if "error" in result:
             return f"Error: {result['error']}"
-        return (f"Render settings: engine={result['engine']}, "
-                f"resolution={result['resolution']}, "
-                f"transparent={result['transparent']}, "
-                f"output={result['output']}")
+        msg = (f"Render settings: engine={result.get('engine', engine)}, "
+               f"resolution={result.get('resolution')}, "
+               f"transparent={result.get('transparent')}, "
+               f"output={result.get('output')}")
+        if result.get("set"):
+            msg += f". Set: {result['set']}"
+        if result.get("unset"):
+            msg += f". Could not set: {result['unset']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ─── Rigging ─────────────────────────────────────────────────────────────────
+
+# ─── Rigging: armatures, skinning, pose, constraints (B1-S L2) ───────────────
+# Rigging doc 3.1 Tier 1, non-image tools. Rotations from the client are DEGREES
+# (converted by the add-on, same as add_keyframe). Lists are comma strings, structured
+# data JSON strings, parsed here and sent as native types.
+
+def _parse_json_any(text: str, label: str):
+    """Parse a JSON argument (object or list); returns the value or an 'Error: ...' string."""
+    if text is None or str(text).strip() == "":
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        return f"Error: {label} is not valid JSON ({e.msg} at position {e.pos})"
+
+
+def _parse_vec3(text, label: str):
+    """'x,y,z' -> [x, y, z] floats; None stays None; returns an 'Error: ...' string on bad input."""
+    if text is None or str(text).strip() == "":
+        return None
+    try:
+        parts = [float(v) for v in str(text).split(",") if v.strip()]
+    except ValueError:
+        return f"Error: {label} must be three numbers 'x,y,z'"
+    if len(parts) != 3:
+        return f"Error: {label} must be three numbers 'x,y,z', got {len(parts)}"
+    return parts
+
+
+def _set_unset_reply(prefix: str, result: dict) -> str:
+    msg = prefix
+    if result.get("set"):
+        msg += f" Set: {result['set']}."
+    if result.get("unset"):
+        msg += f" Could not set: {result['unset']}."
+    if result.get("warnings"):
+        msg += f" Warnings: {result['warnings']}."
+    return msg.strip()
+
+
+@mcp.tool()
+def create_armature(
+    ctx: Context,
+    name: str,
+    location: str = "0,0,0",
+    display_type: str = "OCTAHEDRAL",
+    show_in_front: bool = True,
+    bones: str = None,
+) -> str:
+    """
+    Create an armature object (and its data) in the active collection, optionally
+    with bones in one go.
+
+    Parameters:
+    - name: Armature object name
+    - location: "x,y,z" (default origin)
+    - display_type: OCTAHEDRAL (default), STICK, BBONE, ENVELOPE or WIRE
+    - show_in_front: Draw the bones through meshes (default True)
+    - bones: Optional JSON list exactly as add_bones takes it, e.g.
+             '[{"name": "root", "head": [0,0,0], "tail": [0,0,1]},
+               {"name": "spine", "head": [0,0,1], "tail": [0,0,2], "parent": "root", "connected": true}]'
+
+    Reply: armature name and bone count.
+    """
+    loc = _parse_vec3(location, "location")
+    if isinstance(loc, str):
+        return loc
+    bone_list = _parse_json_any(bones, "bones") if bones else None
+    if isinstance(bone_list, str):
+        return bone_list
+    if bone_list is not None and not isinstance(bone_list, list):
+        return "Error: bones must be a JSON list of bone objects"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_armature", {
+            "name": name, "location": loc, "display_type": display_type,
+            "show_in_front": show_in_front, "bones": bone_list,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _set_unset_reply(
+            f"Created armature '{result.get('name', name)}' with {result.get('bone_count', 0)} bone(s).", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def add_bones(ctx: Context, armature: str, bones: str) -> str:
+    """
+    Add bones to an armature in one edit-mode session.
+
+    Parameters:
+    - armature: Armature object name
+    - bones: JSON list of {"name", "head": [x,y,z], "tail": [x,y,z], "parent"?,
+             "connected"?: bool, "roll"?: degrees, "deform"?: bool, "inherit_rotation"?: bool}.
+             A parent may be an existing bone or an earlier entry in the same list.
+             connected=true snaps the head to the parent's tail (reported).
+             Name collisions get Blender's .001 suffix (reported).
+
+    Reply: created names, snapped bones, warnings.
+    """
+    bone_list = _parse_json_any(bones, "bones")
+    if isinstance(bone_list, str):
+        return bone_list
+    if not isinstance(bone_list, list) or not bone_list:
+        return "Error: bones must be a non-empty JSON list of bone objects"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_bones", {"armature": armature, "bones": bone_list})
+        if "error" in result:
+            return (f"Error: {result['error']}"
+                    + (f" (created before the error: {result['created_before_error']})" if result.get("created_before_error") else ""))
+        msg = f"Added {len(result.get('created', []))} bone(s) to '{armature}' ({result.get('bone_count')} total): {result.get('created')}"
+        if result.get("snapped"):
+            msg += f". Snapped to parent tail: {result['snapped']}"
+        if result.get("warnings"):
+            msg += f". Warnings: {result['warnings']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_armature_info(
+    ctx: Context,
+    armature: str,
+    include_pose: bool = False,
+    space: str = "WORLD",
+    bone_filter: str = None,
+) -> str:
+    """
+    THE perceive tool for a rig: every bone in hierarchy order with parent,
+    children, head, tail, length, roll (degrees), connected, deform, bone
+    collections and constraints, plus pose_position, display_type, action and the
+    bone-collection summary.
+
+    Parameters:
+    - armature: Armature object name
+    - include_pose: Add per-bone pose (location, rotation_mode, rotation in
+                    degrees or quaternion, scale, world head/tail)
+    - space: WORLD (default) or ARMATURE for head/tail coordinates
+    - bone_filter: Glob on bone names, e.g. "arm.L*" or "*spine*"
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_armature_info", {
+            "armature": armature, "include_pose": include_pose, "space": space, "bone_filter": bone_filter,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_bone_properties(
+    ctx: Context,
+    armature: str,
+    bone: str,
+    head: str = None,
+    tail: str = None,
+    roll: float = None,
+    parent: str = None,
+    connected: bool = None,
+    deform: bool = None,
+    inherit_rotation: bool = None,
+    inherit_scale: str = None,
+    new_name: str = None,
+    envelope_distance: float = None,
+    bbone_segments: int = None,
+) -> str:
+    """
+    Change one bone's rest properties. Only the parameters you pass are set.
+
+    Parameters:
+    - armature / bone: Armature object and bone name
+    - head / tail: "x,y,z" in armature space
+    - roll: Degrees
+    - parent: Parent bone name ("" to clear)
+    - connected: Snap the head to the parent's tail and keep it there
+    - deform: Whether the bone deforms skinned meshes
+    - inherit_rotation: Bool
+    - inherit_scale: FULL, FIX_SHEAR, ALIGNED, AVERAGE, NONE, NONE_LEGACY
+    - new_name: Rename the bone (vertex groups are not renamed; see rename_bones)
+    - envelope_distance: Envelope radius
+    - bbone_segments: Bendy-bone segments (1 = plain bone)
+
+    Reply: set list and unset {prop: reason}, like add_modifier.
+    """
+    h = _parse_vec3(head, "head"); t = _parse_vec3(tail, "tail")
+    if isinstance(h, str):
+        return h
+    if isinstance(t, str):
+        return t
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_bone_properties", {
+            "armature": armature, "bone": bone, "head": h, "tail": t, "roll": roll,
+            "parent": parent, "connected": connected, "deform": deform,
+            "inherit_rotation": inherit_rotation, "inherit_scale": inherit_scale,
+            "new_name": new_name, "envelope_distance": envelope_distance,
+            "bbone_segments": bbone_segments,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return _set_unset_reply(f"Bone '{result.get('bone', bone)}' on '{armature}':", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def delete_bones(ctx: Context, armature: str, bones: str, reparent_children: bool = True) -> str:
+    """
+    Delete bones in edit mode.
+
+    Parameters:
+    - armature: Armature object name
+    - bones: Comma list of bone names, or one glob like "finger*"
+    - reparent_children: Attach children of a deleted bone to its parent (default True)
+
+    Reply: deleted names and reparented names.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("delete_bones", {
+            "armature": armature, "bones": bones, "reparent_children": reparent_children,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Deleted {len(result.get('deleted', []))} bone(s) ({result.get('bone_count')} left): {result.get('deleted')}"
+        if result.get("reparented"):
+            msg += f". Reparented: {result['reparented']}"
+        if result.get("unmatched"):
+            msg += f". Not found: {result['unmatched']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def bind_armature(
+    ctx: Context,
+    mesh: str,
+    armature: str,
+    method: str = "AUTO",
+    keep_transform: bool = True,
+) -> str:
+    """
+    Skin a mesh to an armature (parent + Armature modifier + vertex groups).
+
+    Parameters:
+    - mesh: Mesh object name
+    - armature: Armature object name
+    - method: AUTO (automatic weights, default), ENVELOPE (envelope weights),
+              EMPTY_GROUPS (one empty group per bone, paint later),
+              NAME (modifier only; keeps the groups the mesh already has)
+    - keep_transform: Preserve the mesh's world transform (default True)
+
+    Reply: modifier name, vertex-group count, groups with no weighted vertices.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("bind_armature", {
+            "mesh": mesh, "armature": armature, "method": method, "keep_transform": keep_transform,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = (f"Bound '{mesh}' to '{armature}' ({result.get('method', method)}, parent_type {result.get('parent_type')}): "
+               f"modifier '{result.get('modifier')}', {result.get('group_count', 0)} vertex group(s)")
+        if result.get("empty_groups"):
+            msg += f". Groups with zero verts: {result['empty_groups']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_vertex_groups(ctx: Context, mesh: str, include_stats: bool = True) -> str:
+    """
+    List a mesh's vertex groups: name, index, lock, and with include_stats the
+    vertex count, weight min/max/mean and whether a matching bone exists on the
+    bound armature.
+
+    Parameters:
+    - mesh: Mesh object name
+    - include_stats: Compute per-group weight statistics (default True)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_vertex_groups", {"mesh": mesh, "include_stats": include_stats})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_vertex_weights(
+    ctx: Context,
+    mesh: str,
+    indices: str = None,
+    group: str = None,
+    max_verts: int = 2000,
+) -> str:
+    """
+    Read per-vertex weights: {index: {group: weight}}.
+
+    Parameters:
+    - mesh: Mesh object name
+    - indices: Comma list of vertex indices to read (default: all, up to max_verts)
+    - group: Only vertices that belong to this group
+    - max_verts: Truncate after this many vertices (default 2000; truncation is reported)
+    """
+    try:
+        idx = None
+        if indices:
+            try:
+                idx = [int(v) for v in _split_csv(indices)]
+            except ValueError:
+                return "Error: indices must be a comma list of integers"
+        blender = get_blender_connection()
+        result = blender.send_command("get_vertex_weights", {
+            "mesh": mesh, "indices": idx, "group": group, "max_verts": max_verts,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_vertex_weights(
+    ctx: Context,
+    mesh: str,
+    group: str,
+    weights: str,
+    mode: str = "REPLACE",
+    create_group: bool = True,
+) -> str:
+    """
+    Write vertex weights into one group.
+
+    Parameters:
+    - mesh: Mesh object name
+    - group: Vertex group name
+    - weights: JSON object {"index": weight, ...} or list of [index, weight] pairs
+    - mode: REPLACE (default), ADD or SUBTRACT (VertexGroup.add semantics)
+    - create_group: Create the group if it does not exist (default True)
+
+    Reply: vertices written, whether the group was created.
+    """
+    w = _parse_json_any(weights, "weights")
+    if isinstance(w, str):
+        return w
+    if isinstance(w, dict):
+        try:
+            pairs = [[int(k), float(v)] for k, v in w.items()]
+        except (TypeError, ValueError):
+            return "Error: weights object keys must be vertex indices and values numbers"
+    elif isinstance(w, list):
+        try:
+            pairs = [[int(p[0]), float(p[1])] for p in w]
+        except (TypeError, ValueError, IndexError):
+            return "Error: weights list entries must be [index, weight] pairs"
+    else:
+        return "Error: weights must be a JSON object or list"
+    if not pairs:
+        return "Error: weights is empty"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_vertex_weights", {
+            "mesh": mesh, "group": group, "weights": pairs, "mode": mode, "create_group": create_group,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Wrote {result.get('written', len(pairs))} weight(s) into '{group}' on '{mesh}' ({result.get('mode', mode)})"
+                + (" (group created)" if result.get("group_created") else "") + ".")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find_unweighted_vertices(
+    ctx: Context,
+    mesh: str,
+    tolerance: float = 0.001,
+    render: bool = False,
+    angle: str = "front",
+):
+    """
+    Find vertices whose total deform weight is below tolerance, plus vertices with
+    any weight above 1 or below 0. Returns the numbers, or with render=True an
+    image of those vertices selected in edit mode from a named viewport angle
+    (mode and selection restored; needs a GUI session).
+
+    Parameters:
+    - mesh: Mesh object name
+    - tolerance: Total-weight threshold (default 0.001)
+    - render: True returns an image instead of the numbers (default False)
+    - angle: front, back, left, right, top, bottom, iso_front_right, iso_front_left
+
+    Reply (render=False): counts and up to 500 indices per category as JSON.
+    """
+    if render and angle not in _VALID_ANGLES:
+        raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("find_unweighted_vertices", {
+            "mesh": mesh, "tolerance": tolerance, "render": bool(render), "angle": angle,
+        })
+        if "error" in result:
+            if render:
+                raise Exception(result["error"])
+            return f"Error: {result['error']}"
+        if not render:
+            return json.dumps({k: v for k, v in result.items() if k not in ("filepath", "image")}, indent=2)
+        img = result.get("image") or {}
+        if "error" in img:
+            raise Exception(img["error"])
+        fp = img.get("filepath") or result.get("filepath")
+        if not fp or not os.path.exists(fp):
+            raise Exception(f"the add-on reported no capture file ({result.get('unweighted_count')} unweighted vertex(es) found)")
+        return _safe_image_return(_read_and_remove(fp))
+    except Exception as e:
+        if render:
+            logger.error(f"find_unweighted_vertices error: {e}")
+            raise Exception(f"find_unweighted_vertices failed: {e}") from e
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_pose(
+    ctx: Context,
+    armature: str,
+    bones: str,
+    rotation_mode: str = "XYZ",
+    space: str = "POSE",
+    keyframe: bool = False,
+    frame: int = None,
+) -> str:
+    """
+    Pose bones by writing location / rotation / scale, optionally keying them.
+
+    Parameters:
+    - armature: Armature object name
+    - bones: JSON object {"bone": {"location": [x,y,z], "rotation": [x,y,z] degrees
+             or [w,x,y,z] quaternion, "scale": [x,y,z]}, ...}; each key optional
+    - rotation_mode: XYZ (Euler degrees, default) or QUATERNION; set on each bone
+                     before writing
+    - space: POSE (default) - values are bone-local pose values
+    - keyframe: Also insert keyframes for the channels written (default False)
+    - frame: Frame for the keyframes (default: current)
+
+    Note: a pose written on an animated bone is overwritten by the animation at the
+    next update unless keyframe=True.
+
+    Reply: bones written, rotation modes changed.
+    """
+    b = _parse_json_any(bones, "bones")
+    if isinstance(b, str):
+        return b
+    if not isinstance(b, dict) or not b:
+        return "Error: bones must be a non-empty JSON object {bone: {location/rotation/scale}}"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_pose", {
+            "armature": armature, "bones": b, "rotation_mode": rotation_mode,
+            "space": space, "keyframe": keyframe, "frame": frame,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        msg = f"Posed {len(result.get('written', []))} bone(s) on '{armature}': {result.get('written')}"
+        rmc = result.get("rotation_mode_changed")
+        if isinstance(rmc, dict) and rmc:
+            msg += ". Rotation mode changed: " + ", ".join(
+                f"{b} {c.get('from')}->{c.get('to')}" if isinstance(c, dict) else str(b) for b, c in rmc.items())
+        if result.get("keyframe"):
+            msg += f". Keyed at frame {result.get('frame', frame)}"
+        if result.get("unset"):
+            msg += f". Could not set: {result['unset']}"
+        if result.get("warning"):
+            msg += f". Warning: {result['warning']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_pose(ctx: Context, armature: str, bones: str = None, space: str = "WORLD") -> str:
+    """
+    Read the current pose: per bone location, rotation_mode, rotation (degrees
+    or quaternion), scale, world head and tail.
+
+    Parameters:
+    - armature: Armature object name
+    - bones: Comma list of bone names (default: all)
+    - space: WORLD (default) or ARMATURE for head/tail
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_pose", {
+            "armature": armature, "bones": _split_csv(bones) or None, "space": space,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def reset_pose(ctx: Context, armature: str, bones: str = None, transforms: str = "ALL") -> str:
+    """
+    Reset pose transforms to rest (identity), without needing POSE-mode operators.
+
+    Parameters:
+    - armature: Armature object name
+    - bones: Comma list of bone names (default: all)
+    - transforms: ALL (default), LOCATION, ROTATION or SCALE
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("reset_pose", {
+            "armature": armature, "bones": _split_csv(bones) or None, "transforms": transforms,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Reset {result.get('transforms', transforms)} on {len(result.get('reset', []))} bone(s) of '{armature}'."
+                + (f" Missing: {result['missing']}" if result.get("missing") else ""))
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def add_constraint(
+    ctx: Context,
+    owner: str,
+    constraint_type: str,
+    bone: str = None,
+    name: str = None,
+    params: str = None,
+) -> str:
+    """
+    Add a constraint to an object or a pose bone.
+
+    Parameters:
+    - owner: Object name (the armature when bone is given)
+    - constraint_type: IK, COPY_LOCATION, COPY_ROTATION, COPY_TRANSFORMS, DAMPED_TRACK,
+                       TRACK_TO, STRETCH_TO, LIMIT_ROTATION, LIMIT_LOCATION, CHILD_OF, ...
+                       (the error lists the valid types)
+    - bone: Pose bone name to own the constraint (default: the object)
+    - name: Constraint name (default: Blender's)
+    - params: JSON object of constraint properties, e.g. for IK:
+              '{"target": "Rig", "subtarget": "ik_hand.L", "pole_target": "Rig",
+                "pole_subtarget": "pole_elbow.L", "chain_count": 2, "pole_angle": -90}'.
+              Object-pointer properties take object names; subtarget takes a bone
+              name; angles are degrees.
+
+    Reply: constraint name, set list and unset {prop: reason}, like add_modifier.
+    """
+    p = _parse_json_object(params, "params") if params else {}
+    if isinstance(p, str):
+        return p
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_constraint", {
+            "owner": owner, "bone": bone, "constraint_type": constraint_type, "name": name, "params": p,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        where = f"'{owner}'" + (f" bone '{bone}'" if bone else "")
+        return _set_unset_reply(
+            f"Added {result.get('type', constraint_type)} constraint '{result.get('constraint')}' to {where}.", result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_constraints(ctx: Context, owner: str, bone: str = None) -> str:
+    """
+    List the constraints on an object or a pose bone: name, type, target,
+    subtarget, influence, mute, plus type-specific keys (IK: chain_count,
+    pole_target, pole_subtarget, pole_angle_deg, use_tail).
+
+    Parameters:
+    - owner: Object name (the armature when bone is given)
+    - bone: Pose bone name (default: the object's own constraints)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_constraints", {"owner": owner, "bone": bone})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def remove_constraint(ctx: Context, owner: str, name: str, bone: str = None) -> str:
+    """
+    Remove a constraint by name from an object or a pose bone.
+
+    Parameters:
+    - owner: Object name (the armature when bone is given)
+    - name: Constraint name (see get_constraints)
+    - bone: Pose bone name (default: the object)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("remove_constraint", {"owner": owner, "bone": bone, "name": name})
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return (f"Removed constraint '{result.get('removed', name)}' from '{owner}'" + (f" bone '{bone}'" if bone else "")
+                + f". Remaining: {result.get('remaining', [])}")
     except Exception as e:
         return f"Error: {e}"
 
 
 # ─── Animation ────────────────────────────────────────────────────────────────
+
+# set_scene_frame_range from the rigging doc is NOT added: set_frame_range (B0, C11)
+# already covers it and Ton's handler accepts both spellings.
+
+@mcp.tool()
+def set_keyframes(
+    ctx: Context,
+    target: str,
+    data_path: str,
+    keys: str,
+    bone: str = None,
+    replace: bool = True,
+) -> str:
+    """
+    Insert many keyframes on one property in a single call.
+
+    Parameters:
+    - target: Object name (the armature when bone is given)
+    - data_path: 'location', 'rotation_euler', 'scale', or any animatable path
+    - keys: JSON list of [frame, value] pairs or objects
+            {"frame", "value", "interpolation"?, "easing"?}. value follows
+            add_keyframe's rules: a number for a scalar, [x,y,z] for a vector,
+            rotations in degrees. interpolation BEZIER/LINEAR/CONSTANT, easing
+            AUTO/EASE_IN/EASE_OUT/EASE_IN_OUT.
+    - bone: Pose bone name to key instead of the object (rotation_mode switched
+            to XYZ for Euler paths, reported)
+    - replace: Overwrite existing keys on those frames (default True)
+
+    Reply: keyed count, action name, fcurve path.
+    """
+    k = _parse_json_any(keys, "keys")
+    if isinstance(k, str):
+        return k
+    if not isinstance(k, list) or not k:
+        return "Error: keys must be a non-empty JSON list of [frame, value] pairs or key objects"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_keyframes", {
+            "target": target, "bone": bone, "data_path": data_path, "keys": k, "replace": replace,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        where = f"'{target}'" + (f" bone '{bone}'" if bone else "")
+        keyed = result.get("keyed")
+        count = result.get("keyed_count", len(keyed) if isinstance(keyed, (list, tuple)) else (keyed if isinstance(keyed, int) else len(k)))
+        msg = (f"Keyed {count} frame(s) on {where}.{data_path} "
+               f"(action '{result.get('action')}', fcurves {result.get('fcurves', [data_path])})")
+        rmc = result.get("rotation_mode_changed")
+        if isinstance(rmc, dict) and rmc:
+            msg += f". Rotation mode switched {rmc.get('from')} -> {rmc.get('to')}"
+        elif rmc:
+            msg += ". Rotation mode switched to XYZ"
+        if result.get("skipped"):
+            msg += f". Skipped: {result['skipped']}"
+        return msg
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_animation_info(
+    ctx: Context,
+    target: str = None,
+    include_keys: bool = False,
+    max_keys: int = 200,
+) -> str:
+    """
+    Animation overview. Without target: scene fps, frame range, current frame and
+    every action with its users. With target: its action, fcurves (data_path,
+    index, keyframe_count, frame_range), NLA tracks and shape-key action; with
+    include_keys each fcurve lists [frame, value, interpolation] up to max_keys.
+    Works on both the legacy F-curve API (4.x) and slotted actions (5.x).
+
+    Parameters:
+    - target: Object name (default: scene summary)
+    - include_keys: Include the keyframes per fcurve (default False)
+    - max_keys: Cap per fcurve when include_keys (default 200)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_animation_info", {
+            "target": target, "include_keys": include_keys, "max_keys": max_keys,
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def bake_action(
+    ctx: Context,
+    armature: str,
+    start: int = None,
+    end: int = None,
+    step: int = 1,
+    bones: str = None,
+    visual_keying: bool = True,
+    clear_constraints: bool = False,
+    clear_parents: bool = False,
+    only_selected: bool = True,
+    bake_types: str = "POSE",
+) -> str:
+    """
+    Bake the rig's motion (constraints, IK, drivers) into plain keyframes
+    (bpy.ops.nla.bake in POSE mode). Do this before exporting to a game engine.
+
+    Parameters:
+    - armature: Armature object name
+    - start / end: Frame range (default: scene range)
+    - step: Frame step (default 1)
+    - bones: Comma list of bones to bake (default: all)
+    - visual_keying: Bake the evaluated (constrained) transforms (default True)
+    - clear_constraints: Remove constraints after baking (default False)
+    - clear_parents: Clear bone parents after baking (default False)
+    - only_selected: Bake only the listed/selected bones (default True)
+    - bake_types: POSE (default), OBJECT, "POSE,OBJECT" or "both"
+
+    Reply: action name, frame range, fcurve count. Mode and selection are restored.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("bake_action", {
+            "armature": armature, "start": start, "end": end, "step": step,
+            "bones": bones or None, "visual_keying": visual_keying,
+            "clear_constraints": clear_constraints, "clear_parents": clear_parents,
+            "only_selected": only_selected, "bake_types": bake_types or "POSE",
+        })
+        if "error" in result:
+            return f"Error: {result['error']}"
+        fr = result.get("baked_range") or result.get("frame_range")
+        bones_done = result.get("bones")
+        bones_txt = ("all bones" if bones_done == "all" else f"{len(bones_done)} bone(s)" if isinstance(bones_done, list) else "")
+        return (f"Baked '{armature}' into action '{result.get('action')}'"
+                + (f" frames {fr[0]}-{fr[1]}" if isinstance(fr, (list, tuple)) and len(fr) == 2 else "")
+                + (f" step {result['step']}" if result.get("step") else "")
+                + f" ({', '.join(result.get('bake_types', [])) or bake_types}): {result.get('fcurve_count')} fcurve(s)"
+                + (f", {bones_txt}" if bones_txt else "")
+                + (f", animated: {result['animated_bones']}" if result.get("animated_bones") else "") + ".")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def playblast(
+    ctx: Context,
+    start: int = None,
+    end: int = None,
+    step: int = None,
+    frames: str = None,
+    camera: str = None,
+    max_size: int = 640,
+    columns: int = 4,
+    video_path: str = None,
+    overlay: str = None,
+) -> Image:
+    """
+    See motion: capture frames across the range and return one labelled contact
+    sheet. In a GUI session each frame is a viewport capture; headless it is an
+    EEVEE render of the camera. Optionally also writes an MP4.
+
+    Parameters:
+    - start / end: Frame range (default: scene range)
+    - step: Frame step; omit for the add-on's largest step that keeps <= 16 tiles
+    - frames: Explicit comma list of frames (overrides start/end/step)
+    - camera: Camera to look through (default: scene camera / current view)
+    - max_size: Tile size in pixels (default 640)
+    - columns: Sheet columns (default 4)
+    - video_path: Also write an MP4 (FFMPEG H.264) of the full range; Blender appends
+                  the frame range to the file stem
+    - overlay: bones_in_front, wireframe or weight_paint (see capture_viewport_angle)
+
+    The current frame is restored afterwards.
+    """
+    try:
+        _check_overlay(overlay)
+        if frames:
+            try:
+                [int(f) for f in _split_csv(frames)]
+            except ValueError:
+                raise Exception("frames must be a comma list of integers")
+        blender = get_blender_connection()
+        result = blender.send_command("playblast", {
+            "start": start, "end": end, "step": step, "frames": frames or None,
+            "camera": camera, "max_size": max_size, "columns": columns,
+            "video_path": video_path, "overlay": overlay,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        images = result.get("images") or []
+        if isinstance(images, dict):
+            images = [{"frame": fr, **(v if isinstance(v, dict) else {"filepath": v})} for fr, v in images.items()]
+        shots = [(im.get("frame"), im.get("filepath")) for im in images if isinstance(im, dict)]
+        shots = [(f, fp) for f, fp in shots if fp and os.path.exists(fp)]
+        if not shots:
+            raise Exception(f"No frames were captured (path {result.get('path')}, warnings {result.get('warnings')})")
+        try:
+            if not _PIL_AVAILABLE or len(shots) == 1:
+                with open(shots[0][1], "rb") as f:
+                    return _safe_image_return(f.read())
+            tiles, labels = [], []
+            for fr, fp in shots:
+                with PILImage.open(fp) as im:
+                    im.load()
+                    tiles.append(im.convert("RGB"))
+                labels.append(f"f{fr}")
+            tile_w = max_size
+            tile_h = max(1, int(tile_w * tiles[0].height / max(1, tiles[0].width)))
+            sheet = _compose_grid(tiles, columns=max(1, columns), tile_w=tile_w, tile_h=tile_h, labels=labels)
+            logger.info(f"playblast: {len(shots)} frames, path={result.get('path')}, video={result.get('video')}, "
+                        f"warnings={result.get('warnings')}")
+            return _safe_image_return(_pil_to_png_bytes(sheet))
+        finally:
+            _remove_quiet(*[fp for _, fp in shots])
+    except Exception as e:
+        logger.error(f"playblast error: {e}")
+        raise Exception(f"playblast failed: {e}") from e
+
+
+@mcp.tool()
+def render_weight_map(
+    ctx: Context,
+    mesh: str,
+    group: str,
+    angle: str = "front",
+    max_size: int = 800,
+    show_zero_weights: bool = True,
+) -> Image:
+    """
+    See a vertex group's weights as Blender's weight-paint heat map (blue 0 to
+    red 1) from a named viewport angle. Mode and viewport state are restored.
+
+    Parameters:
+    - mesh: Mesh object name
+    - group: Vertex group to display
+    - angle: front, back, left, right, top, bottom, iso_front_right, iso_front_left
+    - max_size: Maximum pixel dimension (default 800)
+    - show_zero_weights: Draw unweighted vertices in black (default True)
+    """
+    try:
+        if angle not in _VALID_ANGLES:
+            raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
+        blender = get_blender_connection()
+        result = blender.send_command("render_weight_map", {
+            "mesh": mesh, "group": group, "angle": angle, "max_size": max_size,
+            "show_zero_weights": show_zero_weights,
+        })
+        if "error" in result:
+            raise Exception(result["error"])
+        fp = result.get("filepath")
+        if not fp or not os.path.exists(fp):
+            raise Exception("the add-on reported no capture file")
+        return _safe_image_return(_read_and_remove(fp))
+    except Exception as e:
+        logger.error(f"render_weight_map error: {e}")
+        raise Exception(f"render_weight_map failed: {e}") from e
+
 
 @mcp.tool()
 def add_keyframe(
@@ -3378,18 +6613,22 @@ def add_keyframe(
     data_path: str = "location",
     frame: int = None,
     value: str = None,
+    bone: str = None,
 ) -> str:
     """
-    Insert an animation keyframe on an object property.
+    Insert an animation keyframe on an object or pose-bone property.
 
     Parameters:
-    - name: Object name
-    - data_path: Property to key — 'location', 'rotation_euler', 'scale',
-                 or any animatable path like 'data.energy'
+    - name: Object name (the armature when bone is given)
+    - data_path: Property to key: 'location', 'rotation_euler', 'scale', or any
+                 animatable path like 'data.energy'
     - frame: Frame number (uses current frame if omitted)
     - value: Value(s) to set before keying: "1,2,3" for a vector property such as
              location, or a single number such as "500" for a scalar like data.energy.
              Rotation values are in degrees and converted automatically.
+    - bone: Pose bone name to key instead of the object. Keying rotation_euler on a
+            bone (or object) in quaternion/axis-angle mode switches it to XYZ
+            Euler, and the reply says so.
     """
     try:
         blender = get_blender_connection()
@@ -3399,12 +6638,20 @@ def add_keyframe(
             val = parts[0] if len(parts) == 1 else parts
         result = blender.send_command("add_keyframe", {
             "name": name, "data_path": data_path,
-            "frame": frame, "value": val,
+            "frame": frame, "value": val, "bone": bone,
         })
         if "error" in result:
             return f"Error: {result['error']}"
-        return (f"Keyframe on '{name}.{data_path}' at frame {result['frame']}"
-                + (f" = {val}" if val else ""))
+        target = f"'{name}'" + (f" bone '{bone}'" if bone else "")
+        msg = f"Keyframe on {target}.{data_path} at frame {result.get('frame')}" + (f" = {val}" if val is not None else "")
+        rmc = result.get("rotation_mode_changed")
+        if isinstance(rmc, dict):
+            msg += f". Rotation mode switched {rmc.get('from')} -> {rmc.get('to')}"
+        elif rmc:
+            msg += f". Rotation mode switched to {result.get('rotation_mode', 'XYZ')}"
+        if result.get("action"):
+            msg += f" (action '{result['action']}'" + (f", {result['fcurve_count']} fcurves" if result.get("fcurve_count") is not None else "") + ")"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -3513,7 +6760,7 @@ async def load_img_to_3d_model(ctx: Context, model_dir: str = None, timeout: flo
     """
     global _img_to_3d_process
     if _img_to_3d_process is not None and _img_to_3d_process.poll() is None:
-        return f"Image-to-3D server is already running on port {_IMG_TO_3D_PORT}"
+        return f"Image-to-3D server is already running on port {_img_to_3d_port()}"
 
     server_script = _find_img_to_3d_script()
     if server_script is None:
@@ -3523,7 +6770,7 @@ async def load_img_to_3d_model(ctx: Context, model_dir: str = None, timeout: flo
     env = {**os.environ}
     if model_dir:
         env["IMG_TO_3D_MODEL_DIR"] = model_dir
-    env["IMG_TO_3D_PORT"] = str(_IMG_TO_3D_PORT)
+    env["IMG_TO_3D_PORT"] = str(_img_to_3d_port())
     python = os.environ.get("IMG_TO_3D_PYTHON") or sys.executable
     log_path = os.path.join(tempfile.gettempdir(), "img_to_3d_server.log")
 
@@ -3546,9 +6793,9 @@ async def load_img_to_3d_model(ctx: Context, model_dir: str = None, timeout: flo
             _img_to_3d_process = None
             return f"Image-to-3D server exited on startup (code {code}). See {log_path}"
         try:
-            r = await asyncio.to_thread(_requests.get, f"{_IMG_TO_3D_URL}/status", timeout=1)
+            r = await asyncio.to_thread(_requests.get, f"{_img_to_3d_url()}/status", timeout=1)
             if r.status_code == 200:
-                return (f"Image-to-3D server started on port {_IMG_TO_3D_PORT} "
+                return (f"Image-to-3D server started on port {_img_to_3d_port()} "
                         f"(pid {_img_to_3d_process.pid}, log {log_path})")
         except Exception:
             pass
@@ -3620,7 +6867,7 @@ async def generate_3d_from_image(
 
         resp = await asyncio.to_thread(
             _requests.post,
-            f"{_IMG_TO_3D_URL}/generate",
+            f"{_img_to_3d_url()}/generate",
             files={"image": (os.path.basename(image_path), img_bytes)},
             data={
                 "foreground_ratio": str(foreground_ratio),

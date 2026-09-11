@@ -1,0 +1,4595 @@
+[
+ {
+  "description": "\nAdd a classic 3-point lighting rig (key, fill, back/rim) centred on a subject.\n\nParameters:\n- subject_name: Object to light (uses scene origin if omitted)\n- key_energy: Key light power in watts (default 1500)\n- fill_energy: Fill light power in watts (default 500)\n- back_energy: Back/rim light power in watts (default 800)\n",
+  "inputSchema": {
+   "properties": {
+    "back_energy": {
+     "default": 800.0,
+     "title": "Back Energy",
+     "type": "number"
+    },
+    "fill_energy": {
+     "default": 500.0,
+     "title": "Fill Energy",
+     "type": "number"
+    },
+    "key_energy": {
+     "default": 1500.0,
+     "title": "Key Energy",
+     "type": "number"
+    },
+    "subject_name": {
+     "default": null,
+     "title": "Subject Name",
+     "type": "string"
+    }
+   },
+   "title": "add_3point_lightingArguments",
+   "type": "object"
+  },
+  "name": "add_3point_lighting"
+ },
+ {
+  "description": "\nAdd bones to an armature in one edit-mode session.\n\nParameters:\n- armature: Armature object name\n- bones: JSON list of {\"name\", \"head\": [x,y,z], \"tail\": [x,y,z], \"parent\"?,\n         \"connected\"?: bool, \"roll\"?: degrees, \"deform\"?: bool, \"inherit_rotation\"?: bool}.\n         A parent may be an existing bone or an earlier entry in the same list.\n         connected=true snaps the head to the parent's tail (reported).\n         Name collisions get Blender's .001 suffix (reported).\n\nReply: created names, snapped bones, warnings.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bones": {
+     "title": "Bones",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature",
+    "bones"
+   ],
+   "title": "add_bonesArguments",
+   "type": "object"
+  },
+  "name": "add_bones"
+ },
+ {
+  "description": "\nAdd a constraint to an object or a pose bone.\n\nParameters:\n- owner: Object name (the armature when bone is given)\n- constraint_type: IK, COPY_LOCATION, COPY_ROTATION, COPY_TRANSFORMS, DAMPED_TRACK,\n                   TRACK_TO, STRETCH_TO, LIMIT_ROTATION, LIMIT_LOCATION, CHILD_OF, ...\n                   (the error lists the valid types)\n- bone: Pose bone name to own the constraint (default: the object)\n- name: Constraint name (default: Blender's)\n- params: JSON object of constraint properties, e.g. for IK:\n          '{\"target\": \"Rig\", \"subtarget\": \"ik_hand.L\", \"pole_target\": \"Rig\",\n            \"pole_subtarget\": \"pole_elbow.L\", \"chain_count\": 2, \"pole_angle\": -90}'.\n          Object-pointer properties take object names; subtarget takes a bone\n          name; angles are degrees.\n\nReply: constraint name, set list and unset {prop: reason}, like add_modifier.\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "constraint_type": {
+     "title": "Constraint Type",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "owner": {
+     "title": "Owner",
+     "type": "string"
+    },
+    "params": {
+     "default": null,
+     "title": "Params",
+     "type": "string"
+    }
+   },
+   "required": [
+    "owner",
+    "constraint_type"
+   ],
+   "title": "add_constraintArguments",
+   "type": "object"
+  },
+  "name": "add_constraint"
+ },
+ {
+  "description": "\nInsert an animation keyframe on an object or pose-bone property.\n\nParameters:\n- name: Object name (the armature when bone is given)\n- data_path: Property to key: 'location', 'rotation_euler', 'scale', or any\n             animatable path like 'data.energy'\n- frame: Frame number (uses current frame if omitted)\n- value: Value(s) to set before keying: \"1,2,3\" for a vector property such as\n         location, or a single number such as \"500\" for a scalar like data.energy.\n         Rotation values are in degrees and converted automatically.\n- bone: Pose bone name to key instead of the object. Keying rotation_euler on a\n        bone (or object) in quaternion/axis-angle mode switches it to XYZ\n        Euler, and the reply says so.\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "data_path": {
+     "default": "location",
+     "title": "Data Path",
+     "type": "string"
+    },
+    "frame": {
+     "default": null,
+     "title": "Frame",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "value": {
+     "default": null,
+     "title": "Value",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "add_keyframeArguments",
+   "type": "object"
+  },
+  "name": "add_keyframe"
+ },
+ {
+  "description": "\nAdd a light to the Blender scene.\n\nParameters:\n- light_type: POINT, SUN, SPOT, or AREA\n- name: Name for the light object (optional)\n- location: Comma-separated x,y,z (default \"0,0,5\")\n- energy: Light power in watts (default 1000)\n- color: Comma-separated r,g,b in 0..1 range (default \"1,1,1\")\n- radius: Shadow soft radius (default 0.1)\n",
+  "inputSchema": {
+   "properties": {
+    "color": {
+     "default": "1,1,1",
+     "title": "Color",
+     "type": "string"
+    },
+    "energy": {
+     "default": 1000.0,
+     "title": "Energy",
+     "type": "number"
+    },
+    "light_type": {
+     "default": "POINT",
+     "title": "Light Type",
+     "type": "string"
+    },
+    "location": {
+     "default": "0,0,5",
+     "title": "Location",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "radius": {
+     "default": 0.1,
+     "title": "Radius",
+     "type": "number"
+    }
+   },
+   "title": "add_lightArguments",
+   "type": "object"
+  },
+  "name": "add_light"
+ },
+ {
+  "description": "\nAdd a modifier to an object with optional parameters.\n\nParameters:\n- name: Object name\n- modifier_type: MIRROR, BEVEL, ARRAY, SOLIDIFY, SUBSURF, DECIMATE,\n                 DISPLACE, SHRINKWRAP, WIREFRAME, SKIN, LATTICE, CAST, etc.\n- modifier_name: Display name for the modifier (auto-generated if omitted)\n- params: JSON string of modifier properties, e.g.:\n    MIRROR:   '{\"use_axis\": [true, false, false], \"use_clip\": true}'\n    BEVEL:    '{\"width\": 0.1, \"segments\": 3}'\n    ARRAY:    '{\"count\": 4, \"relative_offset_displace\": [1, 0, 0]}'\n    SOLIDIFY: '{\"thickness\": 0.05}'\n    SUBSURF:  '{\"levels\": 2, \"render_levels\": 3}'\n\nReturns the modifier name so you can reference it later with apply_modifier.\n",
+  "inputSchema": {
+   "properties": {
+    "modifier_name": {
+     "default": null,
+     "title": "Modifier Name",
+     "type": "string"
+    },
+    "modifier_type": {
+     "title": "Modifier Type",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "params": {
+     "default": null,
+     "title": "Params",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "modifier_type"
+   ],
+   "title": "add_modifierArguments",
+   "type": "object"
+  },
+  "name": "add_modifier"
+ },
+ {
+  "description": "\nAdd a standard mesh primitive to the Blender scene.\n\nParameters:\n- primitive_type: cube, plane, circle, sphere, ico_sphere, cylinder, cone, torus, monkey\n- location: Comma-separated x,y,z (default \"0,0,0\")\n- size: Overall size in Blender units (default 2.0)\n- name: Optional name for the new object\n- rotation: Comma-separated x,y,z rotation in degrees (default \"0,0,0\")\n",
+  "inputSchema": {
+   "properties": {
+    "location": {
+     "default": "0,0,0",
+     "title": "Location",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "primitive_type": {
+     "default": "cube",
+     "title": "Primitive Type",
+     "type": "string"
+    },
+    "rotation": {
+     "default": "0,0,0",
+     "title": "Rotation",
+     "type": "string"
+    },
+    "size": {
+     "default": 2.0,
+     "title": "Size",
+     "type": "number"
+    }
+   },
+   "title": "add_primitiveArguments",
+   "type": "object"
+  },
+  "name": "add_primitive"
+ },
+ {
+  "description": "\nAlign multiple objects' origins along one axis.\n\nParameters:\n- names: Comma-separated object names\n- axis: X, Y, or Z\n- align_to: FIRST, LAST, MIN, MAX, AVERAGE\n",
+  "inputSchema": {
+   "properties": {
+    "align_to": {
+     "default": "FIRST",
+     "title": "Align To",
+     "type": "string"
+    },
+    "axis": {
+     "default": "X",
+     "title": "Axis",
+     "type": "string"
+    },
+    "names": {
+     "title": "Names",
+     "type": "string"
+    }
+   },
+   "required": [
+    "names"
+   ],
+   "title": "align_objectsArguments",
+   "type": "object"
+  },
+  "name": "align_objects"
+ },
+ {
+  "description": "\nAppend (copy) data-blocks from another .blend into the current file via\nbpy.data.libraries.load. Use list_only=True first to see what the file holds.\n\nParameters:\n- filepath: Source .blend\n- datablocks: JSON object of what to load, e.g.\n    '{\"objects\": [\"Cube\"], \"collections\": [\"Kit\"], \"materials\": [\"Steel\"], \"node_groups\": [\"Rust\"]}'\n- names / kind: Alternative to datablocks: a comma list of names plus one kind\n    (objects, collections, materials, node_groups, meshes, images, actions, ...)\n- collection: Link appended objects into this collection (default: active)\n- instance_collections: Appended collections become collection instances\n- relative: Store the library path relative to the current file (default True)\n- list_only: True returns the file's contents per data type without loading\n",
+  "inputSchema": {
+   "properties": {
+    "collection": {
+     "default": null,
+     "title": "Collection",
+     "type": "string"
+    },
+    "datablocks": {
+     "default": null,
+     "title": "Datablocks",
+     "type": "string"
+    },
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "instance_collections": {
+     "default": false,
+     "title": "Instance Collections",
+     "type": "boolean"
+    },
+    "kind": {
+     "default": null,
+     "title": "Kind",
+     "type": "string"
+    },
+    "list_only": {
+     "default": false,
+     "title": "List Only",
+     "type": "boolean"
+    },
+    "names": {
+     "default": null,
+     "title": "Names",
+     "type": "string"
+    },
+    "relative": {
+     "default": true,
+     "title": "Relative",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "append_from_blendArguments",
+   "type": "object"
+  },
+  "name": "append_from_blend"
+ },
+ {
+  "description": "\nApply one of Blender's own Python presets (script.execute_preset), e.g. the\nbuilt-in render size presets.\n\nParameters:\n- category: Preset folder, e.g. \"render\", \"cycles/sampling\", \"cycles/viewport\",\n            \"cloth\", \"fluid\", \"camera\" (see list_blender_presets)\n- name: Preset name as listed, e.g. \"HDTV 1080p\"\n",
+  "inputSchema": {
+   "properties": {
+    "category": {
+     "title": "Category",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "category",
+    "name"
+   ],
+   "title": "apply_blender_presetArguments",
+   "type": "object"
+  },
+  "name": "apply_blender_preset"
+ },
+ {
+  "description": "\nApply a named modifier on a mesh object, collapsing it into the mesh data.\n\nParameters:\n- name: Object name\n- modifier_name: Exact modifier name as shown in Blender's Properties panel\n",
+  "inputSchema": {
+   "properties": {
+    "modifier_name": {
+     "title": "Modifier Name",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "modifier_name"
+   ],
+   "title": "apply_modifierArguments",
+   "type": "object"
+  },
+  "name": "apply_modifier"
+ },
+ {
+  "description": "\nAssign an existing material to an object's material slot.\n\nParameters:\n- object_name: Target object\n- material_name: Material to assign (must already exist)\n- slot: Material slot index (default 0)\n",
+  "inputSchema": {
+   "properties": {
+    "material_name": {
+     "title": "Material Name",
+     "type": "string"
+    },
+    "object_name": {
+     "title": "Object Name",
+     "type": "string"
+    },
+    "slot": {
+     "default": 0,
+     "title": "Slot",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "object_name",
+    "material_name"
+   ],
+   "title": "assign_materialArguments",
+   "type": "object"
+  },
+  "name": "assign_material"
+ },
+ {
+  "description": "\nBake the rig's motion (constraints, IK, drivers) into plain keyframes\n(bpy.ops.nla.bake in POSE mode). Do this before exporting to a game engine.\n\nParameters:\n- armature: Armature object name\n- start / end: Frame range (default: scene range)\n- step: Frame step (default 1)\n- bones: Comma list of bones to bake (default: all)\n- visual_keying: Bake the evaluated (constrained) transforms (default True)\n- clear_constraints: Remove constraints after baking (default False)\n- clear_parents: Clear bone parents after baking (default False)\n- only_selected: Bake only the listed/selected bones (default True)\n- bake_types: POSE (default), OBJECT, \"POSE,OBJECT\" or \"both\"\n\nReply: action name, frame range, fcurve count. Mode and selection are restored.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bake_types": {
+     "default": "POSE",
+     "title": "Bake Types",
+     "type": "string"
+    },
+    "bones": {
+     "default": null,
+     "title": "Bones",
+     "type": "string"
+    },
+    "clear_constraints": {
+     "default": false,
+     "title": "Clear Constraints",
+     "type": "boolean"
+    },
+    "clear_parents": {
+     "default": false,
+     "title": "Clear Parents",
+     "type": "boolean"
+    },
+    "end": {
+     "default": null,
+     "title": "End",
+     "type": "integer"
+    },
+    "only_selected": {
+     "default": true,
+     "title": "Only Selected",
+     "type": "boolean"
+    },
+    "start": {
+     "default": null,
+     "title": "Start",
+     "type": "integer"
+    },
+    "step": {
+     "default": 1,
+     "title": "Step",
+     "type": "integer"
+    },
+    "visual_keying": {
+     "default": true,
+     "title": "Visual Keying",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "armature"
+   ],
+   "title": "bake_actionArguments",
+   "type": "object"
+  },
+  "name": "bake_action"
+ },
+ {
+  "description": "\nSkin a mesh to an armature (parent + Armature modifier + vertex groups).\n\nParameters:\n- mesh: Mesh object name\n- armature: Armature object name\n- method: AUTO (automatic weights, default), ENVELOPE (envelope weights),\n          EMPTY_GROUPS (one empty group per bone, paint later),\n          NAME (modifier only; keeps the groups the mesh already has)\n- keep_transform: Preserve the mesh's world transform (default True)\n\nReply: modifier name, vertex-group count, groups with no weighted vertices.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "keep_transform": {
+     "default": true,
+     "title": "Keep Transform",
+     "type": "boolean"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    },
+    "method": {
+     "default": "AUTO",
+     "title": "Method",
+     "type": "string"
+    }
+   },
+   "required": [
+    "mesh",
+    "armature"
+   ],
+   "title": "bind_armatureArguments",
+   "type": "object"
+  },
+  "name": "bind_armature"
+ },
+ {
+  "description": "\nPerform a boolean operation between two mesh objects.\n\nParameters:\n- target_name: Object to modify (the base mesh)\n- cutter_name: Object used as the cutting/joining tool\n- operation: DIFFERENCE (subtract), UNION (merge), INTERSECT (keep overlap)\n- solver: EXACT (default), FAST or FLOAT (the fast solver: FAST on Blender 4.x,\n          FLOAT on 5.x, either name accepted), MANIFOLD (Blender 5.2+ only).\n          The reply reports the solver id actually used.\n- apply: If True (default), applies the modifier and deletes the cutter object\n",
+  "inputSchema": {
+   "properties": {
+    "apply": {
+     "default": true,
+     "title": "Apply",
+     "type": "boolean"
+    },
+    "cutter_name": {
+     "title": "Cutter Name",
+     "type": "string"
+    },
+    "operation": {
+     "default": "DIFFERENCE",
+     "title": "Operation",
+     "type": "string"
+    },
+    "solver": {
+     "default": "EXACT",
+     "title": "Solver",
+     "type": "string"
+    },
+    "target_name": {
+     "title": "Target Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "target_name",
+    "cutter_name"
+   ],
+   "title": "boolean_operationArguments",
+   "type": "object"
+  },
+  "name": "boolean_operation"
+ },
+ {
+  "description": "\nCapture multiple viewport angles and stitch them into a single contact sheet image.\n\nParameters:\n- angles: Comma-separated list of angle names (default: front,right,top,iso_front_right)\n- max_size: Pixel size for each individual tile (default 512)\n- overlay: Optional rig view for every tile: bones_in_front, wireframe or\n           weight_paint (see capture_viewport_angle). State restored afterwards.\n\nReturns a single composited image with all requested angles labelled.\n",
+  "inputSchema": {
+   "properties": {
+    "angles": {
+     "default": "front,right,top,iso_front_right",
+     "title": "Angles",
+     "type": "string"
+    },
+    "max_size": {
+     "default": 512,
+     "title": "Max Size",
+     "type": "integer"
+    },
+    "overlay": {
+     "default": null,
+     "title": "Overlay",
+     "type": "string"
+    }
+   },
+   "title": "capture_contact_sheetArguments",
+   "type": "object"
+  },
+  "name": "capture_contact_sheet"
+ },
+ {
+  "description": "\nCapture the Blender 3D viewport from a named angle and return it as an image.\n\nParameters:\n- angle: View direction. One of: front, back, left, right, top, bottom,\n         iso_front_right, iso_front_left\n- max_size: Maximum pixel dimension (default 800)\n- overlay: Optional rig view: bones_in_front (armatures drawn through meshes),\n           wireframe, weight_paint (active vertex group as a heat map).\n           All viewport state is restored afterwards.\n",
+  "inputSchema": {
+   "properties": {
+    "angle": {
+     "default": "front",
+     "title": "Angle",
+     "type": "string"
+    },
+    "max_size": {
+     "default": 800,
+     "title": "Max Size",
+     "type": "integer"
+    },
+    "overlay": {
+     "default": null,
+     "title": "Overlay",
+     "type": "string"
+    }
+   },
+   "title": "capture_viewport_angleArguments",
+   "type": "object"
+  },
+  "name": "capture_viewport_angle"
+ },
+ {
+  "description": "\nClose Blender. Works for an instance started with start_blender() and, via the\naddon socket, for one the user launched by hand.\n\nParameters:\n- force: If True, kills the managed process immediately instead of asking\n         Blender to quit gracefully via its Python API (default False).\n- save: If True, save the current .blend (if it has a path) before quitting.\n        Unsaved changes are otherwise discarded without a prompt.\n",
+  "inputSchema": {
+   "properties": {
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "save": {
+     "default": false,
+     "title": "Save",
+     "type": "boolean"
+    }
+   },
+   "title": "close_blenderArguments",
+   "type": "object"
+  },
+  "name": "close_blender"
+ },
+ {
+  "description": "\nCapture the current viewport from a named angle and composite it side-by-side\nwith a previously stored reference image. Both tiles keep their aspect ratio.\n\nParameters:\n- reference_name: Name given to store_reference_image earlier\n- angle: Viewport angle to capture for comparison\n- max_size: Tile size for each image in the composite\n",
+  "inputSchema": {
+   "properties": {
+    "angle": {
+     "default": "front",
+     "title": "Angle",
+     "type": "string"
+    },
+    "max_size": {
+     "default": 512,
+     "title": "Max Size",
+     "type": "integer"
+    },
+    "reference_name": {
+     "title": "Reference Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "reference_name"
+   ],
+   "title": "compare_reference_imageArguments",
+   "type": "object"
+  },
+  "name": "compare_reference_image"
+ },
+ {
+  "description": "\nCreate an armature object (and its data) in the active collection, optionally\nwith bones in one go.\n\nParameters:\n- name: Armature object name\n- location: \"x,y,z\" (default origin)\n- display_type: OCTAHEDRAL (default), STICK, BBONE, ENVELOPE or WIRE\n- show_in_front: Draw the bones through meshes (default True)\n- bones: Optional JSON list exactly as add_bones takes it, e.g.\n         '[{\"name\": \"root\", \"head\": [0,0,0], \"tail\": [0,0,1]},\n           {\"name\": \"spine\", \"head\": [0,0,1], \"tail\": [0,0,2], \"parent\": \"root\", \"connected\": true}]'\n\nReply: armature name and bone count.\n",
+  "inputSchema": {
+   "properties": {
+    "bones": {
+     "default": null,
+     "title": "Bones",
+     "type": "string"
+    },
+    "display_type": {
+     "default": "OCTAHEDRAL",
+     "title": "Display Type",
+     "type": "string"
+    },
+    "location": {
+     "default": "0,0,0",
+     "title": "Location",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "show_in_front": {
+     "default": true,
+     "title": "Show In Front",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "create_armatureArguments",
+   "type": "object"
+  },
+  "name": "create_armature"
+ },
+ {
+  "description": "\nAdd a new camera to the Blender scene.\n\nParameters:\n- name: Name for the camera object\n- location: Comma-separated x,y,z position (default \"0,-5,3\")\n- look_at: Comma-separated x,y,z target point (default \"0,0,0\")\n- lens: Focal length in mm (default 50.0)\n- cam_type: PERSP or ORTHO (default PERSP)\n",
+  "inputSchema": {
+   "properties": {
+    "cam_type": {
+     "default": "PERSP",
+     "title": "Cam Type",
+     "type": "string"
+    },
+    "lens": {
+     "default": 50.0,
+     "title": "Lens",
+     "type": "number"
+    },
+    "location": {
+     "default": "0,-5,3",
+     "title": "Location",
+     "type": "string"
+    },
+    "look_at": {
+     "default": "0,0,0",
+     "title": "Look At",
+     "type": "string"
+    },
+    "name": {
+     "default": "Camera",
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "title": "create_cameraArguments",
+   "type": "object"
+  },
+  "name": "create_camera"
+ },
+ {
+  "description": "\nCreate a new collection for scene organisation.\n\nParameters:\n- name: Collection name\n- parent_collection: Optional parent collection name (nests inside it)\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "parent_collection": {
+     "default": null,
+     "title": "Parent Collection",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "create_collectionArguments",
+   "type": "object"
+  },
+  "name": "create_collection"
+ },
+ {
+  "description": "\nCreate (or replace) a PBR material using Principled BSDF.\n\nParameters:\n- name: Material name\n- base_color: Comma-separated r,g,b in 0..1 (default \"0.8,0.8,0.8\")\n- metallic: 0.0 (dielectric) to 1.0 (fully metallic)\n- roughness: 0.0 (mirror) to 1.0 (fully rough)\n- emission_color: Comma-separated r,g,b to enable glow (e.g. \"1,0.5,0\")\n- emission_strength: Emission multiplier (default 1.0)\n- alpha: Opacity 0..1 (values < 1 enable alpha blending)\n- assign_to: Object name to auto-assign this material to (slot 0)\n",
+  "inputSchema": {
+   "properties": {
+    "alpha": {
+     "default": 1.0,
+     "title": "Alpha",
+     "type": "number"
+    },
+    "assign_to": {
+     "default": null,
+     "title": "Assign To",
+     "type": "string"
+    },
+    "base_color": {
+     "default": "0.8,0.8,0.8",
+     "title": "Base Color",
+     "type": "string"
+    },
+    "emission_color": {
+     "default": null,
+     "title": "Emission Color",
+     "type": "string"
+    },
+    "emission_strength": {
+     "default": 1.0,
+     "title": "Emission Strength",
+     "type": "number"
+    },
+    "metallic": {
+     "default": 0.0,
+     "title": "Metallic",
+     "type": "number"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "roughness": {
+     "default": 0.5,
+     "title": "Roughness",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "create_materialArguments",
+   "type": "object"
+  },
+  "name": "create_material"
+ },
+ {
+  "description": "\nDelete bones in edit mode.\n\nParameters:\n- armature: Armature object name\n- bones: Comma list of bone names, or one glob like \"finger*\"\n- reparent_children: Attach children of a deleted bone to its parent (default True)\n\nReply: deleted names and reparented names.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bones": {
+     "title": "Bones",
+     "type": "string"
+    },
+    "reparent_children": {
+     "default": true,
+     "title": "Reparent Children",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "armature",
+    "bones"
+   ],
+   "title": "delete_bonesArguments",
+   "type": "object"
+  },
+  "name": "delete_bones"
+ },
+ {
+  "description": "\nDelete an object from the scene and purge orphaned mesh/material data.\n\nParameters:\n- name: Object name to delete\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "delete_objectArguments",
+   "type": "object"
+  },
+  "name": "delete_object"
+ },
+ {
+  "description": "\nDelete a user preset file. Shipped presets cannot be deleted (a user preset\nthat shadows one can).\n\nParameters:\n- name: Preset name\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "delete_presetArguments",
+   "type": "object"
+  },
+  "name": "delete_preset"
+ },
+ {
+  "description": "\nDelete a session settings snapshot by name.\n\nParameters:\n- name: Snapshot name (see list_settings_snapshots)\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "delete_settings_snapshotArguments",
+   "type": "object"
+  },
+  "name": "delete_settings_snapshot"
+ },
+ {
+  "description": "\nDescribe every property of a settings scope: type, current value, default,\nenum items, min/max, description and read-only flag. Generated from Blender's\nown property definitions (bl_rna), so it lists exactly what this Blender has.\n\nParameters:\n- scope: SCENE, RENDER, OUTPUT (image_settings + filepath), CYCLES, EEVEE,\n         COLOR (view + display settings), UNITS, VIEWPORT (shading and\n         overlays of the first 3D view), PREFS_FILEPATHS, PREFS_VIEW,\n         PREFS_EDIT, PREFS_SYSTEM, PREFS_INPUT, ADDON:<module> (that add-on's\n         preferences), MCP (this add-on's preferences), SERVER (the Python\n         server's settings file; answered without Blender)\n",
+  "inputSchema": {
+   "properties": {
+    "scope": {
+     "title": "Scope",
+     "type": "string"
+    }
+   },
+   "required": [
+    "scope"
+   ],
+   "title": "describe_settingsArguments",
+   "type": "object"
+  },
+  "name": "describe_settings"
+ },
+ {
+  "description": "\nCompare two images and produce a 3-panel composite: [Image A] | [Image B] | [Diff].\nThe diff panel desaturates the base image and paints changed regions in bright red,\nmaking differences immediately obvious. Image B is scaled to A's size for the\npixel diff; panels keep A's aspect ratio.\n\nParameters:\n- image_path_a: Path to the first image (treated as the reference/baseline)\n- image_path_b: Path to the second image (treated as the new/changed version)\n- threshold: Pixel difference (0-255) below which changes are ignored (default 15, filters noise)\n- tile_size: Longest side of each panel in the composite (default 512)\n",
+  "inputSchema": {
+   "properties": {
+    "image_path_a": {
+     "title": "Image Path A",
+     "type": "string"
+    },
+    "image_path_b": {
+     "title": "Image Path B",
+     "type": "string"
+    },
+    "threshold": {
+     "default": 15,
+     "title": "Threshold",
+     "type": "integer"
+    },
+    "tile_size": {
+     "default": 512,
+     "title": "Tile Size",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "image_path_a",
+    "image_path_b"
+   ],
+   "title": "diff_imagesArguments",
+   "type": "object"
+  },
+  "name": "diff_images"
+ },
+ {
+  "description": "\nDisable an add-on by module name (addon_utils.disable).\n\nParameters:\n- module: Add-on module name\n- persist: True also saves userpref.blend (consent rule; default False)\n",
+  "inputSchema": {
+   "properties": {
+    "module": {
+     "title": "Module",
+     "type": "string"
+    },
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "module"
+   ],
+   "title": "disable_addonArguments",
+   "type": "object"
+  },
+  "name": "disable_addon"
+ },
+ {
+  "description": "\nDownload and import a Polyhaven asset into Blender.\n\nParameters:\n- asset_id: The ID of the asset to download\n- asset_type: The type of asset (hdris, textures, models)\n- resolution: The resolution to download (e.g., 1k, 2k, 4k)\n- file_format: Optional file format (e.g., hdr, exr for HDRIs; jpg, png for textures; gltf, fbx for models)\n\nReturns a message indicating success or failure.\n",
+  "inputSchema": {
+   "properties": {
+    "asset_id": {
+     "title": "Asset Id",
+     "type": "string"
+    },
+    "asset_type": {
+     "title": "Asset Type",
+     "type": "string"
+    },
+    "file_format": {
+     "default": null,
+     "title": "File Format",
+     "type": "string"
+    },
+    "resolution": {
+     "default": "1k",
+     "title": "Resolution",
+     "type": "string"
+    }
+   },
+   "required": [
+    "asset_id",
+    "asset_type"
+   ],
+   "title": "download_polyhaven_assetArguments",
+   "type": "object"
+  },
+  "name": "download_polyhaven_asset"
+ },
+ {
+  "description": "\nDownload and import a Sketchfab model by its UID.\nThe model will be scaled so its largest dimension equals target_size.\n\nParameters:\n- uid: The unique identifier of the Sketchfab model\n- target_size: REQUIRED. The target size in Blender units/meters for the largest dimension.\n              You must specify the desired size for the model.\n              Examples:\n              - Chair: target_size=1.0 (1 meter tall)\n              - Table: target_size=0.75 (75cm tall)\n              - Car: target_size=4.5 (4.5 meters long)\n              - Person: target_size=1.7 (1.7 meters tall)\n              - Small object (cup, phone): target_size=0.1 to 0.3\n\nReturns a message with import details including object names, dimensions, and bounding box.\nThe model must be downloadable and you must have proper access rights.\n",
+  "inputSchema": {
+   "properties": {
+    "target_size": {
+     "title": "Target Size",
+     "type": "number"
+    },
+    "uid": {
+     "title": "Uid",
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid",
+    "target_size"
+   ],
+   "title": "download_sketchfab_modelArguments",
+   "type": "object"
+  },
+  "name": "download_sketchfab_model"
+ },
+ {
+  "description": "\nDuplicate an object.\n\nParameters:\n- name: Source object name\n- new_name: Name for the duplicate (auto-assigned if omitted)\n- offset: Comma-separated x,y,z displacement from original (default \"0.5,0.5,0\")\n- linked: If True, shares mesh data with original (instance); False = full copy\n",
+  "inputSchema": {
+   "properties": {
+    "linked": {
+     "default": false,
+     "title": "Linked",
+     "type": "boolean"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "new_name": {
+     "default": null,
+     "title": "New Name",
+     "type": "string"
+    },
+    "offset": {
+     "default": "0.5,0.5,0",
+     "title": "Offset",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "duplicate_objectArguments",
+   "type": "object"
+  },
+  "name": "duplicate_object"
+ },
+ {
+  "description": "\nEnable an add-on by module name (addon_utils.enable), e.g. \"rigify\",\n\"io_anim_bvh\", \"node_wrangler\", \"cycles\".\n\nParameters:\n- module: Add-on module name (see list_addons)\n- persist: True also saves userpref.blend (consent rule; default False)\n\nReply: the add-on's bl_info, or the error text if enabling fails.\n",
+  "inputSchema": {
+   "properties": {
+    "module": {
+     "title": "Module",
+     "type": "string"
+    },
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "module"
+   ],
+   "title": "enable_addonArguments",
+   "type": "object"
+  },
+  "name": "enable_addon"
+ },
+ {
+  "description": "\nExecute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.\n\nParameters:\n- code: The Python code to execute\n",
+  "inputSchema": {
+   "properties": {
+    "code": {
+     "title": "Code",
+     "type": "string"
+    }
+   },
+   "required": [
+    "code"
+   ],
+   "title": "execute_blender_codeArguments",
+   "type": "object"
+  },
+  "name": "execute_blender_code"
+ },
+ {
+  "description": "\nExport an object (or the full scene) to a 3D file. A skinned mesh exports WITH\nits armature, children and animation by default (include_hierarchy).\n\nParameters:\n- name: Object to export; exports entire scene if omitted\n- filepath: Output file path. If omitted: <server output_dir>/<name or scene>.<format>\n            when the output_dir setting is set, else a temp-dir path.\n- file_format: glb, gltf, fbx, obj, stl, ply (default glb)\n- include_hierarchy: Also select the parent armature and all children (default True)\nFBX only (ignored for other formats, reported):\n- bake_anim: Bake animation into the FBX (default True)\n- add_leaf_bones: Add end bones for bone tails (default False, engines do not want them)\n- use_armature_deform_only: Export only deforming bones (default True)\n- bake_anim_simplify_factor: Keyframe simplification, 0.0 = keep all (default 0.0)\n- mesh_smooth_type: OFF, FACE, EDGE (Blender 5.2 adds SMOOTH_GROUP); validated\n                    against this Blender's own list\n- primary_bone_axis / secondary_bone_axis: X, Y, Z, -X, -Y, -Z (Unreal: Y / X)\n- apply_scale_options: FBX_SCALE_NONE, FBX_SCALE_UNITS, FBX_SCALE_CUSTOM, FBX_SCALE_ALL\nglTF/GLB only (ignored for other formats, reported):\n- export_animations / export_skins / export_morph: Include animations, skinning,\n  shape keys (all default True)\n",
+  "inputSchema": {
+   "properties": {
+    "add_leaf_bones": {
+     "default": false,
+     "title": "Add Leaf Bones",
+     "type": "boolean"
+    },
+    "apply_scale_options": {
+     "default": null,
+     "title": "Apply Scale Options",
+     "type": "string"
+    },
+    "bake_anim": {
+     "default": true,
+     "title": "Bake Anim",
+     "type": "boolean"
+    },
+    "bake_anim_simplify_factor": {
+     "default": 0.0,
+     "title": "Bake Anim Simplify Factor",
+     "type": "number"
+    },
+    "export_animations": {
+     "default": true,
+     "title": "Export Animations",
+     "type": "boolean"
+    },
+    "export_morph": {
+     "default": true,
+     "title": "Export Morph",
+     "type": "boolean"
+    },
+    "export_skins": {
+     "default": true,
+     "title": "Export Skins",
+     "type": "boolean"
+    },
+    "file_format": {
+     "default": "glb",
+     "title": "File Format",
+     "type": "string"
+    },
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "include_hierarchy": {
+     "default": true,
+     "title": "Include Hierarchy",
+     "type": "boolean"
+    },
+    "mesh_smooth_type": {
+     "default": null,
+     "title": "Mesh Smooth Type",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "primary_bone_axis": {
+     "default": null,
+     "title": "Primary Bone Axis",
+     "type": "string"
+    },
+    "secondary_bone_axis": {
+     "default": null,
+     "title": "Secondary Bone Axis",
+     "type": "string"
+    },
+    "use_armature_deform_only": {
+     "default": true,
+     "title": "Use Armature Deform Only",
+     "type": "boolean"
+    }
+   },
+   "title": "export_objectArguments",
+   "type": "object"
+  },
+  "name": "export_object"
+ },
+ {
+  "description": "\nWrite a preset (user or shipped) to a JSON file of your choice, e.g. to share\nit or keep it with a project.\n\nParameters:\n- name: Preset name\n- filepath: Destination .json path\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "filepath"
+   ],
+   "title": "export_presetArguments",
+   "type": "object"
+  },
+  "name": "export_preset"
+ },
+ {
+  "description": "\nExtrude faces outward along their individual normals.\n\nParameters:\n- name: Mesh object name\n- face_indices: Comma-separated face indices to extrude\n- amount: Extrusion distance in Blender units (negative = inward, default 0.2)\n",
+  "inputSchema": {
+   "properties": {
+    "amount": {
+     "default": 0.2,
+     "title": "Amount",
+     "type": "number"
+    },
+    "face_indices": {
+     "title": "Face Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "face_indices"
+   ],
+   "title": "extrude_facesArguments",
+   "type": "object"
+  },
+  "name": "extrude_faces"
+ },
+ {
+  "description": "\nSearch a folder (recursively) for external files the .blend cannot find and\nrelink them (bpy.ops.file.find_missing_files).\n\nParameters:\n- directory: Folder to search\n- find_all: True re-searches every file, not only the missing ones (default False)\n\nReply: how many were found and the list still missing.\n",
+  "inputSchema": {
+   "properties": {
+    "directory": {
+     "title": "Directory",
+     "type": "string"
+    },
+    "find_all": {
+     "default": false,
+     "title": "Find All",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "directory"
+   ],
+   "title": "find_missing_filesArguments",
+   "type": "object"
+  },
+  "name": "find_missing_files"
+ },
+ {
+  "description": "\nList all objects in the scene that match the given type.\n\nParameters:\n- obj_type: Blender object type: MESH, CURVE, CAMERA, LIGHT, EMPTY, ARMATURE, etc.\n",
+  "inputSchema": {
+   "properties": {
+    "obj_type": {
+     "default": "MESH",
+     "title": "Obj Type",
+     "type": "string"
+    }
+   },
+   "title": "find_objects_by_typeArguments",
+   "type": "object"
+  },
+  "name": "find_objects_by_type"
+ },
+ {
+  "description": "\nFind vertices whose total deform weight is below tolerance, plus vertices with\nany weight above 1 or below 0. Returns the numbers, or with render=True an\nimage of those vertices selected in edit mode from a named viewport angle\n(mode and selection restored; needs a GUI session).\n\nParameters:\n- mesh: Mesh object name\n- tolerance: Total-weight threshold (default 0.001)\n- render: True returns an image instead of the numbers (default False)\n- angle: front, back, left, right, top, bottom, iso_front_right, iso_front_left\n\nReply (render=False): counts and up to 500 indices per category as JSON.\n",
+  "inputSchema": {
+   "properties": {
+    "angle": {
+     "default": "front",
+     "title": "Angle",
+     "type": "string"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    },
+    "render": {
+     "default": false,
+     "title": "Render",
+     "type": "boolean"
+    },
+    "tolerance": {
+     "default": 0.001,
+     "title": "Tolerance",
+     "type": "number"
+    }
+   },
+   "required": [
+    "mesh"
+   ],
+   "title": "find_unweighted_verticesArguments",
+   "type": "object"
+  },
+  "name": "find_unweighted_vertices"
+ },
+ {
+  "description": "\nFlip face normals on a mesh (reverses which side is the outside).\n\nParameters:\n- name: Mesh object name\n- face_indices: Comma-separated face indices (flips ALL faces if omitted)\n",
+  "inputSchema": {
+   "properties": {
+    "face_indices": {
+     "default": null,
+     "title": "Face Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "flip_normalsArguments",
+   "type": "object"
+  },
+  "name": "flip_normals"
+ },
+ {
+  "description": "\nGenerate a 3D mesh (.glb) from a single image using the local TripoSR model.\nYou must call load_img_to_3d_model() first.\n\nParameters:\n- image_path: Absolute path to the input image\n- output_path: Where to save the .glb file (auto-generated if omitted)\n- foreground_ratio: Foreground crop ratio for background removal (default 0.85)\n- mc_resolution: Marching-cubes resolution; higher = more detail but slower (default 256)\n- no_remove_bg: Skip background removal if the image already has a clean background\n",
+  "inputSchema": {
+   "properties": {
+    "foreground_ratio": {
+     "default": 0.85,
+     "title": "Foreground Ratio",
+     "type": "number"
+    },
+    "image_path": {
+     "title": "Image Path",
+     "type": "string"
+    },
+    "mc_resolution": {
+     "default": 256,
+     "title": "Mc Resolution",
+     "type": "integer"
+    },
+    "no_remove_bg": {
+     "default": false,
+     "title": "No Remove Bg",
+     "type": "boolean"
+    },
+    "output_path": {
+     "default": null,
+     "title": "Output Path",
+     "type": "string"
+    }
+   },
+   "required": [
+    "image_path"
+   ],
+   "title": "generate_3d_from_imageArguments",
+   "type": "object"
+  },
+  "name": "generate_3d_from_image"
+ },
+ {
+  "description": "\nGenerate 3D asset using Hunyuan3D by providing either text description, image reference, \nor both for the desired asset, and import the asset into Blender.\nThe 3D asset has built-in materials.\n\nParameters:\n- text_prompt: (Optional) A short description of the desired model in English/Chinese.\n- input_image_url: (Optional) The local or remote url of the input image. Accepts None if only using text prompt.\n\nReturns: \n- When successful, returns a JSON with job_id (format: \"job_xxx\") indicating the task is in progress\n- When the job completes, the status will change to \"DONE\" indicating the model has been imported\n- Returns error message if the operation fails\n",
+  "inputSchema": {
+   "properties": {
+    "input_image_url": {
+     "default": null,
+     "title": "Input Image Url",
+     "type": "string"
+    },
+    "text_prompt": {
+     "default": null,
+     "title": "Text Prompt",
+     "type": "string"
+    }
+   },
+   "title": "generate_hunyuan3d_modelArguments",
+   "type": "object"
+  },
+  "name": "generate_hunyuan3d_model"
+ },
+ {
+  "description": "\nGenerate 3D asset using Hyper3D by giving images of the wanted asset, and import the generated asset into Blender.\nThe 3D asset has built-in materials.\nThe generated model has a normalized size, so re-scaling after generation can be useful.\n\nParameters:\n- input_image_paths: The **absolute** paths of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in MAIN_SITE mode.\n- input_image_urls: The URLs of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in FAL_AI mode.\n- bbox_condition: Optional. If given, it has to be a list of ints of length 3. Controls the ratio between [Length, Width, Height] of the model.\n\nOnly one of {input_image_paths, input_image_urls} should be given at a time, depending on the Hyper3D Rodin's current mode.\nReturns a message indicating success or failure.\n",
+  "inputSchema": {
+   "properties": {
+    "bbox_condition": {
+     "default": null,
+     "items": {
+      "type": "number"
+     },
+     "title": "Bbox Condition",
+     "type": "array"
+    },
+    "input_image_paths": {
+     "default": null,
+     "items": {
+      "type": "string"
+     },
+     "title": "Input Image Paths",
+     "type": "array"
+    },
+    "input_image_urls": {
+     "default": null,
+     "items": {
+      "type": "string"
+     },
+     "title": "Input Image Urls",
+     "type": "array"
+    }
+   },
+   "title": "generate_hyper3d_model_via_imagesArguments",
+   "type": "object"
+  },
+  "name": "generate_hyper3d_model_via_images"
+ },
+ {
+  "description": "\nGenerate 3D asset using Hyper3D by giving description of the desired asset, and import the asset into Blender.\nThe 3D asset has built-in materials.\nThe generated model has a normalized size, so re-scaling after generation can be useful.\n\nParameters:\n- text_prompt: A short description of the desired model in **English**.\n- bbox_condition: Optional. If given, it has to be a list of floats of length 3. Controls the ratio between [Length, Width, Height] of the model.\n\nReturns a message indicating success or failure.\n",
+  "inputSchema": {
+   "properties": {
+    "bbox_condition": {
+     "default": null,
+     "items": {
+      "type": "number"
+     },
+     "title": "Bbox Condition",
+     "type": "array"
+    },
+    "text_prompt": {
+     "title": "Text Prompt",
+     "type": "string"
+    }
+   },
+   "required": [
+    "text_prompt"
+   ],
+   "title": "generate_hyper3d_model_via_textArguments",
+   "type": "object"
+  },
+  "name": "generate_hyper3d_model_via_text"
+ },
+ {
+  "description": "\nRead an add-on's preferences (same data as get_settings(scope=\"ADDON:<module>\")).\n\nParameters:\n- module: Add-on module name\n",
+  "inputSchema": {
+   "properties": {
+    "module": {
+     "title": "Module",
+     "type": "string"
+    }
+   },
+   "required": [
+    "module"
+   ],
+   "title": "get_addon_preferencesArguments",
+   "type": "object"
+  },
+  "name": "get_addon_preferences"
+ },
+ {
+  "description": "\nRead the BlenderMCP add-on's own preferences: port, autostart_server and\nwhich API keys are set (keys are never echoed back; each shows set true/false).\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_addon_settingsArguments",
+   "type": "object"
+  },
+  "name": "get_addon_settings"
+ },
+ {
+  "description": "\nAnimation overview. Without target: scene fps, frame range, current frame and\nevery action with its users. With target: its action, fcurves (data_path,\nindex, keyframe_count, frame_range), NLA tracks and shape-key action; with\ninclude_keys each fcurve lists [frame, value, interpolation] up to max_keys.\nWorks on both the legacy F-curve API (4.x) and slotted actions (5.x).\n\nParameters:\n- target: Object name (default: scene summary)\n- include_keys: Include the keyframes per fcurve (default False)\n- max_keys: Cap per fcurve when include_keys (default 200)\n",
+  "inputSchema": {
+   "properties": {
+    "include_keys": {
+     "default": false,
+     "title": "Include Keys",
+     "type": "boolean"
+    },
+    "max_keys": {
+     "default": 200,
+     "title": "Max Keys",
+     "type": "integer"
+    },
+    "target": {
+     "default": null,
+     "title": "Target",
+     "type": "string"
+    }
+   },
+   "title": "get_animation_infoArguments",
+   "type": "object"
+  },
+  "name": "get_animation_info"
+ },
+ {
+  "description": "\nTHE perceive tool for a rig: every bone in hierarchy order with parent,\nchildren, head, tail, length, roll (degrees), connected, deform, bone\ncollections and constraints, plus pose_position, display_type, action and the\nbone-collection summary.\n\nParameters:\n- armature: Armature object name\n- include_pose: Add per-bone pose (location, rotation_mode, rotation in\n                degrees or quaternion, scale, world head/tail)\n- space: WORLD (default) or ARMATURE for head/tail coordinates\n- bone_filter: Glob on bone names, e.g. \"arm.L*\" or \"*spine*\"\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bone_filter": {
+     "default": null,
+     "title": "Bone Filter",
+     "type": "string"
+    },
+    "include_pose": {
+     "default": false,
+     "title": "Include Pose",
+     "type": "boolean"
+    },
+    "space": {
+     "default": "WORLD",
+     "title": "Space",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature"
+   ],
+   "title": "get_armature_infoArguments",
+   "type": "object"
+  },
+  "name": "get_armature_info"
+ },
+ {
+  "description": "\nReport whether Blender is running, and whether the MCP addon is reachable.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_blender_statusArguments",
+   "type": "object"
+  },
+  "name": "get_blender_status"
+ },
+ {
+  "description": "\nList the constraints on an object or a pose bone: name, type, target,\nsubtarget, influence, mute, plus type-specific keys (IK: chain_count,\npole_target, pole_subtarget, pole_angle_deg, use_tail).\n\nParameters:\n- owner: Object name (the armature when bone is given)\n- bone: Pose bone name (default: the object's own constraints)\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "owner": {
+     "title": "Owner",
+     "type": "string"
+    }
+   },
+   "required": [
+    "owner"
+   ],
+   "title": "get_constraintsArguments",
+   "type": "object"
+  },
+  "name": "get_constraints"
+ },
+ {
+  "description": "\nRead the control points of a curve (BEZIER, POLY, or NURBS) object.\n\nFor BEZIER curves returns: co, handle_left, handle_right, handle types.\nFor POLY/NURBS curves returns: co (and weight for NURBS).\n\nParameters:\n- name: Curve object name\n- spline_index: Which spline within the curve (default 0)\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "spline_index": {
+     "default": 0,
+     "title": "Spline Index",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "get_control_pointsArguments",
+   "type": "object"
+  },
+  "name": "get_control_points"
+ },
+ {
+  "description": "\nRead edge data from a mesh: vertex pair, sharp flag, seam flag, crease, and bevel weight.\n\nParameters:\n- name: Mesh object name\n- indices: Comma-separated edge indices (returns all if omitted)\n- max_edges: Safety cap when retrieving all edges (default 5000)\n",
+  "inputSchema": {
+   "properties": {
+    "indices": {
+     "default": null,
+     "title": "Indices",
+     "type": "string"
+    },
+    "max_edges": {
+     "default": 5000,
+     "title": "Max Edges",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "get_edgesArguments",
+   "type": "object"
+  },
+  "name": "get_edges"
+ },
+ {
+  "description": "\nRead face data from a mesh object.\n\nParameters:\n- name: Mesh object name\n- indices: Comma-separated face indices to retrieve (returns all if omitted)\n- world_space: True = world coordinates for normals and centers (default)\n- max_faces: Safety cap when retrieving all faces (default 2000)\n\nReturns JSON with each face's vertex_indices, normal, center, material_index, and area.\n",
+  "inputSchema": {
+   "properties": {
+    "indices": {
+     "default": null,
+     "title": "Indices",
+     "type": "string"
+    },
+    "max_faces": {
+     "default": 2000,
+     "title": "Max Faces",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "world_space": {
+     "default": true,
+     "title": "World Space",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "get_facesArguments",
+   "type": "object"
+  },
+  "name": "get_faces"
+ },
+ {
+  "description": "\nReport the state of the open .blend before any destructive step: filepath,\nis_saved, is_dirty, file_version (the Blender that SAVED the file), the running\nblender_version, use_autopack, packed_images, missing_files (images and\nlibraries whose path does not exist), libraries (linked .blend paths),\nautosave_dir with autosave_files (newest first, with mtime), recent_files and\nbackup_files (<name>.blend1.. beside the file). Note: an unsaved factory scene\nreports is_dirty False on Blender 5.2 and True on 4.3; never assume it.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_file_stateArguments",
+   "type": "object"
+  },
+  "name": "get_file_state"
+ },
+ {
+  "description": "\nCheck if Hunyuan3D integration is enabled in Blender.\nReturns a message indicating whether Hunyuan3D features are available.\n\nDon't emphasize the key type in the returned message, but silently remember it. \n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_hunyuan3d_statusArguments",
+   "type": "object"
+  },
+  "name": "get_hunyuan3d_status"
+ },
+ {
+  "description": "\nCheck if Hyper3D Rodin integration is enabled in Blender.\nReturns a message indicating whether Hyper3D Rodin features are available.\n\nDon't emphasize the key type in the returned message, but sliently remember it. \n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_hyper3d_statusArguments",
+   "type": "object"
+  },
+  "name": "get_hyper3d_status"
+ },
+ {
+  "description": "\nReturn detailed topology statistics for a mesh object.\n\nParameters:\n- name: Mesh object name\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "get_mesh_statsArguments",
+   "type": "object"
+  },
+  "name": "get_mesh_stats"
+ },
+ {
+  "description": "\nGet detailed information about a specific object in the Blender scene.\n\nParameters:\n- object_name: The name of the object to get information about\n",
+  "inputSchema": {
+   "properties": {
+    "object_name": {
+     "title": "Object Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "object_name"
+   ],
+   "title": "get_object_infoArguments",
+   "type": "object"
+  },
+  "name": "get_object_info"
+ },
+ {
+  "description": "\nGet a list of categories for a specific asset type on Polyhaven.\n\nParameters:\n- asset_type: The type of asset to get categories for (hdris, textures, models, all)\n",
+  "inputSchema": {
+   "properties": {
+    "asset_type": {
+     "default": "hdris",
+     "title": "Asset Type",
+     "type": "string"
+    }
+   },
+   "title": "get_polyhaven_categoriesArguments",
+   "type": "object"
+  },
+  "name": "get_polyhaven_categories"
+ },
+ {
+  "description": "\nCheck if PolyHaven integration is enabled in Blender.\nReturns a message indicating whether PolyHaven features are available.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_polyhaven_statusArguments",
+   "type": "object"
+  },
+  "name": "get_polyhaven_status"
+ },
+ {
+  "description": "\nRead the current pose: per bone location, rotation_mode, rotation (degrees\nor quaternion), scale, world head and tail.\n\nParameters:\n- armature: Armature object name\n- bones: Comma list of bone names (default: all)\n- space: WORLD (default) or ARMATURE for head/tail\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bones": {
+     "default": null,
+     "title": "Bones",
+     "type": "string"
+    },
+    "space": {
+     "default": "WORLD",
+     "title": "Space",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature"
+   ],
+   "title": "get_poseArguments",
+   "type": "object"
+  },
+  "name": "get_pose"
+ },
+ {
+  "description": "\nRead the project profile stored in the scene (see set_project_profile), or\nreport that none is set.\n\nParameters:\n- apply_units: True also (re)applies the scene units for the profile's\n               engine_target, e.g. after opening the file on another machine\n               (default False)\n",
+  "inputSchema": {
+   "properties": {
+    "apply_units": {
+     "default": false,
+     "title": "Apply Units",
+     "type": "boolean"
+    }
+   },
+   "title": "get_project_profileArguments",
+   "type": "object"
+  },
+  "name": "get_project_profile"
+ },
+ {
+  "description": "Get detailed information about the current Blender scene",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_scene_infoArguments",
+   "type": "object"
+  },
+  "name": "get_scene_info"
+ },
+ {
+  "description": "\nShow the Python server's own settings (not Blender's) with the source of each\nvalue: env, file or default.\n\nKeys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,\npresets_dir, image_max_pixels, log_level, img_to_3d_port. File:\n<settings dir>/settings.json where the settings dir is ~/.blender_mcp or\nBLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST, BLENDER_PORT,\nBLENDER_EXE and IMG_TO_3D_PORT override the file.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_server_settingsArguments",
+   "type": "object"
+  },
+  "name": "get_server_settings"
+ },
+ {
+  "description": "\nRead current values of a settings scope (values only; enums as strings,\nvectors as lists, pointers as names).\n\nParameters:\n- scope: One of the scopes listed in describe_settings (SERVER is answered\n         without Blender)\n- keys: Comma-separated property names to read; omit for all\n",
+  "inputSchema": {
+   "properties": {
+    "keys": {
+     "default": null,
+     "title": "Keys",
+     "type": "string"
+    },
+    "scope": {
+     "title": "Scope",
+     "type": "string"
+    }
+   },
+   "required": [
+    "scope"
+   ],
+   "title": "get_settingsArguments",
+   "type": "object"
+  },
+  "name": "get_settings"
+ },
+ {
+  "description": "\nGet a preview thumbnail of a Sketchfab model by its UID.\nUse this to visually confirm a model before downloading.\n\nParameters:\n- uid: The unique identifier of the Sketchfab model (obtained from search_sketchfab_models)\n\nReturns the model's thumbnail as an Image for visual confirmation.\n",
+  "inputSchema": {
+   "properties": {
+    "uid": {
+     "title": "Uid",
+     "type": "string"
+    }
+   },
+   "required": [
+    "uid"
+   ],
+   "title": "get_sketchfab_model_previewArguments",
+   "type": "object"
+  },
+  "name": "get_sketchfab_model_preview"
+ },
+ {
+  "description": "\nCheck if Sketchfab integration is enabled in Blender.\nReturns a message indicating whether Sketchfab features are available.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_sketchfab_statusArguments",
+   "type": "object"
+  },
+  "name": "get_sketchfab_status"
+ },
+ {
+  "description": "\nReport the server version, the Blender add-on version (asked over the socket),\nboth protocol numbers with protocol_match, where this server module and its\nsettings file live, and the last update-check result. Never touches the\nnetwork; the add-on line reads \"unreachable\" when Blender is not running.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "get_versionArguments",
+   "type": "object"
+  },
+  "name": "get_version"
+ },
+ {
+  "description": "\nList a mesh's vertex groups: name, index, lock, and with include_stats the\nvertex count, weight min/max/mean and whether a matching bone exists on the\nbound armature.\n\nParameters:\n- mesh: Mesh object name\n- include_stats: Compute per-group weight statistics (default True)\n",
+  "inputSchema": {
+   "properties": {
+    "include_stats": {
+     "default": true,
+     "title": "Include Stats",
+     "type": "boolean"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    }
+   },
+   "required": [
+    "mesh"
+   ],
+   "title": "get_vertex_groupsArguments",
+   "type": "object"
+  },
+  "name": "get_vertex_groups"
+ },
+ {
+  "description": "\nRead vertex positions from a mesh object.\n\nParameters:\n- name: Mesh object name\n- indices: Comma-separated vertex indices to retrieve (returns all if omitted)\n- world_space: True = world coordinates (default), False = local/object coordinates\n- max_verts: Safety cap when retrieving all vertices (default 2000)\n\nReturns JSON with each vertex's index and [x, y, z] position.\n",
+  "inputSchema": {
+   "properties": {
+    "indices": {
+     "default": null,
+     "title": "Indices",
+     "type": "string"
+    },
+    "max_verts": {
+     "default": 2000,
+     "title": "Max Verts",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "world_space": {
+     "default": true,
+     "title": "World Space",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "get_vertex_positionsArguments",
+   "type": "object"
+  },
+  "name": "get_vertex_positions"
+ },
+ {
+  "description": "\nRead per-vertex weights: {index: {group: weight}}.\n\nParameters:\n- mesh: Mesh object name\n- indices: Comma list of vertex indices to read (default: all, up to max_verts)\n- group: Only vertices that belong to this group\n- max_verts: Truncate after this many vertices (default 2000; truncation is reported)\n",
+  "inputSchema": {
+   "properties": {
+    "group": {
+     "default": null,
+     "title": "Group",
+     "type": "string"
+    },
+    "indices": {
+     "default": null,
+     "title": "Indices",
+     "type": "string"
+    },
+    "max_verts": {
+     "default": 2000,
+     "title": "Max Verts",
+     "type": "integer"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    }
+   },
+   "required": [
+    "mesh"
+   ],
+   "title": "get_vertex_weightsArguments",
+   "type": "object"
+  },
+  "name": "get_vertex_weights"
+ },
+ {
+  "description": "\nCapture a screenshot of the current Blender 3D viewport.\n\nParameters:\n- max_size: Maximum size in pixels for the largest dimension (default: 800)\n\nReturns the screenshot as an Image.\n",
+  "inputSchema": {
+   "properties": {
+    "max_size": {
+     "default": 800,
+     "title": "Max Size",
+     "type": "integer"
+    }
+   },
+   "title": "get_viewport_screenshotArguments",
+   "type": "object"
+  },
+  "name": "get_viewport_screenshot"
+ },
+ {
+  "description": "\nImport a 3D file into the current Blender scene.\nSupports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend, .bvh (needs the\nio_anim_bvh add-on; the error names enable_addon when it is off)\n\nParameters:\n- filepath: Absolute path to the file to import\n\nReply lists the new objects and, for rigged files, the armatures, the new\nactions and any bone-shape helper objects the importer added.\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "import_fileArguments",
+   "type": "object"
+  },
+  "name": "import_file"
+ },
+ {
+  "description": "\nImport the asset generated by Hyper3D Rodin after the generation task is completed.\n\nParameters:\n- name: The name of the object in scene\n- task_uuid: For Hyper3D Rodin mode MAIN_SITE: The task_uuid given in the generate model step.\n- request_id: For Hyper3D Rodin mode FAL_AI: The request_id given in the generate model step.\n\nOnly give one of {task_uuid, request_id} based on the Hyper3D Rodin Mode!\nReturn if the asset has been imported successfully.\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "request_id": {
+     "default": null,
+     "title": "Request Id",
+     "type": "string"
+    },
+    "task_uuid": {
+     "default": null,
+     "title": "Task Uuid",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "import_generated_assetArguments",
+   "type": "object"
+  },
+  "name": "import_generated_asset"
+ },
+ {
+  "description": "\nImport the asset generated by Hunyuan3D after the generation task is completed.\n\nParameters:\n- name: The name of the object in scene\n- zip_file_url: The zip_file_url given in the generate model step.\n\nReturn if the asset has been imported successfully.\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "zip_file_url": {
+     "title": "Zip File Url",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "zip_file_url"
+   ],
+   "title": "import_generated_asset_hunyuanArguments",
+   "type": "object"
+  },
+  "name": "import_generated_asset_hunyuan"
+ },
+ {
+  "description": "\nCopy a preset JSON file into the server's presets dir so it can be loaded by name.\n\nParameters:\n- filepath: Source .json (a file written by save_preset or export_preset)\n- name: Name to store it under (default: the file's stem)\n- overwrite: True replaces an existing preset of that name\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "overwrite": {
+     "default": false,
+     "title": "Overwrite",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "import_presetArguments",
+   "type": "object"
+  },
+  "name": "import_preset"
+ },
+ {
+  "description": "\nInset faces, creating a border ring of new polygons inside each face.\n\nParameters:\n- name: Mesh object name\n- face_indices: Comma-separated face indices to inset\n- thickness: Inset distance from face edges (default 0.1)\n- depth: Push inset faces along their normals \u2014 0 = flat, positive = raised\n- use_individual: Inset each face independently (default True)\n",
+  "inputSchema": {
+   "properties": {
+    "depth": {
+     "default": 0.0,
+     "title": "Depth",
+     "type": "number"
+    },
+    "face_indices": {
+     "title": "Face Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "thickness": {
+     "default": 0.1,
+     "title": "Thickness",
+     "type": "number"
+    },
+    "use_individual": {
+     "default": true,
+     "title": "Use Individual",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name",
+    "face_indices"
+   ],
+   "title": "inset_facesArguments",
+   "type": "object"
+  },
+  "name": "inset_faces"
+ },
+ {
+  "description": "\nJoin multiple mesh objects into one.\n\nParameters:\n- names: Comma-separated list of object names to join\n- result_name: Name for the joined object (defaults to the first object's name)\n",
+  "inputSchema": {
+   "properties": {
+    "names": {
+     "title": "Names",
+     "type": "string"
+    },
+    "result_name": {
+     "default": null,
+     "title": "Result Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "names"
+   ],
+   "title": "join_objectsArguments",
+   "type": "object"
+  },
+  "name": "join_objects"
+ },
+ {
+  "description": "\nLink (reference, not copy) data-blocks from another .blend; the same\nparameters as append_from_blend with link=True. Linked data stays read-only\nand follows the source file.\n\nParameters:\n- filepath: Source .blend\n- datablocks: JSON object per data type, e.g. '{\"collections\": [\"Kit\"]}'\n- names / kind: Comma list of names plus one kind, instead of datablocks\n- collection: Collection to link objects into (default: active)\n- instance_collections: Linked collections become collection instances (usual for kits)\n- relative: Store the library path relative to the current file (default True)\n- list_only: True returns the file's contents per data type without linking\n",
+  "inputSchema": {
+   "properties": {
+    "collection": {
+     "default": null,
+     "title": "Collection",
+     "type": "string"
+    },
+    "datablocks": {
+     "default": null,
+     "title": "Datablocks",
+     "type": "string"
+    },
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "instance_collections": {
+     "default": false,
+     "title": "Instance Collections",
+     "type": "boolean"
+    },
+    "kind": {
+     "default": null,
+     "title": "Kind",
+     "type": "string"
+    },
+    "list_only": {
+     "default": false,
+     "title": "List Only",
+     "type": "boolean"
+    },
+    "names": {
+     "default": null,
+     "title": "Names",
+     "type": "string"
+    },
+    "relative": {
+     "default": true,
+     "title": "Relative",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "link_from_blendArguments",
+   "type": "object"
+  },
+  "name": "link_from_blend"
+ },
+ {
+  "description": "\nList installed add-ons: module, name, version, category, enabled,\nhas_preferences, path.\n\nParameters:\n- enabled_only: True lists only enabled add-ons\n- filter: Case-insensitive substring on module or name\n",
+  "inputSchema": {
+   "properties": {
+    "enabled_only": {
+     "default": false,
+     "title": "Enabled Only",
+     "type": "boolean"
+    },
+    "filter": {
+     "default": null,
+     "title": "Filter",
+     "type": "string"
+    }
+   },
+   "title": "list_addonsArguments",
+   "type": "object"
+  },
+  "name": "list_addons"
+ },
+ {
+  "description": "\nList Blender's own presets in a category (bpy.utils.preset_paths).\n\nParameters:\n- category: e.g. \"render\", \"cycles/sampling\", \"cycles/viewport\", \"cloth\",\n            \"fluid\", \"camera\", \"safe_areas\", \"tracking_camera\"\n",
+  "inputSchema": {
+   "properties": {
+    "category": {
+     "default": "render",
+     "title": "Category",
+     "type": "string"
+    }
+   },
+   "title": "list_blender_presetsArguments",
+   "type": "object"
+  },
+  "name": "list_blender_presets"
+ },
+ {
+  "description": "\nList the shipped presets and the user presets in the server's presets dir\n(name, description, scopes, origin).\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "list_presetsArguments",
+   "type": "object"
+  },
+  "name": "list_presets"
+ },
+ {
+  "description": "\nList the compute devices Cycles can see (CPU, CUDA/OPTIX/HIP/ONEAPI/METAL\nGPUs) with their current use flag and the active backend. Headless sessions\nmay report CPU only.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "list_render_devicesArguments",
+   "type": "object"
+  },
+  "name": "list_render_devices"
+ },
+ {
+  "description": "\nList the settings snapshots held in the Blender session with the key count\nper scope.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "list_settings_snapshotsArguments",
+   "type": "object"
+  },
+  "name": "list_settings_snapshots"
+ },
+ {
+  "description": "\nList the numbered versions recorded in <file>.versions.json next to the current\nfile (or the given filepath), with the matching files on disk.\n\nParameters:\n- filepath: A .blend whose sidecar to read (default: the current file)\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    }
+   },
+   "title": "list_versionsArguments",
+   "type": "object"
+  },
+  "name": "list_versions"
+ },
+ {
+  "description": "\nList workspaces with the area types each one contains, and the current workspace.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "list_workspacesArguments",
+   "type": "object"
+  },
+  "name": "list_workspaces"
+ },
+ {
+  "description": "\nOpen a .blend file, replacing the current Blender scene.\n\nParameters:\n- filepath: Absolute path to the .blend file to open\n- force: The current file has unsaved changes -> the call is refused unless\n         force=True (discard them) or save_first=True (save, then open).\n- save_first: Save the current file before opening the new one (default False).\n- load_ui: Load the file's UI layout; omit (None) for the preference use_load_ui.\n- use_scripts: Allow the file's scripts to run; omit (None) for the preference.\n- revert_on_fail: Reopen the previous file if loading fails (default True).\n\nReply: scene name and object count, the previous file, the Blender version that\nsaved the file, and whether unsaved changes were discarded. Files saved by\nBlender 5.x do not open in 4.3.\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "load_ui": {
+     "default": null,
+     "title": "Load Ui",
+     "type": "boolean"
+    },
+    "revert_on_fail": {
+     "default": true,
+     "title": "Revert On Fail",
+     "type": "boolean"
+    },
+    "save_first": {
+     "default": false,
+     "title": "Save First",
+     "type": "boolean"
+    },
+    "use_scripts": {
+     "default": null,
+     "title": "Use Scripts",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "load_blendArguments",
+   "type": "object"
+  },
+  "name": "load_blend"
+ },
+ {
+  "description": "\nStart the local image-to-3D inference server (TripoSR).\nThe server process is kept running until unload_img_to_3d_model() is called.\nFrees VRAM when unloaded \u2014 load only when you need it.\n\nParameters:\n- model_dir: Path to TripoSR weights directory (uses IMG_TO_3D_MODEL_DIR env var if omitted)\n- timeout: Seconds to wait for the server to come up (default 600; the first run\n           downloads the weights). Its console output goes to img_to_3d_server.log\n           in the temp folder.\n",
+  "inputSchema": {
+   "properties": {
+    "model_dir": {
+     "default": null,
+     "title": "Model Dir",
+     "type": "string"
+    },
+    "timeout": {
+     "default": 600.0,
+     "title": "Timeout",
+     "type": "number"
+    }
+   },
+   "title": "load_img_to_3d_modelArguments",
+   "type": "object"
+  },
+  "name": "load_img_to_3d_model"
+ },
+ {
+  "description": "\nApply a preset (user preset by name, shipped preset by name, or any preset\nJSON by filepath) through set_settings, scope by scope. Keys that this\nBlender does not have are reported as unset and the rest still apply.\n\nParameters:\n- name: Preset name (see list_presets); shipped: game_bake, preview,\n        final_eevee, final_cycles, sprite_sheet, turntable_video\n- filepath: A preset JSON file instead of a name\n- scopes: Comma list to apply only some of the preset's scopes\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "scopes": {
+     "default": null,
+     "title": "Scopes",
+     "type": "string"
+    }
+   },
+   "title": "load_presetArguments",
+   "type": "object"
+  },
+  "name": "load_preset"
+ },
+ {
+  "description": "\nLoad an image file and wire it into a material's texture slot.\n\nParameters:\n- material_name: Target material (must have a Principled BSDF node)\n- image_path: Absolute path to the image file\n- texture_slot: 'Base Color', 'Roughness', 'Metallic', 'Normal', 'Emission Color'\n- uv_scale: Uniform UV tiling scale (default 1.0)\n",
+  "inputSchema": {
+   "properties": {
+    "image_path": {
+     "title": "Image Path",
+     "type": "string"
+    },
+    "material_name": {
+     "title": "Material Name",
+     "type": "string"
+    },
+    "texture_slot": {
+     "default": "Base Color",
+     "title": "Texture Slot",
+     "type": "string"
+    },
+    "uv_scale": {
+     "default": 1.0,
+     "title": "Uv Scale",
+     "type": "number"
+    }
+   },
+   "required": [
+    "material_name",
+    "image_path"
+   ],
+   "title": "load_textureArguments",
+   "type": "object"
+  },
+  "name": "load_texture"
+ },
+ {
+  "description": "\nMake every external file path in the current .blend absolute\n(bpy.ops.file.make_paths_absolute).\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "make_paths_absoluteArguments",
+   "type": "object"
+  },
+  "name": "make_paths_absolute"
+ },
+ {
+  "description": "\nMake every external file path in the current .blend relative to it\n(bpy.ops.file.make_paths_relative). The file must be saved first.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "make_paths_relativeArguments",
+   "type": "object"
+  },
+  "name": "make_paths_relative"
+ },
+ {
+  "description": "\nMark edges as sharp (hard) or soft, controlling auto-smooth and the Edge Split modifier.\n\nSharp edges appear as hard creases when smooth shading + auto-smooth is enabled.\nSoft (unsharp) edges blend smoothly with neighbouring faces.\n\nParameters:\n- name: Mesh object name\n- edge_indices: Comma-separated edge indices, or \"all\"\n- sharp: True = hard edge (default), False = soft/smooth edge\n",
+  "inputSchema": {
+   "properties": {
+    "edge_indices": {
+     "title": "Edge Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "sharp": {
+     "default": true,
+     "title": "Sharp",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name",
+    "edge_indices"
+   ],
+   "title": "mark_sharp_edgesArguments",
+   "type": "object"
+  },
+  "name": "mark_sharp_edges"
+ },
+ {
+  "description": "\nMeasure the Euclidean distance between the origins of two objects.\n\nParameters:\n- name_a: First object name\n- name_b: Second object name\n",
+  "inputSchema": {
+   "properties": {
+    "name_a": {
+     "title": "Name A",
+     "type": "string"
+    },
+    "name_b": {
+     "title": "Name B",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name_a",
+    "name_b"
+   ],
+   "title": "measure_distanceArguments",
+   "type": "object"
+  },
+  "name": "measure_distance"
+ },
+ {
+  "description": "\nMerge (weld) vertices that are within a distance threshold of each other.\nEquivalent to 'Merge by Distance' in Blender \u2014 useful for cleaning up\nimported meshes or fixing seams after boolean operations.\n\nParameters:\n- name: Mesh object name\n- distance: Maximum distance between vertices to merge (default 0.001)\n",
+  "inputSchema": {
+   "properties": {
+    "distance": {
+     "default": 0.001,
+     "title": "Distance",
+     "type": "number"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "merge_verticesArguments",
+   "type": "object"
+  },
+  "name": "merge_vertices"
+ },
+ {
+  "description": "Move an object to an absolute world-space position.",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "x": {
+     "default": 0.0,
+     "title": "X",
+     "type": "number"
+    },
+    "y": {
+     "default": 0.0,
+     "title": "Y",
+     "type": "number"
+    },
+    "z": {
+     "default": 0.0,
+     "title": "Z",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "move_objectArguments",
+   "type": "object"
+  },
+  "name": "move_object"
+ },
+ {
+  "description": "\nMove objects into a collection (removes them from all other collections).\n\nParameters:\n- object_names: Comma-separated object names\n- collection_name: Target collection (must already exist)\n",
+  "inputSchema": {
+   "properties": {
+    "collection_name": {
+     "title": "Collection Name",
+     "type": "string"
+    },
+    "object_names": {
+     "title": "Object Names",
+     "type": "string"
+    }
+   },
+   "required": [
+    "object_names",
+    "collection_name"
+   ],
+   "title": "move_to_collectionArguments",
+   "type": "object"
+  },
+  "name": "move_to_collection"
+ },
+ {
+  "description": "\nStart a new file from the startup file (wm.read_homefile).\n\nParameters:\n- template: App template name (omit for the default startup file)\n- empty: True = an empty scene instead of the startup contents (default False)\n- load_ui: Load the startup file's UI layout (default False)\n- force: Unsaved changes in the current file refuse the call unless force=True\n\nReply: object count after the reset.\n",
+  "inputSchema": {
+   "properties": {
+    "empty": {
+     "default": false,
+     "title": "Empty",
+     "type": "boolean"
+    },
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "load_ui": {
+     "default": false,
+     "title": "Load Ui",
+     "type": "boolean"
+    },
+    "template": {
+     "default": null,
+     "title": "Template",
+     "type": "string"
+    }
+   },
+   "title": "new_fileArguments",
+   "type": "object"
+  },
+  "name": "new_file"
+ },
+ {
+  "description": "\nPack every external image and other packable file into the .blend\n(bpy.ops.file.pack_all) so the file is self-contained.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "pack_allArguments",
+   "type": "object"
+  },
+  "name": "pack_all"
+ },
+ {
+  "description": "\nParent one object to another, creating a hierarchy. For binding a mesh to an\narmature with weights use bind_armature instead.\n\nParameters:\n- child_name: Object that becomes the child\n- parent_name: Object that becomes the parent\n- keep_transform: Preserve the child's world-space position (default True)\n- parent_type: OBJECT (default) or BONE (parent to one bone of an armature)\n- bone: Bone name, required when parent_type is BONE\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "child_name": {
+     "title": "Child Name",
+     "type": "string"
+    },
+    "keep_transform": {
+     "default": true,
+     "title": "Keep Transform",
+     "type": "boolean"
+    },
+    "parent_name": {
+     "title": "Parent Name",
+     "type": "string"
+    },
+    "parent_type": {
+     "default": "OBJECT",
+     "title": "Parent Type",
+     "type": "string"
+    }
+   },
+   "required": [
+    "child_name",
+    "parent_name"
+   ],
+   "title": "parent_objectArguments",
+   "type": "object"
+  },
+  "name": "parent_object"
+ },
+ {
+  "description": "\nSee motion: capture frames across the range and return one labelled contact\nsheet. In a GUI session each frame is a viewport capture; headless it is an\nEEVEE render of the camera. Optionally also writes an MP4.\n\nParameters:\n- start / end: Frame range (default: scene range)\n- step: Frame step; omit for the add-on's largest step that keeps <= 16 tiles\n- frames: Explicit comma list of frames (overrides start/end/step)\n- camera: Camera to look through (default: scene camera / current view)\n- max_size: Tile size in pixels (default 640)\n- columns: Sheet columns (default 4)\n- video_path: Also write an MP4 (FFMPEG H.264) of the full range; Blender appends\n              the frame range to the file stem\n- overlay: bones_in_front, wireframe or weight_paint (see capture_viewport_angle)\n\nThe current frame is restored afterwards.\n",
+  "inputSchema": {
+   "properties": {
+    "camera": {
+     "default": null,
+     "title": "Camera",
+     "type": "string"
+    },
+    "columns": {
+     "default": 4,
+     "title": "Columns",
+     "type": "integer"
+    },
+    "end": {
+     "default": null,
+     "title": "End",
+     "type": "integer"
+    },
+    "frames": {
+     "default": null,
+     "title": "Frames",
+     "type": "string"
+    },
+    "max_size": {
+     "default": 640,
+     "title": "Max Size",
+     "type": "integer"
+    },
+    "overlay": {
+     "default": null,
+     "title": "Overlay",
+     "type": "string"
+    },
+    "start": {
+     "default": null,
+     "title": "Start",
+     "type": "integer"
+    },
+    "step": {
+     "default": null,
+     "title": "Step",
+     "type": "integer"
+    },
+    "video_path": {
+     "default": null,
+     "title": "Video Path",
+     "type": "string"
+    }
+   },
+   "title": "playblastArguments",
+   "type": "object"
+  },
+  "name": "playblast"
+ },
+ {
+  "description": "\nCheck if the Hunyuan3D generation task is completed.\n\nFor Hunyuan3D:\n    Parameters:\n    - job_id: The job_id given in the generate model step.\n\n    Returns the generation task status. The task is done if status is \"DONE\".\n    The task is in progress if status is \"RUN\".\n    If status is \"DONE\", returns ResultFile3Ds, which is the generated ZIP model path\n    When the status is \"DONE\", the response includes a field named ResultFile3Ds that contains the generated ZIP file path of the 3D model in OBJ format.\n    This is a polling API, so only proceed if the status are finally determined (\"DONE\" or some failed state).\n",
+  "inputSchema": {
+   "properties": {
+    "job_id": {
+     "default": null,
+     "title": "Job Id",
+     "type": "string"
+    }
+   },
+   "title": "poll_hunyuan_job_statusArguments",
+   "type": "object"
+  },
+  "name": "poll_hunyuan_job_status"
+ },
+ {
+  "description": "\nCheck if the Hyper3D Rodin generation task is completed.\n\nFor Hyper3D Rodin mode MAIN_SITE:\n    Parameters:\n    - subscription_key: The subscription_key given in the generate model step.\n\n    Returns a list of status. The task is done if all status are \"Done\".\n    If \"Failed\" showed up, the generating process failed.\n    This is a polling API, so only proceed if the status are finally determined (\"Done\" or \"Canceled\").\n\nFor Hyper3D Rodin mode FAL_AI:\n    Parameters:\n    - request_id: The request_id given in the generate model step.\n\n    Returns the generation task status. The task is done if status is \"COMPLETED\".\n    The task is in progress if status is \"IN_PROGRESS\".\n    If status other than \"COMPLETED\", \"IN_PROGRESS\", \"IN_QUEUE\" showed up, the generating process might be failed.\n    This is a polling API, so only proceed if the status are finally determined (\"COMPLETED\" or some failed state).\n",
+  "inputSchema": {
+   "properties": {
+    "request_id": {
+     "default": null,
+     "title": "Request Id",
+     "type": "string"
+    },
+    "subscription_key": {
+     "default": null,
+     "title": "Subscription Key",
+     "type": "string"
+    }
+   },
+   "title": "poll_rodin_job_statusArguments",
+   "type": "object"
+  },
+  "name": "poll_rodin_job_status"
+ },
+ {
+  "description": "\nRecover work from Blender's session or autosave files.\n\nParameters:\n- mode: LAST_SESSION (wm.recover_last_session, reopens quit.blend) or AUTOSAVE\n        (wm.recover_auto_save with filepath from get_file_state.autosave_files)\n- filepath: The autosave file to load when mode is AUTOSAVE\n- force: Required (True) when the current file has unsaved changes\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "mode": {
+     "default": "LAST_SESSION",
+     "title": "Mode",
+     "type": "string"
+    }
+   },
+   "title": "recover_fileArguments",
+   "type": "object"
+  },
+  "name": "recover_file"
+ },
+ {
+  "description": "\nRemove a constraint by name from an object or a pose bone.\n\nParameters:\n- owner: Object name (the armature when bone is given)\n- name: Constraint name (see get_constraints)\n- bone: Pose bone name (default: the object)\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "owner": {
+     "title": "Owner",
+     "type": "string"
+    }
+   },
+   "required": [
+    "owner",
+    "name"
+   ],
+   "title": "remove_constraintArguments",
+   "type": "object"
+  },
+  "name": "remove_constraint"
+ },
+ {
+  "description": "\nRename an object and its mesh data block.\n\nParameters:\n- old_name: Current object name\n- new_name: Desired new name\n",
+  "inputSchema": {
+   "properties": {
+    "new_name": {
+     "title": "New Name",
+     "type": "string"
+    },
+    "old_name": {
+     "title": "Old Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "old_name",
+    "new_name"
+   ],
+   "title": "rename_objectArguments",
+   "type": "object"
+  },
+  "name": "rename_object"
+ },
+ {
+  "description": "\nRender a still from every camera in the scene and return a contact sheet with\nall results labelled by camera name.\n\nParameters:\n- width: Render width per camera in pixels (default 1920)\n- height: Render height per camera in pixels (default 1080)\n- samples: Sample count for Cycles and EEVEE (default 32)\n- output_dir: Directory to keep the individual full-resolution renders.\n              If omitted, the server setting output_dir is used; if that is\n              unset too they are rendered to the temp dir and deleted after\n              the sheet is built.\n\nReturns a composited contact sheet image.\n",
+  "inputSchema": {
+   "properties": {
+    "height": {
+     "default": 1080,
+     "title": "Height",
+     "type": "integer"
+    },
+    "output_dir": {
+     "default": null,
+     "title": "Output Dir",
+     "type": "string"
+    },
+    "samples": {
+     "default": 32,
+     "title": "Samples",
+     "type": "integer"
+    },
+    "width": {
+     "default": 1920,
+     "title": "Width",
+     "type": "integer"
+    }
+   },
+   "title": "render_all_camerasArguments",
+   "type": "object"
+  },
+  "name": "render_all_cameras"
+ },
+ {
+  "description": "\nRender a normalised depth map from the active camera using the Blender compositor\nZ-pass. Closer objects appear lighter. Rendered in a throw-away scene copy, so the\ncurrent scene's compositor and render settings are untouched.\n\nParameters:\n- max_depth: Depth value (scene units) mapped to black (default 10.0)\n",
+  "inputSchema": {
+   "properties": {
+    "max_depth": {
+     "default": 10.0,
+     "title": "Max Depth",
+     "type": "number"
+    }
+   },
+   "title": "render_depth_mapArguments",
+   "type": "object"
+  },
+  "name": "render_depth_map"
+ },
+ {
+  "description": "\nRender a still from the specified (or active) camera.\n\nParameters:\n- camera_name: Camera to render from (uses scene active camera if omitted)\n- width: Render width in pixels (default 1920)\n- height: Render height in pixels (default 1080)\n- samples: Sample count for Cycles and EEVEE (default 32)\n",
+  "inputSchema": {
+   "properties": {
+    "camera_name": {
+     "default": null,
+     "title": "Camera Name",
+     "type": "string"
+    },
+    "height": {
+     "default": 1080,
+     "title": "Height",
+     "type": "integer"
+    },
+    "samples": {
+     "default": 32,
+     "title": "Samples",
+     "type": "integer"
+    },
+    "width": {
+     "default": 1920,
+     "title": "Width",
+     "type": "integer"
+    }
+   },
+   "title": "render_from_cameraArguments",
+   "type": "object"
+  },
+  "name": "render_from_camera"
+ },
+ {
+  "description": "\nSee a vertex group's weights as Blender's weight-paint heat map (blue 0 to\nred 1) from a named viewport angle. Mode and viewport state are restored.\n\nParameters:\n- mesh: Mesh object name\n- group: Vertex group to display\n- angle: front, back, left, right, top, bottom, iso_front_right, iso_front_left\n- max_size: Maximum pixel dimension (default 800)\n- show_zero_weights: Draw unweighted vertices in black (default True)\n",
+  "inputSchema": {
+   "properties": {
+    "angle": {
+     "default": "front",
+     "title": "Angle",
+     "type": "string"
+    },
+    "group": {
+     "title": "Group",
+     "type": "string"
+    },
+    "max_size": {
+     "default": 800,
+     "title": "Max Size",
+     "type": "integer"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    },
+    "show_zero_weights": {
+     "default": true,
+     "title": "Show Zero Weights",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "mesh",
+    "group"
+   ],
+   "title": "render_weight_mapArguments",
+   "type": "object"
+  },
+  "name": "render_weight_map"
+ },
+ {
+  "description": "\nReset pose transforms to rest (identity), without needing POSE-mode operators.\n\nParameters:\n- armature: Armature object name\n- bones: Comma list of bone names (default: all)\n- transforms: ALL (default), LOCATION, ROTATION or SCALE\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bones": {
+     "default": null,
+     "title": "Bones",
+     "type": "string"
+    },
+    "transforms": {
+     "default": "ALL",
+     "title": "Transforms",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature"
+   ],
+   "title": "reset_poseArguments",
+   "type": "object"
+  },
+  "name": "reset_pose"
+ },
+ {
+  "description": "\nRestore a session saved with save_session_state: the add-on reopens its file\n(with the unsaved-changes guard) and re-applies frame, camera, selection,\nactive object, mode, views, workspace and settings snapshots. Reports what\ncould not be restored.\n\nParameters:\n- name: Session name (default \"last\")\n- load_file: Reopen the session's .blend first (default True)\n- force: Discard unsaved changes in the current file when reopening\n",
+  "inputSchema": {
+   "properties": {
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "load_file": {
+     "default": true,
+     "title": "Load File",
+     "type": "boolean"
+    },
+    "name": {
+     "default": "last",
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "title": "restore_session_stateArguments",
+   "type": "object"
+  },
+  "name": "restore_session_state"
+ },
+ {
+  "description": "\nReload the current file from disk, discarding unsaved changes\n(wm.revert_mainfile). Refuses when the file was never saved.\n\nParameters:\n- force: Required (True) when there are unsaved changes\n- use_scripts: Allow the file's scripts to run; omit (None) for the preference\n",
+  "inputSchema": {
+   "properties": {
+    "force": {
+     "default": false,
+     "title": "Force",
+     "type": "boolean"
+    },
+    "use_scripts": {
+     "default": null,
+     "title": "Use Scripts",
+     "type": "boolean"
+    }
+   },
+   "title": "revert_fileArguments",
+   "type": "object"
+  },
+  "name": "revert_file"
+ },
+ {
+  "description": "\nSet the Euler rotation of an object (degrees).\n\nParameters:\n- name: Object name\n- x, y, z: Rotation in degrees around each axis\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "x": {
+     "default": 0.0,
+     "title": "X",
+     "type": "number"
+    },
+    "y": {
+     "default": 0.0,
+     "title": "Y",
+     "type": "number"
+    },
+    "z": {
+     "default": 0.0,
+     "title": "Z",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "rotate_objectArguments",
+   "type": "object"
+  },
+  "name": "rotate_object"
+ },
+ {
+  "description": "\nSave the current Blender project as a .blend file.\n\nParameters:\n- filepath: Absolute path to save to (e.g. \"C:/projects/my_scene.blend\").\n            If omitted, saves over the currently open file. If the file has\n            never been saved it goes to <server output_dir>/untitled_<stamp>.blend\n            when that setting is set, else to a temporary path (the reply warns).\n- compress: True/False to force compression; omit (None) to use the Blender\n            preference use_file_compression (on by default since Blender 5.0).\n- relative_remap: Remap relative paths when the file moves (default True).\n- copy: True = save a COPY without changing the working file path (default False).\n- incremental: True = Blender's own numbered save beside the open file\n               (a.blend -> a1.blend, then a2.blend); do not combine with filepath.\n               Default False.\n- backup: True (default) keeps Blender's .blend1 backups per the save_version\n          preference; the reply reports that preference value.\n- overwrite: False refuses when the target exists (default True).\n- purge_orphans: True purges orphan data-blocks before saving (default False).\n\nReply: path, bytes written, effective compress, is_dirty after, elapsed seconds.\n",
+  "inputSchema": {
+   "properties": {
+    "backup": {
+     "default": true,
+     "title": "Backup",
+     "type": "boolean"
+    },
+    "compress": {
+     "default": null,
+     "title": "Compress",
+     "type": "boolean"
+    },
+    "copy": {
+     "default": false,
+     "title": "Copy",
+     "type": "boolean"
+    },
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "incremental": {
+     "default": false,
+     "title": "Incremental",
+     "type": "boolean"
+    },
+    "overwrite": {
+     "default": true,
+     "title": "Overwrite",
+     "type": "boolean"
+    },
+    "purge_orphans": {
+     "default": false,
+     "title": "Purge Orphans",
+     "type": "boolean"
+    },
+    "relative_remap": {
+     "default": true,
+     "title": "Relative Remap",
+     "type": "boolean"
+    }
+   },
+   "title": "save_blendArguments",
+   "type": "object"
+  },
+  "name": "save_blend"
+ },
+ {
+  "description": "\nSave a COPY of the working file without changing its path (deliverable-safe\nexport of the current state). Optionally packs images into the copy only.\n\nParameters:\n- filepath: Destination .blend path\n- compress: True/False, or omit for the preference (on by default since 5.0)\n- relative_remap: Remap relative paths for the new location (default True)\n- pack_images: True packs all external images into the copy, then unpacks\n               them again so the working file is unchanged (default False)\n",
+  "inputSchema": {
+   "properties": {
+    "compress": {
+     "default": null,
+     "title": "Compress",
+     "type": "boolean"
+    },
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "pack_images": {
+     "default": false,
+     "title": "Pack Images",
+     "type": "boolean"
+    },
+    "relative_remap": {
+     "default": true,
+     "title": "Relative Remap",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "filepath"
+   ],
+   "title": "save_copyArguments",
+   "type": "object"
+  },
+  "name": "save_copy"
+ },
+ {
+  "description": "\nWrite Blender's user preferences to userpref.blend (wm.save_userpref).\nRefuses without confirm=True and reports preferences.is_dirty and\nuse_preferences_save so you can decide.\n\nParameters:\n- confirm: Must be True to actually save\n",
+  "inputSchema": {
+   "properties": {
+    "confirm": {
+     "default": false,
+     "title": "Confirm",
+     "type": "boolean"
+    }
+   },
+   "title": "save_preferencesArguments",
+   "type": "object"
+  },
+  "name": "save_preferences"
+ },
+ {
+  "description": "\nSave the current values of the given settings scopes as a named preset JSON\nunder the server's presets dir (portable across files and Blender versions).\n\nParameters:\n- name: Preset name (letters, digits, _ . -), becomes <name>.json\n- scopes: Comma list of scopes to capture (default RENDER,OUTPUT,CYCLES,EEVEE,COLOR)\n- overwrite: True replaces an existing preset of that name (default False)\n- description: Free text stored in the preset\n",
+  "inputSchema": {
+   "properties": {
+    "description": {
+     "default": null,
+     "title": "Description",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "overwrite": {
+     "default": false,
+     "title": "Overwrite",
+     "type": "boolean"
+    },
+    "scopes": {
+     "default": "RENDER,OUTPUT,CYCLES,EEVEE,COLOR",
+     "title": "Scopes",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "save_presetArguments",
+   "type": "object"
+  },
+  "name": "save_preset"
+ },
+ {
+  "description": "\nSave what you are working on so it survives a Blender restart: open file\npath and dirty flag, frame range and current frame, active camera, selection\nand active object, mode, each 3D view's view matrix/distance/shading,\nworkspace and the named settings snapshots. Stored as\n<settings dir>/sessions/<name>.json. Pairs with close_blender /\nstart_blender(restore_session=...).\n\nParameters:\n- name: Session name (default \"last\")\n- include: Comma list of FILE, FRAME, CAMERA, SELECTION, ACTIVE, MODE, VIEWPORT,\n           WORKSPACE, SETTINGS_SNAPSHOTS (default: all)\n",
+  "inputSchema": {
+   "properties": {
+    "include": {
+     "default": "FILE,FRAME,CAMERA,SELECTION,ACTIVE,MODE,VIEWPORT,WORKSPACE,SETTINGS_SNAPSHOTS",
+     "title": "Include",
+     "type": "string"
+    },
+    "name": {
+     "default": "last",
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "title": "save_session_stateArguments",
+   "type": "object"
+  },
+  "name": "save_session_state"
+ },
+ {
+  "description": "\nSave a numbered version of the current file (my_scene_v001.blend, _v002, ...)\nwith a sidecar <file>.versions.json recording n, timestamp, note, object count\nand triangle count. The file must have been saved at least once.\n\nParameters:\n- note: Free text stored with the version entry\n- pattern: File-name pattern; {stem} = current file name without extension,\n           {n} = version number (default \"{stem}_v{n:03d}\")\n- dir: Folder for the versions (default: beside the current file)\n- copy: True (default) keeps working on the original; False switches the\n        working file to the new version\n",
+  "inputSchema": {
+   "properties": {
+    "copy": {
+     "default": true,
+     "title": "Copy",
+     "type": "boolean"
+    },
+    "dir": {
+     "default": null,
+     "title": "Dir",
+     "type": "string"
+    },
+    "note": {
+     "default": null,
+     "title": "Note",
+     "type": "string"
+    },
+    "pattern": {
+     "default": "{stem}_v{n:03d}",
+     "title": "Pattern",
+     "type": "string"
+    }
+   },
+   "title": "save_versionArguments",
+   "type": "object"
+  },
+  "name": "save_version"
+ },
+ {
+  "description": "Set the absolute scale of an object on each axis.",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "x": {
+     "default": 1.0,
+     "title": "X",
+     "type": "number"
+    },
+    "y": {
+     "default": 1.0,
+     "title": "Y",
+     "type": "number"
+    },
+    "z": {
+     "default": 1.0,
+     "title": "Z",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "scale_objectArguments",
+   "type": "object"
+  },
+  "name": "scale_object"
+ },
+ {
+  "description": "\nSearch for assets on Polyhaven with optional filtering.\n\nParameters:\n- asset_type: Type of assets to search for (hdris, textures, models, all)\n- categories: Optional comma-separated list of categories to filter by\n\nReturns a list of matching assets with basic information.\n",
+  "inputSchema": {
+   "properties": {
+    "asset_type": {
+     "default": "all",
+     "title": "Asset Type",
+     "type": "string"
+    },
+    "categories": {
+     "default": null,
+     "title": "Categories",
+     "type": "string"
+    }
+   },
+   "title": "search_polyhaven_assetsArguments",
+   "type": "object"
+  },
+  "name": "search_polyhaven_assets"
+ },
+ {
+  "description": "\nSearch for models on Sketchfab with optional filtering.\n\nParameters:\n- query: Text to search for\n- categories: Optional comma-separated list of categories\n- count: Maximum number of results to return (default 20)\n- downloadable: Whether to include only downloadable models (default True)\n\nReturns a formatted list of matching models.\n",
+  "inputSchema": {
+   "properties": {
+    "categories": {
+     "default": null,
+     "title": "Categories",
+     "type": "string"
+    },
+    "count": {
+     "default": 20,
+     "title": "Count",
+     "type": "integer"
+    },
+    "downloadable": {
+     "default": true,
+     "title": "Downloadable",
+     "type": "boolean"
+    },
+    "query": {
+     "title": "Query",
+     "type": "string"
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "title": "search_sketchfab_modelsArguments",
+   "type": "object"
+  },
+  "name": "search_sketchfab_models"
+ },
+ {
+  "description": "\nSelect or deselect objects by name list and/or type.\n\nParameters:\n- names: Comma-separated object names (if omitted, applies to all or filtered by type)\n- action: SELECT, DESELECT, TOGGLE\n- obj_type: Filter by type when names is omitted: MESH, CAMERA, LIGHT, CURVE, etc.\n",
+  "inputSchema": {
+   "properties": {
+    "action": {
+     "default": "SELECT",
+     "title": "Action",
+     "type": "string"
+    },
+    "names": {
+     "default": null,
+     "title": "Names",
+     "type": "string"
+    },
+    "obj_type": {
+     "default": null,
+     "title": "Obj Type",
+     "type": "string"
+    }
+   },
+   "title": "select_objectsArguments",
+   "type": "object"
+  },
+  "name": "select_objects"
+ },
+ {
+  "description": "\nSeparate a mesh object into multiple objects.\n\nParameters:\n- name: Mesh object name\n- method: LOOSE (by disconnected geometry), MATERIAL (by material slot),\n          SELECTED (by face selection)\n",
+  "inputSchema": {
+   "properties": {
+    "method": {
+     "default": "LOOSE",
+     "title": "Method",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "separate_meshArguments",
+   "type": "object"
+  },
+  "name": "separate_mesh"
+ },
+ {
+  "description": "\nSet the active render camera to an existing camera object.\n\nParameters:\n- name: Camera object name\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "set_active_cameraArguments",
+   "type": "object"
+  },
+  "name": "set_active_camera"
+ },
+ {
+  "description": "\nWrite an add-on's preferences (same machinery as set_settings(scope=\"ADDON:<module>\")).\n\nParameters:\n- module: Add-on module name\n- values: JSON object of property -> value\n- persist: True also saves userpref.blend (consent rule; default False)\n",
+  "inputSchema": {
+   "properties": {
+    "module": {
+     "title": "Module",
+     "type": "string"
+    },
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    },
+    "values": {
+     "title": "Values",
+     "type": "string"
+    }
+   },
+   "required": [
+    "module",
+    "values"
+   ],
+   "title": "set_addon_preferencesArguments",
+   "type": "object"
+  },
+  "name": "set_addon_preferences"
+ },
+ {
+  "description": "\nChange the BlenderMCP add-on's own preferences.\n\nParameters:\n- values: JSON object, e.g. '{\"port\": 9877, \"autostart_server\": true,\n          \"hyper3d_api_key\": \"...\"}'. API keys are write-only: the reply says\n          set true/false per key, never the value. A port change applies when\n          the add-on's server is restarted (Disconnect / Connect).\n- persist: True also saves userpref.blend (consent rule; default False)\n",
+  "inputSchema": {
+   "properties": {
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    },
+    "values": {
+     "title": "Values",
+     "type": "string"
+    }
+   },
+   "required": [
+    "values"
+   ],
+   "title": "set_addon_settingsArguments",
+   "type": "object"
+  },
+  "name": "set_addon_settings"
+ },
+ {
+  "description": "\nConfigure Blender's autosave preferences. Only passed values change.\n\nParameters:\n- enabled: preferences.filepaths.use_auto_save_temporary_files\n- interval_minutes: auto_save_time (minutes between autosaves)\n- save_versions: Number of .blend1/.blend2 backups kept on save (save_version)\n- temp_dir: temporary_directory for autosave files (empty = system temp)\n- persist: True also writes userpref.blend (consent rule: nothing here is\n           persisted unless you ask); the reply says whether it was persisted\n",
+  "inputSchema": {
+   "properties": {
+    "enabled": {
+     "default": null,
+     "title": "Enabled",
+     "type": "boolean"
+    },
+    "interval_minutes": {
+     "default": null,
+     "title": "Interval Minutes",
+     "type": "integer"
+    },
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    },
+    "save_versions": {
+     "default": null,
+     "title": "Save Versions",
+     "type": "integer"
+    },
+    "temp_dir": {
+     "default": null,
+     "title": "Temp Dir",
+     "type": "string"
+    }
+   },
+   "title": "set_autosaveArguments",
+   "type": "object"
+  },
+  "name": "set_autosave"
+ },
+ {
+  "description": "\nChange one bone's rest properties. Only the parameters you pass are set.\n\nParameters:\n- armature / bone: Armature object and bone name\n- head / tail: \"x,y,z\" in armature space\n- roll: Degrees\n- parent: Parent bone name (\"\" to clear)\n- connected: Snap the head to the parent's tail and keep it there\n- deform: Whether the bone deforms skinned meshes\n- inherit_rotation: Bool\n- inherit_scale: FULL, FIX_SHEAR, ALIGNED, AVERAGE, NONE, NONE_LEGACY\n- new_name: Rename the bone (vertex groups are not renamed; see rename_bones)\n- envelope_distance: Envelope radius\n- bbone_segments: Bendy-bone segments (1 = plain bone)\n\nReply: set list and unset {prop: reason}, like add_modifier.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bbone_segments": {
+     "default": null,
+     "title": "Bbone Segments",
+     "type": "integer"
+    },
+    "bone": {
+     "title": "Bone",
+     "type": "string"
+    },
+    "connected": {
+     "default": null,
+     "title": "Connected",
+     "type": "boolean"
+    },
+    "deform": {
+     "default": null,
+     "title": "Deform",
+     "type": "boolean"
+    },
+    "envelope_distance": {
+     "default": null,
+     "title": "Envelope Distance",
+     "type": "number"
+    },
+    "head": {
+     "default": null,
+     "title": "Head",
+     "type": "string"
+    },
+    "inherit_rotation": {
+     "default": null,
+     "title": "Inherit Rotation",
+     "type": "boolean"
+    },
+    "inherit_scale": {
+     "default": null,
+     "title": "Inherit Scale",
+     "type": "string"
+    },
+    "new_name": {
+     "default": null,
+     "title": "New Name",
+     "type": "string"
+    },
+    "parent": {
+     "default": null,
+     "title": "Parent",
+     "type": "string"
+    },
+    "roll": {
+     "default": null,
+     "title": "Roll",
+     "type": "number"
+    },
+    "tail": {
+     "default": null,
+     "title": "Tail",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature",
+    "bone"
+   ],
+   "title": "set_bone_propertiesArguments",
+   "type": "object"
+  },
+  "name": "set_bone_properties"
+ },
+ {
+  "description": "\nSet scene colour management. Game-asset renders and bakes usually want\nview_transform \"Standard\" so colours match the engine (Blender's default is AgX).\n\nParameters:\n- view_transform: Standard, Filmic, AgX, Khronos PBR Neutral, Raw, False Color\n- look: e.g. \"None\", \"AgX - Medium High Contrast\" (names depend on the transform)\n- exposure / gamma: Floats (0.0 / 1.0 are neutral)\n- display_device: sRGB, Display P3, Rec.1886, Rec.2020 (or as installed)\n- sequencer_colorspace: Colour space for the sequencer\n\nValues are validated by assignment (the enum list is not readable headless).\n",
+  "inputSchema": {
+   "properties": {
+    "display_device": {
+     "default": null,
+     "title": "Display Device",
+     "type": "string"
+    },
+    "exposure": {
+     "default": null,
+     "title": "Exposure",
+     "type": "number"
+    },
+    "gamma": {
+     "default": null,
+     "title": "Gamma",
+     "type": "number"
+    },
+    "look": {
+     "default": null,
+     "title": "Look",
+     "type": "string"
+    },
+    "sequencer_colorspace": {
+     "default": null,
+     "title": "Sequencer Colorspace",
+     "type": "string"
+    },
+    "view_transform": {
+     "default": null,
+     "title": "View Transform",
+     "type": "string"
+    }
+   },
+   "title": "set_color_managementArguments",
+   "type": "object"
+  },
+  "name": "set_color_management"
+ },
+ {
+  "description": "\nMove a curve control point and optionally adjust its bezier handles.\n\nParameters:\n- name: Curve object name\n- point_index: Zero-based control point index\n- co: Comma-separated x,y,z world-space position\n- handle_left: Comma-separated x,y,z for left handle (bezier only)\n- handle_right: Comma-separated x,y,z for right handle (bezier only)\n- handle_left_type: FREE, ALIGNED, VECTOR, or AUTO (bezier only)\n- handle_right_type: FREE, ALIGNED, VECTOR, or AUTO (bezier only)\n- spline_index: Spline index within the curve object (default 0)\n",
+  "inputSchema": {
+   "properties": {
+    "co": {
+     "title": "Co",
+     "type": "string"
+    },
+    "handle_left": {
+     "default": null,
+     "title": "Handle Left",
+     "type": "string"
+    },
+    "handle_left_type": {
+     "default": null,
+     "title": "Handle Left Type",
+     "type": "string"
+    },
+    "handle_right": {
+     "default": null,
+     "title": "Handle Right",
+     "type": "string"
+    },
+    "handle_right_type": {
+     "default": null,
+     "title": "Handle Right Type",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "point_index": {
+     "title": "Point Index",
+     "type": "integer"
+    },
+    "spline_index": {
+     "default": 0,
+     "title": "Spline Index",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "name",
+    "point_index",
+    "co"
+   ],
+   "title": "set_control_pointArguments",
+   "type": "object"
+  },
+  "name": "set_control_point"
+ },
+ {
+  "description": "\nSet bevel weight on edges, used with the Bevel modifier (limit_method=WEIGHT).\n\nOnly edges with weight > 0 will be bevelled when the modifier uses WEIGHT mode.\nThis lets you selectively bevel specific edges without affecting the whole mesh.\n\nTypical workflow:\n  1. set_edge_bevel_weight(\"Cube\", \"4,5,6,7\", weight=1.0)   \u2190 top edges only\n  2. add_modifier(\"Cube\", \"BEVEL\", params='{\"width\": 0.05, \"limit_method\": \"WEIGHT\"}')\n\nParameters:\n- name: Mesh object name\n- edge_indices: Comma-separated edge indices, or \"all\"\n- weight: 0.0 (no bevel) to 1.0 (full bevel)\n",
+  "inputSchema": {
+   "properties": {
+    "edge_indices": {
+     "title": "Edge Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "weight": {
+     "title": "Weight",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name",
+    "edge_indices",
+    "weight"
+   ],
+   "title": "set_edge_bevel_weightArguments",
+   "type": "object"
+  },
+  "name": "set_edge_bevel_weight"
+ },
+ {
+  "description": "\nSet subdivision crease weight on edges.\n\nCrease controls how the Subdivision Surface modifier handles edge sharpness:\n0.0 = fully smooth (no crease), 1.0 = perfectly sharp crease.\nValues in between give progressively harder edges without going fully sharp.\n\nParameters:\n- name: Mesh object name\n- edge_indices: Comma-separated edge indices, or \"all\"\n- crease: Weight 0.0\u20131.0\n",
+  "inputSchema": {
+   "properties": {
+    "crease": {
+     "title": "Crease",
+     "type": "number"
+    },
+    "edge_indices": {
+     "title": "Edge Indices",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "edge_indices",
+    "crease"
+   ],
+   "title": "set_edge_creaseArguments",
+   "type": "object"
+  },
+  "name": "set_edge_crease"
+ },
+ {
+  "description": "\nAssign a material slot to specific faces (for multi-material objects).\n\nParameters:\n- name: Mesh object name\n- face_indices: Comma-separated face indices, or \"all\" for every face\n- material_index: Material slot number (0-based; material must already be in the object's slots)\n",
+  "inputSchema": {
+   "properties": {
+    "face_indices": {
+     "title": "Face Indices",
+     "type": "string"
+    },
+    "material_index": {
+     "title": "Material Index",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "face_indices",
+    "material_index"
+   ],
+   "title": "set_face_material_indexArguments",
+   "type": "object"
+  },
+  "name": "set_face_material_index"
+ },
+ {
+  "description": "\nSet the current scene frame (scrubs the timeline).\n\nParameters:\n- frame: Target frame number\n",
+  "inputSchema": {
+   "properties": {
+    "frame": {
+     "title": "Frame",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "frame"
+   ],
+   "title": "set_frameArguments",
+   "type": "object"
+  },
+  "name": "set_frame"
+ },
+ {
+  "description": "\nSet the scene frame range and frame rate (shared with the animation tools).\nOnly the parameters you pass are changed.\n\nParameters:\n- start / end: Scene frame range\n- fps / fps_base: Frame rate (24 / 1.0; 24 / 1.001 for 23.976)\n- current: Also set the current frame\n",
+  "inputSchema": {
+   "properties": {
+    "current": {
+     "default": null,
+     "title": "Current",
+     "type": "integer"
+    },
+    "end": {
+     "default": null,
+     "title": "End",
+     "type": "integer"
+    },
+    "fps": {
+     "default": null,
+     "title": "Fps",
+     "type": "number"
+    },
+    "fps_base": {
+     "default": null,
+     "title": "Fps Base",
+     "type": "number"
+    },
+    "start": {
+     "default": null,
+     "title": "Start",
+     "type": "integer"
+    }
+   },
+   "title": "set_frame_rangeArguments",
+   "type": "object"
+  },
+  "name": "set_frame_range"
+ },
+ {
+  "description": "\nInsert many keyframes on one property in a single call.\n\nParameters:\n- target: Object name (the armature when bone is given)\n- data_path: 'location', 'rotation_euler', 'scale', or any animatable path\n- keys: JSON list of [frame, value] pairs or objects\n        {\"frame\", \"value\", \"interpolation\"?, \"easing\"?}. value follows\n        add_keyframe's rules: a number for a scalar, [x,y,z] for a vector,\n        rotations in degrees. interpolation BEZIER/LINEAR/CONSTANT, easing\n        AUTO/EASE_IN/EASE_OUT/EASE_IN_OUT.\n- bone: Pose bone name to key instead of the object (rotation_mode switched\n        to XYZ for Euler paths, reported)\n- replace: Overwrite existing keys on those frames (default True)\n\nReply: keyed count, action name, fcurve path.\n",
+  "inputSchema": {
+   "properties": {
+    "bone": {
+     "default": null,
+     "title": "Bone",
+     "type": "string"
+    },
+    "data_path": {
+     "title": "Data Path",
+     "type": "string"
+    },
+    "keys": {
+     "title": "Keys",
+     "type": "string"
+    },
+    "replace": {
+     "default": true,
+     "title": "Replace",
+     "type": "boolean"
+    },
+    "target": {
+     "title": "Target",
+     "type": "string"
+    }
+   },
+   "required": [
+    "target",
+    "data_path",
+    "keys"
+   ],
+   "title": "set_keyframesArguments",
+   "type": "object"
+  },
+  "name": "set_keyframes"
+ },
+ {
+  "description": "\nSet the Principled BSDF base colour of an object's material.\nCreates the material if one does not exist.\n\nParameters:\n- name: Object name\n- r, g, b, a: Colour channels in 0..1 range\n- material_index: Which material slot to update (default 0)\n",
+  "inputSchema": {
+   "properties": {
+    "a": {
+     "default": 1.0,
+     "title": "A",
+     "type": "number"
+    },
+    "b": {
+     "default": 1.0,
+     "title": "B",
+     "type": "number"
+    },
+    "g": {
+     "default": 1.0,
+     "title": "G",
+     "type": "number"
+    },
+    "material_index": {
+     "default": 0,
+     "title": "Material Index",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "r": {
+     "default": 1.0,
+     "title": "R",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "set_object_material_colorArguments",
+   "type": "object"
+  },
+  "name": "set_object_material_color"
+ },
+ {
+  "description": "\nSet an object's origin point.\n\nParameters:\n- name: Object name\n- origin_type: ORIGIN_GEOMETRY (centre of mesh),\n               ORIGIN_CURSOR (3D cursor position),\n               ORIGIN_CENTER_OF_MASS,\n               ORIGIN_CENTER_OF_VOLUME\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "origin_type": {
+     "default": "ORIGIN_GEOMETRY",
+     "title": "Origin Type",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "set_originArguments",
+   "type": "object"
+  },
+  "name": "set_origin"
+ },
+ {
+  "description": "\nSet the render output path, image format and video settings in one call.\nOnly the parameters you pass are changed.\n\nParameters:\n- filepath: Output path (e.g. \"//renders/frame_####\"); Blender adds the extension\n- file_format: PNG, JPEG, OPEN_EXR (EXR accepted), OPEN_EXR_MULTILAYER, TIFF,\n               BMP, TARGA, WEBP, FFMPEG (video; sets media_type VIDEO on 5.x)\n- color_mode: BW, RGB or RGBA\n- color_depth: \"8\" / \"16\" (PNG, TIFF) or \"16\" / \"32\" (OPEN_EXR)\n- compression: PNG compression 0-100\n- quality: JPEG/WEBP quality 0-100\n- film_transparent: Transparent background (alpha) on/off\n- use_stamp: Burn metadata into the image\n- use_overwrite / use_placeholder: Animation output file handling\n- ffmpeg: JSON for video, e.g. '{\"format\": \"MPEG4\", \"codec\": \"H264\", \"constant_rate_factor\": \"MEDIUM\"}'\n",
+  "inputSchema": {
+   "properties": {
+    "color_depth": {
+     "default": null,
+     "title": "Color Depth",
+     "type": "string"
+    },
+    "color_mode": {
+     "default": null,
+     "title": "Color Mode",
+     "type": "string"
+    },
+    "compression": {
+     "default": null,
+     "title": "Compression",
+     "type": "integer"
+    },
+    "ffmpeg": {
+     "default": null,
+     "title": "Ffmpeg",
+     "type": "string"
+    },
+    "file_format": {
+     "default": null,
+     "title": "File Format",
+     "type": "string"
+    },
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "film_transparent": {
+     "default": null,
+     "title": "Film Transparent",
+     "type": "boolean"
+    },
+    "quality": {
+     "default": null,
+     "title": "Quality",
+     "type": "integer"
+    },
+    "use_overwrite": {
+     "default": null,
+     "title": "Use Overwrite",
+     "type": "boolean"
+    },
+    "use_placeholder": {
+     "default": null,
+     "title": "Use Placeholder",
+     "type": "boolean"
+    },
+    "use_stamp": {
+     "default": null,
+     "title": "Use Stamp",
+     "type": "boolean"
+    }
+   },
+   "title": "set_output_settingsArguments",
+   "type": "object"
+  },
+  "name": "set_output_settings"
+ },
+ {
+  "description": "\nPose bones by writing location / rotation / scale, optionally keying them.\n\nParameters:\n- armature: Armature object name\n- bones: JSON object {\"bone\": {\"location\": [x,y,z], \"rotation\": [x,y,z] degrees\n         or [w,x,y,z] quaternion, \"scale\": [x,y,z]}, ...}; each key optional\n- rotation_mode: XYZ (Euler degrees, default) or QUATERNION; set on each bone\n                 before writing\n- space: POSE (default) - values are bone-local pose values\n- keyframe: Also insert keyframes for the channels written (default False)\n- frame: Frame for the keyframes (default: current)\n\nNote: a pose written on an animated bone is overwritten by the animation at the\nnext update unless keyframe=True.\n\nReply: bones written, rotation modes changed.\n",
+  "inputSchema": {
+   "properties": {
+    "armature": {
+     "title": "Armature",
+     "type": "string"
+    },
+    "bones": {
+     "title": "Bones",
+     "type": "string"
+    },
+    "frame": {
+     "default": null,
+     "title": "Frame",
+     "type": "integer"
+    },
+    "keyframe": {
+     "default": false,
+     "title": "Keyframe",
+     "type": "boolean"
+    },
+    "rotation_mode": {
+     "default": "XYZ",
+     "title": "Rotation Mode",
+     "type": "string"
+    },
+    "space": {
+     "default": "POSE",
+     "title": "Space",
+     "type": "string"
+    }
+   },
+   "required": [
+    "armature",
+    "bones"
+   ],
+   "title": "set_poseArguments",
+   "type": "object"
+  },
+  "name": "set_pose"
+ },
+ {
+  "description": "\nStore the project's target engine and conventions in the scene (custom\nproperty blendermcp_profile, travels with the file) and mirror them to\n<file>.mcp-profile.json. Export and texturing tools read their defaults here.\n\nParameters:\n- engine_target: UNITY, UNREAL, GODOT, BEVY, TIMBERMESH or NONE\n- export_dir / texture_dir / render_dir: Default output folders\n- kit_unit: Modular kit grid unit in scene units\n- naming: Naming convention note (e.g. \"SM_<Asset>_<Variant>\")\n- max_triangles / texture_size: Budgets the validation tools check against\n- notes: Free text\n- apply_units: True also sets scene units for the target (Unreal: centimetres)\n",
+  "inputSchema": {
+   "properties": {
+    "apply_units": {
+     "default": false,
+     "title": "Apply Units",
+     "type": "boolean"
+    },
+    "engine_target": {
+     "title": "Engine Target",
+     "type": "string"
+    },
+    "export_dir": {
+     "default": null,
+     "title": "Export Dir",
+     "type": "string"
+    },
+    "kit_unit": {
+     "default": null,
+     "title": "Kit Unit",
+     "type": "number"
+    },
+    "max_triangles": {
+     "default": null,
+     "title": "Max Triangles",
+     "type": "integer"
+    },
+    "naming": {
+     "default": null,
+     "title": "Naming",
+     "type": "string"
+    },
+    "notes": {
+     "default": null,
+     "title": "Notes",
+     "type": "string"
+    },
+    "render_dir": {
+     "default": null,
+     "title": "Render Dir",
+     "type": "string"
+    },
+    "texture_dir": {
+     "default": null,
+     "title": "Texture Dir",
+     "type": "string"
+    },
+    "texture_size": {
+     "default": null,
+     "title": "Texture Size",
+     "type": "integer"
+    }
+   },
+   "required": [
+    "engine_target"
+   ],
+   "title": "set_project_profileArguments",
+   "type": "object"
+  },
+  "name": "set_project_profile"
+ },
+ {
+  "description": "\nChoose the Cycles render device and compute backend.\n\nParameters:\n- device: GPU or CPU (scene.cycles.device)\n- backend: OPTIX, CUDA, HIP, ONEAPI, METAL or NONE (Cycles preferences\n           compute_device_type; validated by assignment, then every device of\n           that type is enabled)\n- persist: True also saves userpref.blend (consent rule)\n\nReply: the devices Blender found with their use flag.\n",
+  "inputSchema": {
+   "properties": {
+    "backend": {
+     "default": null,
+     "title": "Backend",
+     "type": "string"
+    },
+    "device": {
+     "default": "GPU",
+     "title": "Device",
+     "type": "string"
+    },
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    }
+   },
+   "title": "set_render_deviceArguments",
+   "type": "object"
+  },
+  "name": "set_render_device"
+ },
+ {
+  "description": "\nApply a quality preset. The previous values are stored in the settings\nsnapshot \"_before_quality\" so settings_restore(\"_before_quality\") undoes it.\n\nParameters:\n- preset: PREVIEW (25% resolution, 16 samples, denoise on, simplify on),\n          DRAFT (50%, 64 samples), FINAL (100%, 256 samples or the engine\n          default, persistent data on)\n- engine: Optionally switch the engine first (CYCLES, BLENDER_EEVEE, BLENDER_WORKBENCH)\n",
+  "inputSchema": {
+   "properties": {
+    "engine": {
+     "default": null,
+     "title": "Engine",
+     "type": "string"
+    },
+    "preset": {
+     "default": "PREVIEW",
+     "title": "Preset",
+     "type": "string"
+    }
+   },
+   "title": "set_render_qualityArguments",
+   "type": "object"
+  },
+  "name": "set_render_quality"
+ },
+ {
+  "description": "\nConfigure scene render settings. Only the parameters you pass are changed.\nEvery value is validated against Blender's own property definitions (the\nsame path as set_settings(scope=\"RENDER\")); rejected values are listed.\n\nParameters:\n- engine: CYCLES, BLENDER_EEVEE (alias EEVEE; the 4.x id BLENDER_EEVEE_NEXT\n          is accepted), BLENDER_WORKBENCH. The reply reports the engine id\n          actually set.\n- width / height: Render resolution in pixels\n- samples: Number of render samples (affects quality/noise)\n- output_path: File path for saved renders (e.g. \"C:/renders/frame_####.png\")\n- file_format: PNG, JPEG, OPEN_EXR (EXR accepted), TIFF, BMP, FFMPEG (video)\n- transparent_background: True to render with alpha instead of background colour\n- fps / fps_base: Frame rate (fps=24, fps_base=1.001 for 23.976)\n- frame_start / frame_end: Scene frame range\n- resolution_percentage: 1-100 (render at a fraction of width x height)\n- color_mode: BW, RGB or RGBA\n- color_depth: 8 or 16 (PNG/TIFF), 16 or 32 (OPEN_EXR), as a string\n- compression: PNG compression 0-100\n- denoise: Cycles denoising on/off\n- device: Cycles render device, CPU or GPU\n- use_persistent_data: Keep render data between frames (faster animations)\n- use_simplify / simplify_subdivision: Simplify toggle and max subdivision level\n",
+  "inputSchema": {
+   "properties": {
+    "color_depth": {
+     "default": null,
+     "title": "Color Depth",
+     "type": "string"
+    },
+    "color_mode": {
+     "default": null,
+     "title": "Color Mode",
+     "type": "string"
+    },
+    "compression": {
+     "default": null,
+     "title": "Compression",
+     "type": "integer"
+    },
+    "denoise": {
+     "default": null,
+     "title": "Denoise",
+     "type": "boolean"
+    },
+    "device": {
+     "default": null,
+     "title": "Device",
+     "type": "string"
+    },
+    "engine": {
+     "default": null,
+     "title": "Engine",
+     "type": "string"
+    },
+    "file_format": {
+     "default": null,
+     "title": "File Format",
+     "type": "string"
+    },
+    "fps": {
+     "default": null,
+     "title": "Fps",
+     "type": "number"
+    },
+    "fps_base": {
+     "default": null,
+     "title": "Fps Base",
+     "type": "number"
+    },
+    "frame_end": {
+     "default": null,
+     "title": "Frame End",
+     "type": "integer"
+    },
+    "frame_start": {
+     "default": null,
+     "title": "Frame Start",
+     "type": "integer"
+    },
+    "height": {
+     "default": null,
+     "title": "Height",
+     "type": "integer"
+    },
+    "output_path": {
+     "default": null,
+     "title": "Output Path",
+     "type": "string"
+    },
+    "resolution_percentage": {
+     "default": null,
+     "title": "Resolution Percentage",
+     "type": "integer"
+    },
+    "samples": {
+     "default": null,
+     "title": "Samples",
+     "type": "integer"
+    },
+    "simplify_subdivision": {
+     "default": null,
+     "title": "Simplify Subdivision",
+     "type": "integer"
+    },
+    "transparent_background": {
+     "default": null,
+     "title": "Transparent Background",
+     "type": "boolean"
+    },
+    "use_persistent_data": {
+     "default": null,
+     "title": "Use Persistent Data",
+     "type": "boolean"
+    },
+    "use_simplify": {
+     "default": null,
+     "title": "Use Simplify",
+     "type": "boolean"
+    },
+    "width": {
+     "default": null,
+     "title": "Width",
+     "type": "integer"
+    }
+   },
+   "title": "set_render_settingsArguments",
+   "type": "object"
+  },
+  "name": "set_render_settings"
+ },
+ {
+  "description": "\nSet scene units (shared with the engine-readiness tools), by engine preset\nor explicitly. Unreal wants centimetres (scale_length 0.01, CENTIMETERS);\nUnity, Godot, Bevy and glTF want metres (1.0, METERS).\n\nParameters:\n- preset: UNREAL, UNITY, GODOT, BEVY, TIMBERMESH or NONE (sets system,\n          scale_length and length_unit for that engine)\n- system: METRIC, IMPERIAL or NONE\n- scale_length: Unit scale (1.0 = metres, 0.01 = centimetres)\n- length_unit: ADAPTIVE, KILOMETERS, METERS, CENTIMETERS, MILLIMETERS,\n               MICROMETERS, MILES, FEET, INCHES, THOU\n- rescale_objects: True also scales the scene's objects so they keep their\n                   real-world size under the new scale_length (default False)\n",
+  "inputSchema": {
+   "properties": {
+    "length_unit": {
+     "default": null,
+     "title": "Length Unit",
+     "type": "string"
+    },
+    "preset": {
+     "default": null,
+     "title": "Preset",
+     "type": "string"
+    },
+    "rescale_objects": {
+     "default": false,
+     "title": "Rescale Objects",
+     "type": "boolean"
+    },
+    "scale_length": {
+     "default": null,
+     "title": "Scale Length",
+     "type": "number"
+    },
+    "system": {
+     "default": null,
+     "title": "System",
+     "type": "string"
+    }
+   },
+   "title": "set_scene_unitsArguments",
+   "type": "object"
+  },
+  "name": "set_scene_units"
+ },
+ {
+  "description": "\nChange the Python server's own settings and persist them to settings.json.\n\nParameters:\n- values: JSON object of key -> value, e.g. '{\"port\": 9877, \"output_dir\": \"D:/renders\"}'.\n  Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,\n  presets_dir, image_max_pixels, log_level, img_to_3d_port. A null value resets\n  a key to its default. Unknown keys and wrong types are reported as rejected.\n  host and port take effect on the next connection (the current one is dropped);\n  the other keys apply immediately. A key set by an environment variable keeps\n  the environment value until that variable is unset (reported as overridden).\n",
+  "inputSchema": {
+   "properties": {
+    "values": {
+     "title": "Values",
+     "type": "string"
+    }
+   },
+   "required": [
+    "values"
+   ],
+   "title": "set_server_settingsArguments",
+   "type": "object"
+  },
+  "name": "set_server_settings"
+ },
+ {
+  "description": "\nWrite values into a settings scope. Each value is validated against Blender's\nproperty definition (enum membership, numeric range, type) before writing;\nread-only properties are refused with the reason.\n\nParameters:\n- scope: One of the scopes listed in describe_settings. SERVER writes the\n         Python server's settings.json (same as set_server_settings).\n- values: JSON object of property -> value, e.g. '{\"resolution_x\": 1280, \"engine\": \"CYCLES\"}'\n- persist: For PREFS_*, ADDON: and MCP scopes, True also saves userpref.blend\n           (consent rule: preferences are never persisted unless asked)\n\nReply: set (applied keys) and unset {key: reason}, like add_modifier.\n",
+  "inputSchema": {
+   "properties": {
+    "persist": {
+     "default": false,
+     "title": "Persist",
+     "type": "boolean"
+    },
+    "scope": {
+     "title": "Scope",
+     "type": "string"
+    },
+    "values": {
+     "title": "Values",
+     "type": "string"
+    }
+   },
+   "required": [
+    "scope",
+    "values"
+   ],
+   "title": "set_settingsArguments",
+   "type": "object"
+  },
+  "name": "set_settings"
+ },
+ {
+  "description": "\nToggle and configure render Simplify (scene.render.use_simplify and friends).\n\nParameters:\n- enabled: Simplify on/off\n- subdivision: Max subdivision level for renders (simplify_subdivision)\n- child_particles: 0.0-1.0 fraction of child particles\n- texture_limit: OFF, 128, 256, 512, 1024, 2048, 4096, 8192 (Cycles texture limit)\n- volume_resolution: 0.0-1.0 volume resolution factor\n",
+  "inputSchema": {
+   "properties": {
+    "child_particles": {
+     "default": null,
+     "title": "Child Particles",
+     "type": "number"
+    },
+    "enabled": {
+     "title": "Enabled",
+     "type": "boolean"
+    },
+    "subdivision": {
+     "default": null,
+     "title": "Subdivision",
+     "type": "integer"
+    },
+    "texture_limit": {
+     "default": null,
+     "title": "Texture Limit",
+     "type": "string"
+    },
+    "volume_resolution": {
+     "default": null,
+     "title": "Volume Resolution",
+     "type": "number"
+    }
+   },
+   "required": [
+    "enabled"
+   ],
+   "title": "set_simplifyArguments",
+   "type": "object"
+  },
+  "name": "set_simplify"
+ },
+ {
+  "description": "\nToggle smooth or flat shading on a mesh object.\n\nParameters:\n- name: Mesh object name\n- smooth: True for smooth shading, False for flat\n- auto_smooth: Enable auto-smooth (smooths only edges below angle threshold)\n- angle: Auto-smooth threshold in degrees (default 30\u00b0)\n",
+  "inputSchema": {
+   "properties": {
+    "angle": {
+     "default": 30.0,
+     "title": "Angle",
+     "type": "number"
+    },
+    "auto_smooth": {
+     "default": true,
+     "title": "Auto Smooth",
+     "type": "boolean"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "smooth": {
+     "default": true,
+     "title": "Smooth",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "set_smooth_shadingArguments",
+   "type": "object"
+  },
+  "name": "set_smooth_shading"
+ },
+ {
+  "description": "\nApply a previously downloaded Polyhaven texture to an object.\n\nParameters:\n- object_name: Name of the object to apply the texture to\n- texture_id: ID of the Polyhaven texture to apply (must be downloaded first)\n\nReturns a message indicating success or failure.\n",
+  "inputSchema": {
+   "properties": {
+    "object_name": {
+     "title": "Object Name",
+     "type": "string"
+    },
+    "texture_id": {
+     "title": "Texture Id",
+     "type": "string"
+    }
+   },
+   "required": [
+    "object_name",
+    "texture_id"
+   ],
+   "title": "set_textureArguments",
+   "type": "object"
+  },
+  "name": "set_texture"
+ },
+ {
+  "description": "\nMove a single vertex of a mesh object to a world-space position.\n\nParameters:\n- name: Mesh object name\n- vertex_index: Zero-based vertex index\n- x, y, z: Target world-space position\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "vertex_index": {
+     "title": "Vertex Index",
+     "type": "integer"
+    },
+    "x": {
+     "title": "X",
+     "type": "number"
+    },
+    "y": {
+     "title": "Y",
+     "type": "number"
+    },
+    "z": {
+     "title": "Z",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name",
+    "vertex_index",
+    "x",
+    "y",
+    "z"
+   ],
+   "title": "set_vertex_positionArguments",
+   "type": "object"
+  },
+  "name": "set_vertex_position"
+ },
+ {
+  "description": "\nBatch-update multiple vertex positions in a single call (much faster than\ncalling set_vertex_position repeatedly for many vertices).\n\nParameters:\n- name: Mesh object name\n- vertices: JSON array of {\"index\": int, \"co\": [x, y, z]} objects.\n            Example: '[{\"index\":0,\"co\":[0,0,1]},{\"index\":3,\"co\":[1,0,0]}]'\n- world_space: True = co values are world-space (default), False = local/object space\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "vertices": {
+     "title": "Vertices",
+     "type": "string"
+    },
+    "world_space": {
+     "default": true,
+     "title": "World Space",
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "name",
+    "vertices"
+   ],
+   "title": "set_vertex_positionsArguments",
+   "type": "object"
+  },
+  "name": "set_vertex_positions"
+ },
+ {
+  "description": "\nWrite vertex weights into one group.\n\nParameters:\n- mesh: Mesh object name\n- group: Vertex group name\n- weights: JSON object {\"index\": weight, ...} or list of [index, weight] pairs\n- mode: REPLACE (default), ADD or SUBTRACT (VertexGroup.add semantics)\n- create_group: Create the group if it does not exist (default True)\n\nReply: vertices written, whether the group was created.\n",
+  "inputSchema": {
+   "properties": {
+    "create_group": {
+     "default": true,
+     "title": "Create Group",
+     "type": "boolean"
+    },
+    "group": {
+     "title": "Group",
+     "type": "string"
+    },
+    "mesh": {
+     "title": "Mesh",
+     "type": "string"
+    },
+    "mode": {
+     "default": "REPLACE",
+     "title": "Mode",
+     "type": "string"
+    },
+    "weights": {
+     "title": "Weights",
+     "type": "string"
+    }
+   },
+   "required": [
+    "mesh",
+    "group",
+    "weights"
+   ],
+   "title": "set_vertex_weightsArguments",
+   "type": "object"
+  },
+  "name": "set_vertex_weights"
+ },
+ {
+  "description": "\nApply viewport display settings to EVERY 3D view (the persistent counterpart\nof the per-capture shading/overlay options). Needs a GUI session.\n\nParameters:\n- shading: WIREFRAME, SOLID, MATERIAL or RENDERED\n- light: STUDIO, MATCAP or FLAT (solid mode)\n- color_type: MATERIAL, SINGLE, OBJECT, RANDOM, VERTEX or TEXTURE (solid mode)\n- show_overlays / show_floor / show_stats: Overlay toggles\n- clip_end: View clip distance\n- lens: Viewport focal length in mm\n",
+  "inputSchema": {
+   "properties": {
+    "clip_end": {
+     "default": null,
+     "title": "Clip End",
+     "type": "number"
+    },
+    "color_type": {
+     "default": null,
+     "title": "Color Type",
+     "type": "string"
+    },
+    "lens": {
+     "default": null,
+     "title": "Lens",
+     "type": "number"
+    },
+    "light": {
+     "default": null,
+     "title": "Light",
+     "type": "string"
+    },
+    "shading": {
+     "default": null,
+     "title": "Shading",
+     "type": "string"
+    },
+    "show_floor": {
+     "default": null,
+     "title": "Show Floor",
+     "type": "boolean"
+    },
+    "show_overlays": {
+     "default": null,
+     "title": "Show Overlays",
+     "type": "boolean"
+    },
+    "show_stats": {
+     "default": null,
+     "title": "Show Stats",
+     "type": "boolean"
+    }
+   },
+   "title": "set_viewport_defaultsArguments",
+   "type": "object"
+  },
+  "name": "set_viewport_defaults"
+ },
+ {
+  "description": "\nSwitch the active workspace, e.g. set_workspace(\"Layout\") to guarantee a 3D\nview for the capture tools. Needs a GUI session.\n\nParameters:\n- name: Workspace name (see list_workspaces)\n",
+  "inputSchema": {
+   "properties": {
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "set_workspaceArguments",
+   "type": "object"
+  },
+  "name": "set_workspace"
+ },
+ {
+  "description": "\nSet the scene world background to a solid colour or an HDRI environment map.\n\nParameters:\n- color: Comma-separated r,g,b in 0..1 range (used when hdri_path is not given)\n- strength: Background emission strength (default 1.0)\n- hdri_path: Absolute path to a .hdr or .exr file (overrides color)\n",
+  "inputSchema": {
+   "properties": {
+    "color": {
+     "default": "0.05,0.05,0.05",
+     "title": "Color",
+     "type": "string"
+    },
+    "hdri_path": {
+     "default": null,
+     "title": "Hdri Path",
+     "type": "string"
+    },
+    "strength": {
+     "default": 1.0,
+     "title": "Strength",
+     "type": "number"
+    }
+   },
+   "title": "set_world_backgroundArguments",
+   "type": "object"
+  },
+  "name": "set_world_background"
+ },
+ {
+  "description": "\nRestore a settings snapshot taken with settings_snapshot (by name, or from a\nJSON file). Reports keys that no longer exist or failed to apply.\n\nParameters:\n- name: Snapshot name (session snapshots)\n- filepath: JSON file written by settings_snapshot (used when name is omitted)\n- scopes: Comma list to restore only some scopes (default: all in the snapshot)\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "default": null,
+     "title": "Name",
+     "type": "string"
+    },
+    "scopes": {
+     "default": null,
+     "title": "Scopes",
+     "type": "string"
+    }
+   },
+   "title": "settings_restoreArguments",
+   "type": "object"
+  },
+  "name": "settings_restore"
+ },
+ {
+  "description": "\nCapture the current values of the given scopes under a name (kept in the\nBlender session; survives an add-on reload, dies with Blender) and\noptionally into a JSON file. Restore with settings_restore.\n\nParameters:\n- name: Snapshot name\n- scopes: Comma list of scopes (default: the eight scene-level scopes)\n- filepath: Also write the snapshot to this JSON file\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "default": null,
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "scopes": {
+     "default": "SCENE,RENDER,OUTPUT,CYCLES,EEVEE,COLOR,UNITS,VIEWPORT",
+     "title": "Scopes",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "settings_snapshotArguments",
+   "type": "object"
+  },
+  "name": "settings_snapshot"
+ },
+ {
+  "description": "\nMove an object so its lowest bounding-box point rests on the ground plane.\n\nParameters:\n- name: Object name\n- ground_z: Z value of the ground plane (default 0.0)\n",
+  "inputSchema": {
+   "properties": {
+    "ground_z": {
+     "default": 0.0,
+     "title": "Ground Z",
+     "type": "number"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "snap_to_groundArguments",
+   "type": "object"
+  },
+  "name": "snap_to_ground"
+ },
+ {
+  "description": "\nLaunch Blender as a managed subprocess.\n\nParameters:\n- blend_file: Path to a .blend file to open on startup (optional)\n- blender_exe: Full path to the Blender executable. Auto-detected if omitted:\n               the BLENDER_EXE environment variable, then the settings file\n               (blender_exe), then PATH, then the highest-version copy among\n               Program Files installs and portable zip folders\n               (blender-<ver>-windows-x64 on D:, in the user's home or on any\n               fixed drive root), then Steam. get_blender_status shows the pick.\n- background: True = headless mode (--background), no UI. Useful for rendering.\n- wait_for_addon: Wait up to 30 s for the BlenderMCP addon socket to become\n                  reachable (default True). Set False for background jobs that\n                  don't use the addon.\n- python_expr: Optional Python expression passed to Blender via --python-expr,\n               e.g. \"import bpy; bpy.ops.wm.quit_blender()\" for scripted batch runs.\n- start_server: True (default) also asks the add-on to start its socket server\n                through a --python-expr hook: 1 s after startup in GUI mode (in\n                case the autostart preference is off), immediately in background\n                mode (autostart never opens a port headless; only this does).\n- restore_session: Name of a session saved with save_session_state (e.g. \"last\")\n                   to reopen and re-apply once the add-on answers.\n\nBlender console output goes to blender_mcp_blender.log in the temp folder; it\nmust never share this process stdio, which carries the MCP transport.\n",
+  "inputSchema": {
+   "properties": {
+    "background": {
+     "default": false,
+     "title": "Background",
+     "type": "boolean"
+    },
+    "blend_file": {
+     "default": null,
+     "title": "Blend File",
+     "type": "string"
+    },
+    "blender_exe": {
+     "default": null,
+     "title": "Blender Exe",
+     "type": "string"
+    },
+    "python_expr": {
+     "default": null,
+     "title": "Python Expr",
+     "type": "string"
+    },
+    "restore_session": {
+     "default": null,
+     "title": "Restore Session",
+     "type": "string"
+    },
+    "start_server": {
+     "default": true,
+     "title": "Start Server",
+     "type": "boolean"
+    },
+    "wait_for_addon": {
+     "default": true,
+     "title": "Wait For Addon",
+     "type": "boolean"
+    }
+   },
+   "title": "start_blenderArguments",
+   "type": "object"
+  },
+  "name": "start_blender"
+ },
+ {
+  "description": "\nStore a local image file as a named reference for later comparison tools.\n\nParameters:\n- name: Short identifier (e.g. \"concept_art\")\n- filepath: Absolute path to the image file on disk\n",
+  "inputSchema": {
+   "properties": {
+    "filepath": {
+     "title": "Filepath",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name",
+    "filepath"
+   ],
+   "title": "store_reference_imageArguments",
+   "type": "object"
+  },
+  "name": "store_reference_image"
+ },
+ {
+  "description": "\nSubdivide all faces of a mesh (equivalent to Subdivide in Edit Mode).\n\nParameters:\n- name: Mesh object name\n- cuts: Number of cuts per edge (default 1)\n- smoothness: Smooth factor 0..1 (default 0.0 = flat)\n",
+  "inputSchema": {
+   "properties": {
+    "cuts": {
+     "default": 1,
+     "title": "Cuts",
+     "type": "integer"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    },
+    "smoothness": {
+     "default": 0.0,
+     "title": "Smoothness",
+     "type": "number"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "subdivide_meshArguments",
+   "type": "object"
+  },
+  "name": "subdivide_mesh"
+ },
+ {
+  "description": "\nTriangulate all faces of a mesh (convert quads/ngons to triangles).\nUseful before export to game engines or 3D printing.\n\nParameters:\n- name: Mesh object name\n- method: BEAUTY (best quality, default), FIXED, FIXED_ALTERNATE,\n          SHORTEST_DIAGONAL\n",
+  "inputSchema": {
+   "properties": {
+    "method": {
+     "default": "BEAUTY",
+     "title": "Method",
+     "type": "string"
+    },
+    "name": {
+     "title": "Name",
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "title": "triangulate_meshArguments",
+   "type": "object"
+  },
+  "name": "triangulate_mesh"
+ },
+ {
+  "description": "\nStop the local image-to-3D server, freeing VRAM and memory.\n",
+  "inputSchema": {
+   "properties": {},
+   "title": "unload_img_to_3d_modelArguments",
+   "type": "object"
+  },
+  "name": "unload_img_to_3d_model"
+ },
+ {
+  "description": "\nUnpack every packed file back to disk (bpy.ops.file.unpack_all).\n\nParameters:\n- unpack_method: USE_LOCAL (default, write next to the .blend into //textures),\n                 WRITE_LOCAL, USE_ORIGINAL, WRITE_ORIGINAL, KEEP, REMOVE\n",
+  "inputSchema": {
+   "properties": {
+    "unpack_method": {
+     "default": "USE_LOCAL",
+     "title": "Unpack Method",
+     "type": "string"
+    }
+   },
+   "title": "unpack_allArguments",
+   "type": "object"
+  },
+  "name": "unpack_all"
+ }
+]

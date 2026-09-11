@@ -1,4 +1,4 @@
-# Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
+# Code created by Siddharth Ahuja: www.github.com/ahujasid (c) 2025
 
 import re
 import bpy
@@ -13,7 +13,9 @@ import traceback
 import os
 import shutil
 import zipfile
+import platform
 from bpy.props import IntProperty
+from bpy.app.handlers import persistent
 import io
 from datetime import datetime
 import hashlib, hmac, base64
@@ -25,12 +27,17 @@ import bmesh
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 6, 0),
+    "version": (2, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
     "category": "Interface",
 }
+
+# Wire protocol number, mirrored by the server's PROTOCOL constant. Bumped when a handler key
+# is renamed or removed, or an existing payload / reply key changes meaning or type; purely
+# additive keys with addon-side defaults do not bump it.
+PROTOCOL = 1
 
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
 
@@ -50,17 +57,135 @@ def _restart_flag_set(value: bool) -> None:
     else:
         bpy.app.driver_namespace.pop(_RESTART_FLAG, None)
 
+
+# ─── Preferences and server-lifecycle helpers ────────────────────────────────
+# The port, the autostart switch and every API key live in BLENDERMCP_AddonPreferences (never
+# in the .blend). A sys.path import (headless harness) is NOT in preferences.addons, so
+# _prefs() returns None there and every consumer falls back to defaults.
+
+_DEFAULT_PORT = 9876
+_SERVER_HOST = "127.0.0.1"      # AF_INET only; 'localhost' may resolve to ::1 first on the client
+_SECRET_NAMES = ("hyper3d_api_key", "sketchfab_api_key", "hunyuan3d_secret_id", "hunyuan3d_secret_key")
+_ENSURE_SERVER_HOOK = "blendermcp_ensure_server"     # driver_namespace key for --python-expr launches
+
+
+def _prefs():
+    """This add-on's AddonPreferences, or None when the module is not in preferences.addons."""
+    try:
+        entry = bpy.context.preferences.addons.get(__name__)
+    except Exception:
+        return None
+    return entry.preferences if entry is not None else None
+
+
+def _port():
+    """Configured server port; the default when preferences are unavailable."""
+    prefs = _prefs()
+    try:
+        return int(prefs.port) if prefs is not None else _DEFAULT_PORT
+    except Exception:
+        return _DEFAULT_PORT
+
+
+def _secret(name):
+    """
+    API key / secret by short name (see _SECRET_NAMES): preferences first, then the legacy
+    Scene property as a read-only fallback. The legacy Scene properties stay registered but
+    undrawn through 2.1.x so pre-2.1 files still load and migrate; they go away in 2.2.0.
+    """
+    prefs = _prefs()
+    if prefs is not None:
+        value = getattr(prefs, name, "") or ""
+        if value:
+            return value
+    scene = getattr(bpy.context, "scene", None)
+    return (getattr(scene, "blendermcp_" + name, "") or "") if scene is not None else ""
+
+
+def _migrate_legacy_secrets(prefs, scene=None):
+    """
+    One-time move of non-empty legacy Scene secrets into prefs (only where the prefs value is
+    empty), blanking the Scene copy so it is not saved into the file again. prefs is a
+    parameter so a headless test can pass a stand-in object. Returns the migrated names.
+    """
+    if prefs is None:
+        return []
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return []
+    migrated = []
+    for name in _SECRET_NAMES:
+        legacy = getattr(scene, "blendermcp_" + name, "") or ""
+        if legacy and not (getattr(prefs, name, "") or ""):
+            try:
+                setattr(prefs, name, legacy)
+                setattr(scene, "blendermcp_" + name, "")
+                migrated.append(name)
+            except Exception as e:
+                print(f"BlenderMCP: could not migrate legacy {name}: {e}")
+    return migrated
+
+
+def _server_running():
+    """Runtime truth about the socket server (replaces the old Scene.blendermcp_server_running)."""
+    srv = getattr(bpy.types, "blendermcp_server", None)
+    return srv is not None and bool(getattr(srv, "running", False))
+
+
+def ensure_server(port=None):
+    """
+    Start the socket server if it is not running; never raises.
+    port=None reads the preference (9876 without preferences); port=0 asks the OS for a free
+    port (tests). Returns {"running", "port", "host", "started_now"} plus "error" on a failed
+    bind. Shared by the deferred autostart timer, the panel button, the ensure_server_running
+    command and the bpy.app.driver_namespace["blendermcp_ensure_server"] launch hook.
+    """
+    srv = getattr(bpy.types, "blendermcp_server", None)
+    if srv is not None and srv.running:
+        return {"running": True, "port": srv.port, "host": srv.host, "started_now": False}
+    wanted = _port() if port is None else int(port)
+    if srv is None or srv.port != wanted or srv.host != _SERVER_HOST:
+        srv = BlenderMCPServer(host=_SERVER_HOST, port=wanted)
+        bpy.types.blendermcp_server = srv
+    srv.start()
+    result = {"running": bool(srv.running), "port": srv.port, "host": srv.host,
+              "started_now": bool(srv.running)}
+    if not srv.running:
+        result["error"] = srv.last_error or f"could not bind {srv.host}:{wanted}"
+    return result
+
+
+@persistent
+def _on_load_post(_filepath=None):
+    """A newly opened file may carry pre-2.1 secrets: migrate them once. The server is
+    process-global and is left alone."""
+    try:
+        _migrate_legacy_secrets(_prefs())
+    except Exception as e:
+        print(f"BlenderMCP load_post migration failed: {e}")
+
+
+def _on_exit_pre(*_args):
+    """Blender 5.1+: close the socket before the process exits (4.x relies on unregister())."""
+    srv = getattr(bpy.types, "blendermcp_server", None)
+    if srv is not None:
+        with suppress(Exception):
+            srv.stop()
+
+
 # Add User-Agent as required by Poly Haven API
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
 class BlenderMCPServer:
-    def __init__(self, host='localhost', port=9876):
+    def __init__(self, host=_SERVER_HOST, port=_DEFAULT_PORT):
         self.host = host
         self.port = port
         self.running = False
         self.socket = None
         self.server_thread = None
+        self.last_error = None
 
     def start(self):
         if self.running:
@@ -68,12 +193,14 @@ class BlenderMCPServer:
             return
 
         self.running = True
+        self.last_error = None
 
         try:
             # Create socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.host, self.port))
+            self.port = self.socket.getsockname()[1]      # port=0 -> the OS-assigned port
             self.socket.listen(5)
 
             # Start server thread
@@ -83,6 +210,7 @@ class BlenderMCPServer:
 
             print(f"BlenderMCP server started on {self.host}:{self.port}")
         except Exception as e:
+            self.last_error = str(e)
             print(f"Failed to start server: {str(e)}")
             self.stop()
 
@@ -298,6 +426,8 @@ class BlenderMCPServer:
             "set_control_point": self.set_control_point,
             # Lifecycle
             "quit_blender": self.quit_blender,
+            "get_version": self.get_version,
+            "ensure_server_running": self.ensure_server_running,
             # Edge operations
             "get_edges": self.get_edges,
             "mark_sharp_edges": self.mark_sharp_edges,
@@ -359,6 +489,87 @@ class BlenderMCPServer:
             # Collections
             "create_collection": self.create_collection,
             "move_to_collection": self.move_to_collection,
+            # Settings, save and load (B0 Tier 1): file lifecycle
+            "get_file_state": self.get_file_state,
+            "new_file": self.new_file,
+            "revert_file": self.revert_file,
+            "recover_file": self.recover_file,
+            "save_copy": self.save_copy,
+            "save_version": self.save_version,
+            "list_versions": self.list_versions,
+            "append_from_blend": self.append_from_blend,
+            "link_from_blend": self.link_from_blend,
+            "set_autosave": self.set_autosave,
+            "make_paths_relative": self.make_paths_relative,
+            "make_paths_absolute": self.make_paths_absolute,
+            "find_missing_files": self.find_missing_files,
+            "pack_all": self.pack_all,
+            "unpack_all": self.unpack_all,
+            # Settings, generic
+            "describe_settings": self.describe_settings,
+            "get_settings": self.get_settings,
+            "set_settings": self.set_settings,
+            "settings_snapshot": self.settings_snapshot,
+            "settings_restore": self.settings_restore,
+            "list_settings_snapshots": self.list_settings_snapshots,
+            "delete_settings_snapshot": self.delete_settings_snapshot,
+            # Settings, typed conveniences
+            "set_output_settings": self.set_output_settings,
+            "set_color_management": self.set_color_management,
+            "set_render_quality": self.set_render_quality,
+            "set_render_device": self.set_render_device,
+            "list_render_devices": self.list_render_devices,
+            "set_simplify": self.set_simplify,
+            "set_frame_range": self.set_frame_range,
+            "set_scene_units": self.set_scene_units,
+            "set_viewport_defaults": self.set_viewport_defaults,
+            # Presets and profiles
+            "list_blender_presets": self.list_blender_presets,
+            "apply_blender_preset": self.apply_blender_preset,
+            "set_project_profile": self.set_project_profile,
+            "get_project_profile": self.get_project_profile,
+            # Add-ons, workspaces, preferences
+            "list_addons": self.list_addons,
+            "enable_addon": self.enable_addon,
+            "disable_addon": self.disable_addon,
+            "get_addon_preferences": self.get_addon_preferences,
+            "set_addon_preferences": self.set_addon_preferences,
+            "save_preferences": self.save_preferences,
+            "list_workspaces": self.list_workspaces,
+            "set_workspace": self.set_workspace,
+            "get_addon_settings": self.get_addon_settings,
+            "set_addon_settings": self.set_addon_settings,
+            # Session state
+            "save_session_state": self.save_session_state,
+            "restore_session_state": self.restore_session_state,
+            "get_session_state": self.get_session_state,        # server wrapper of save_session_state
+            "apply_session_state": self.apply_session_state,    # server wrapper of restore_session_state
+            # Rigging (B1 Tier 1): armatures and bones
+            "create_armature": self.create_armature,
+            "add_bones": self.add_bones,
+            "get_armature_info": self.get_armature_info,
+            "set_bone_properties": self.set_bone_properties,
+            "delete_bones": self.delete_bones,
+            # Rigging: skinning and weights
+            "bind_armature": self.bind_armature,
+            "get_vertex_groups": self.get_vertex_groups,
+            "get_vertex_weights": self.get_vertex_weights,
+            "set_vertex_weights": self.set_vertex_weights,
+            "render_weight_map": self.render_weight_map,
+            "find_unweighted_vertices": self.find_unweighted_vertices,
+            # Rigging: pose and constraints
+            "set_pose": self.set_pose,
+            "get_pose": self.get_pose,
+            "reset_pose": self.reset_pose,
+            "add_constraint": self.add_constraint,
+            "get_constraints": self.get_constraints,
+            "remove_constraint": self.remove_constraint,
+            # Animation (B1 Tier 1)
+            "set_keyframes": self.set_keyframes,
+            "get_animation_info": self.get_animation_info,
+            "set_scene_frame_range": self.set_scene_frame_range,
+            "playblast": self.playblast,
+            "bake_action": self.bake_action,
         }
         handlers.update(extended_handlers)
         return handlers
@@ -398,17 +609,41 @@ class BlenderMCPServer:
         """Get information about the current Blender scene"""
         try:
             print("Getting scene info...")
+            scene = bpy.context.scene
+            r, vs, units = scene.render, scene.view_settings, scene.unit_settings
             # Simplify the scene info to reduce data size
             scene_info = {
-                "name": bpy.context.scene.name,
-                "object_count": len(bpy.context.scene.objects),
+                "name": scene.name,
+                "object_count": len(scene.objects),
                 "objects": [],
                 "materials_count": len(bpy.data.materials),
+                # File state: is_dirty is reported, never assumed (True at 4.3.2 startup, False at 5.2.1);
+                # version is the Blender that SAVED the file, not the running one
+                "file": {
+                    "filepath": bpy.data.filepath,
+                    "is_saved": bool(bpy.data.is_saved),
+                    "is_dirty": bool(bpy.data.is_dirty),
+                    "version": list(bpy.data.version),
+                },
+                "settings_summary": {
+                    "engine": r.engine,
+                    "resolution": [r.resolution_x, r.resolution_y],
+                    "resolution_percentage": r.resolution_percentage,
+                    "fps": r.fps,
+                    "fps_base": r.fps_base,
+                    "frame_start": scene.frame_start,
+                    "frame_end": scene.frame_end,
+                    "frame_current": scene.frame_current,
+                    "units": {"system": units.system, "scale_length": units.scale_length,
+                              "length_unit": units.length_unit},
+                    "view_transform": vs.view_transform,
+                    "look": vs.look,
+                },
             }
 
-            # Collect minimal object information (limit to first 10 objects)
-            for i, obj in enumerate(bpy.context.scene.objects):
-                if i >= 10:  # Reduced from 20 to 10
+            # Collect minimal object information (limit to first 10 objects; documented in TOOLS.md)
+            for i, obj in enumerate(scene.objects):
+                if i >= 10:
                     break
 
                 obj_info = {
@@ -465,7 +700,11 @@ class BlenderMCPServer:
             "scale": [obj.scale.x, obj.scale.y, obj.scale.z],
             "visible": obj.visible_get(),
             "materials": [],
+            "parent": obj.parent.name if obj.parent else None,
+            "parent_type": obj.parent_type,
         }
+        if obj.parent_type == 'BONE':
+            obj_info["parent_bone"] = obj.parent_bone
 
         if obj.type == "MESH":
             bounding_box = self._get_aabb(obj)
@@ -484,6 +723,19 @@ class BlenderMCPServer:
                 "edges": len(mesh.edges),
                 "polygons": len(mesh.polygons),
             }
+            # Rig data on a mesh
+            obj_info["vertex_groups"] = [vg.name for vg in obj.vertex_groups]
+            obj_info["shape_keys"] = [kb.name for kb in mesh.shape_keys.key_blocks] if mesh.shape_keys else []
+            arm_mod = next((m for m in obj.modifiers if m.type == 'ARMATURE'), None)
+            obj_info["armature"] = arm_mod.object.name if arm_mod is not None and arm_mod.object else None
+
+        if obj.type == 'ARMATURE' and obj.data:
+            ad = obj.animation_data
+            obj_info["bones"] = len(obj.data.bones)
+            obj_info["pose_position"] = obj.data.pose_position
+            obj_info["display_type"] = obj.data.display_type
+            obj_info["action"] = ad.action.name if ad is not None and ad.action else None
+            obj_info["bone_collections"] = self._bone_collections(obj.data)
 
         return obj_info
 
@@ -581,6 +833,207 @@ class BlenderMCPServer:
         obj.select_set(True)
         bpy.context.view_layer.objects.active = obj
 
+    @contextmanager
+    def _selection_scope(self):
+        """
+        Snapshot the active object and the selection; restore both in finally, whatever
+        happens inside. Objects removed meanwhile are skipped; when the previous active
+        object is gone the current active (usually the handler's target) is kept. The mode
+        is left as the body leaves it (handlers end in OBJECT mode).
+        """
+        view_layer = bpy.context.view_layer
+        active = view_layer.objects.active
+        active_name = active.name if active is not None else None
+        selected_names = [o.name for o in view_layer.objects if o.select_get()]
+        try:
+            yield
+        finally:
+            for o in view_layer.objects:
+                with suppress(Exception):
+                    o.select_set(o.name in selected_names)
+            restore = bpy.data.objects.get(active_name) if active_name else None
+            if restore is not None and restore.name in view_layer.objects:
+                view_layer.objects.active = restore
+
+    @contextmanager
+    def _mesh_select_scope(self, mesh):
+        """
+        Snapshot the vertex / edge / polygon select flags of a Mesh datablock and put them
+        back in finally (foreach_get / foreach_set, OBJECT-mode data). Use it OUTSIDE
+        _mode_restore so the flags are written after the mode is back (A1.3, 2026-09-11).
+        """
+        saved = []
+        for coll in (mesh.vertices, mesh.edges, mesh.polygons):
+            buf = [False] * len(coll)
+            with suppress(Exception):
+                coll.foreach_get("select", buf)
+            saved.append((coll, buf))
+        try:
+            yield
+        finally:
+            for coll, buf in saved:
+                if len(coll) == len(buf):
+                    with suppress(Exception):
+                        coll.foreach_set("select", buf)
+
+    # ─── Rigging helpers (B1) ────────────────────────────────────────────────
+
+    @contextmanager
+    def _mode_restore(self):
+        """
+        Remember the active object and its interaction mode; restore both in finally.
+        Leaves whatever mode the body entered, then re-activates the previous object and
+        re-enters its previous mode (a removed object is skipped, OBJECT mode remains).
+        """
+        view_layer = bpy.context.view_layer
+        active = view_layer.objects.active
+        active_name = active.name if active is not None else None
+        mode = active.mode if active is not None else 'OBJECT'
+        try:
+            yield
+        finally:
+            with suppress(Exception):
+                if bpy.context.object is not None and bpy.context.object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            restore = bpy.data.objects.get(active_name) if active_name else None
+            if restore is not None and restore.name in view_layer.objects:
+                view_layer.objects.active = restore
+                if mode != 'OBJECT':
+                    with suppress(Exception):
+                        bpy.ops.object.mode_set(mode=mode)
+
+    @contextmanager
+    def _armature_edit(self, arm_obj):
+        """
+        Enter EDIT mode on arm_obj and yield arm_obj.data.edit_bones; prior mode and active
+        object are restored afterwards. EditBone references are UNDEFINED once the block
+        exits (measured on both versions): callers return bone NAMES only.
+        """
+        with self._mode_restore():
+            self._ensure_object_mode(arm_obj)
+            bpy.context.view_layer.objects.active = arm_obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            try:
+                yield arm_obj.data.edit_bones
+            finally:
+                with suppress(Exception):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+    @contextmanager
+    def _pose_mode(self, arm_obj):
+        """Enter POSE mode on arm_obj and yield arm_obj.pose.bones; prior mode and active restored."""
+        with self._mode_restore():
+            self._ensure_object_mode(arm_obj)
+            bpy.context.view_layer.objects.active = arm_obj
+            bpy.ops.object.mode_set(mode='POSE')
+            try:
+                yield arm_obj.pose.bones
+            finally:
+                with suppress(Exception):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+
+    @staticmethod
+    def _get_typed(name, obj_type):
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return None, {"error": f"Object not found: {name}"}
+        if obj.type != obj_type:
+            others = [o.name for o in bpy.data.objects if o.type == obj_type][:20]
+            article = "an" if obj_type[0] in "AEIOU" else "a"
+            return None, {"error": f"{name} is a {obj.type}, not {article} {obj_type}; {obj_type} objects: {others}"}
+        return obj, None
+
+    def _get_armature(self, name):
+        """(obj, None) for an ARMATURE object, or (None, error_dict) that says what it found instead."""
+        return self._get_typed(name, 'ARMATURE')
+
+    def _get_mesh(self, name):
+        """(obj, None) for a MESH object, or (None, error_dict)."""
+        return self._get_typed(name, 'MESH')
+
+    @staticmethod
+    def _addon_enabled(module_name):
+        return module_name in bpy.context.preferences.addons.keys()
+
+    @staticmethod
+    def _bone_collections(arm_data):
+        """Bone collections on 4.0 (collections) and 4.1+ (collections_all), by name."""
+        coll = getattr(arm_data, "collections_all", None)
+        if coll is None:
+            coll = getattr(arm_data, "collections", None)
+        return [c.name for c in coll] if coll is not None else []
+
+    def _action_channels(self, id_obj, ensure=False):
+        """
+        F-curve access that hides the 5.0 slotted-action API. Returns
+        (fcurves, groups, new_fcurve) for the action on id_obj.animation_data, or
+        (None, None, None) when there is no action (or no channels yet and ensure=False).
+        4.x: action.fcurves / action.groups; new_fcurve passes action_group=.
+        5.x: the slot's channelbag via bpy_extras.anim_utils (get, or ensure when writing);
+        a missing slot is bound from action_suitable_slots or created (ensure=True);
+        new_fcurve passes group_name= (falls back to action_group= on TypeError).
+        """
+        ad = getattr(id_obj, "animation_data", None)
+        action = ad.action if ad is not None else None
+        if action is None:
+            return None, None, None
+        if hasattr(action, "fcurves"):
+            fcurves, groups = action.fcurves, action.groups
+
+            def new_fcurve(data_path, index=0, group=None):
+                return fcurves.new(data_path, index=index, action_group=group or "")
+            return fcurves, groups, new_fcurve
+
+        from bpy_extras import anim_utils
+        slot = getattr(ad, "action_slot", None)
+        if slot is None:
+            suitable = list(getattr(ad, "action_suitable_slots", []) or [])
+            if suitable:
+                ad.action_slot = suitable[0]
+            elif ensure:
+                id_type = getattr(id_obj, "id_type", 'OBJECT')
+                ad.action_slot = action.slots.new(id_type=id_type, name=id_obj.name)
+            slot = getattr(ad, "action_slot", None)
+            if slot is None:
+                return None, None, None
+        if ensure:
+            bag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+        else:
+            bag = anim_utils.action_get_channelbag_for_slot(action, slot)
+        if bag is None:
+            return None, None, None
+
+        def new_fcurve(data_path, index=0, group=None):
+            try:
+                return bag.fcurves.new(data_path, index=index, group_name=group or "")
+            except TypeError:
+                return bag.fcurves.new(data_path, index=index, action_group=group or "")
+        return bag.fcurves, bag.groups, new_fcurve
+
+    @staticmethod
+    def _select_bones(arm_obj, names=None, select=True):
+        """
+        Select (or deselect) pose bones by name (None = all) through the version-correct
+        attribute: PoseBone.select on 5.x, Bone.select (+head/tail) on 4.x.
+        Returns (selected_names, missing_names).
+        """
+        wanted = None if names is None else set(names)
+        done, missing = [], []
+        for pb in arm_obj.pose.bones:
+            if wanted is not None and pb.name not in wanted:
+                continue
+            if hasattr(pb, "select"):
+                pb.select = bool(select)
+            else:
+                pb.bone.select = bool(select)
+                with suppress(Exception):
+                    pb.bone.select_head = bool(select)
+                    pb.bone.select_tail = bool(select)
+            done.append(pb.name)
+        if wanted is not None:
+            missing = sorted(wanted - set(done))
+        return done, missing
+
     @staticmethod
     def _check_indices(indices, count, label):
         """Return an error dict when any index is outside [0, count), else None."""
@@ -624,6 +1077,99 @@ class BlenderMCPServer:
             return False
 
     @staticmethod
+    def _new_node(tree, *ids):
+        """
+        Add a node to tree trying each type id in turn: the Compositor id first, then its
+        Shader twin (5.0 replaced several CompositorNode* ids with ShaderNode* ones).
+        Raises RuntimeError naming every id tried when none exists on this Blender.
+        """
+        tried = []
+        for node_id in ids:
+            try:
+                return tree.nodes.new(node_id)
+            except Exception as e:
+                tried.append(f"{node_id} ({e})")
+        raise RuntimeError(f"No usable node type among {list(ids)}; tried: {tried}")
+
+    @staticmethod
+    def _engine_ids(render=None):
+        """
+        Identifiers of the live render-engine enum. The static RNA enum lists only the built-in
+        EEVEE id on both 4.x and 5.x, so probe by assignment: the TypeError text carries the
+        full live tuple including add-on engines such as CYCLES. Falls back to the static list.
+        """
+        render = render or bpy.context.scene.render
+        try:
+            render.engine = "__MCP_PROBE__"        # always rejected; nothing is changed
+        except Exception as e:
+            live = re.search(r"not found in \((.*?)\)", str(e))
+            if live:
+                return [v.strip().strip("'\"") for v in live.group(1).split(",")]
+        return [e.identifier for e in render.bl_rna.properties['engine'].enum_items]
+
+    # EEVEE was BLENDER_EEVEE (<=4.1), BLENDER_EEVEE_NEXT (4.2-4.5), BLENDER_EEVEE again (5.0+).
+    _ENGINE_ALIASES = {
+        'BLENDER_EEVEE': ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'),
+        'BLENDER_EEVEE_NEXT': ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'),
+    }
+
+    @classmethod
+    def _set_render_engine(cls, render, engine):
+        """
+        Try-assign an engine id, case-insensitively, accepting bare EEVEE / CYCLES / WORKBENCH
+        and the BLENDER_EEVEE <-> BLENDER_EEVEE_NEXT alias. Never inspects the Blender version.
+        Returns an error dict listing the live enum on failure, else None.
+        """
+        name = str(engine or "").strip().upper()
+        if not name:
+            return {"error": f"engine must be a non-empty string; valid: {cls._engine_ids(render)}"}
+        candidates = []
+        for base in (name, "BLENDER_" + name):
+            for cand in cls._ENGINE_ALIASES.get(base, (base,)):
+                if cand not in candidates:
+                    candidates.append(cand)
+        for cand in candidates:
+            try:
+                render.engine = cand
+                return None
+            except Exception:
+                continue
+        return {"error": f"engine '{engine}' not valid (tried {candidates}); valid: {cls._engine_ids(render)}. "
+                         "Add-on engines that are disabled do not appear in this list."}
+
+    @staticmethod
+    def _set_file_format(image_settings, file_format):
+        """
+        Assign image_settings.file_format. Blender 5.0 added ImageFormatSettings.media_type,
+        which must match the format before file_format is assigned (IMAGE for stills, VIDEO
+        for FFMPEG, MULTI_LAYER_IMAGE for OPEN_EXR_MULTILAYER on 5.2.1; the spelling is
+        try-assigned so a renamed item cannot break stills); 4.x has no such attribute.
+        Returns an error dict listing the live enum on failure, else None.
+        """
+        fmt = str(file_format or "").strip().upper().lstrip(".")
+        # Common file-extension spellings map onto Blender's enum identifiers
+        fmt = {'EXR': 'OPEN_EXR', 'EXR_MULTILAYER': 'OPEN_EXR_MULTILAYER',
+               'JPG': 'JPEG', 'TIF': 'TIFF', 'TGA': 'TARGA'}.get(fmt, fmt)
+        if hasattr(image_settings, "media_type"):
+            media_candidates = {'FFMPEG': ('VIDEO',),
+                                'OPEN_EXR_MULTILAYER': ('MULTI_LAYER_IMAGE', 'MULTI_LAYER')}.get(fmt, ('IMAGE',))
+            for media in media_candidates:
+                try:
+                    image_settings.media_type = media
+                    break
+                except Exception:
+                    continue
+        try:
+            image_settings.file_format = fmt
+        except Exception:
+            # Unlike the engine enum, the static file_format enum is complete; on 5.x Blender's
+            # TypeError tuple is filtered by the current media_type (under IMAGE it omits FFMPEG
+            # and OPEN_EXR_MULTILAYER, which this helper accepts), so the static list is the truth.
+            valid = [i.identifier for i in image_settings.bl_rna.properties['file_format'].enum_items]
+            return {"error": f"file_format '{file_format}' not valid; valid: {valid}"}
+        return None
+
+    @staticmethod
     def _reference_images():
         """Reference registry, kept in driver_namespace so an addon reload does not drop it."""
         return bpy.app.driver_namespace.setdefault("blendermcp_reference_images", {})
@@ -639,15 +1185,65 @@ class BlenderMCPServer:
         "iso_front_left":  None,
     }
 
-    def capture_viewport_angle(self, angle="front", max_size=800, filepath=None):
+    _CAPTURE_OVERLAYS = ("bones_in_front", "wireframe", "weight_paint")
+
+    @contextmanager
+    def _capture_overlay(self, space, overlay):
+        """
+        Apply a capture overlay on a VIEW_3D space and undo every change in finally.
+        bones_in_front: every armature's show_in_front + the bones overlay on.
+        wireframe: shading type WIREFRAME.
+        weight_paint: WEIGHT_PAINT mode on the active MESH (its active vertex group is shown).
+        """
+        if overlay is None:
+            yield None
+            return
+        name = str(overlay).lower()
+        if name not in self._CAPTURE_OVERLAYS:
+            raise ValueError(f"overlay '{overlay}' not valid; valid: {list(self._CAPTURE_OVERLAYS)}")
+        saved_in_front = {}
+        saved_show_bones = space.overlay.show_bones
+        saved_shading = space.shading.type
+        try:
+            if name == "bones_in_front":
+                for o in bpy.context.scene.objects:
+                    if o.type == 'ARMATURE':
+                        saved_in_front[o.name] = o.show_in_front
+                        o.show_in_front = True
+                space.overlay.show_bones = True
+                yield name
+            elif name == "wireframe":
+                space.shading.type = 'WIREFRAME'
+                yield name
+            else:
+                active = bpy.context.view_layer.objects.active
+                if active is None or active.type != 'MESH':
+                    raise ValueError("overlay weight_paint needs an active MESH object (select_objects first)")
+                with self._mode_restore():
+                    bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
+                    yield name
+        finally:
+            for oname, value in saved_in_front.items():
+                o = bpy.data.objects.get(oname)
+                if o is not None:
+                    o.show_in_front = value
+            with suppress(Exception):
+                space.overlay.show_bones = saved_show_bones
+            with suppress(Exception):
+                space.shading.type = saved_shading
+
+    def capture_viewport_angle(self, angle="front", max_size=800, filepath=None, overlay=None):
         """
         Capture the 3D viewport from a named angle.
         angle: one of front, back, left, right, top, bottom, iso_front_right, iso_front_left
+        overlay: None, bones_in_front, wireframe or weight_paint (all changes restored afterwards)
         Frames the selected objects, or the whole scene when nothing is selected.
         """
         import math
         if angle not in self._VIEW_PRESETS:
             return {"error": f"Unknown angle: {angle}. Choose from: {list(self._VIEW_PRESETS.keys())}"}
+        if overlay is not None and str(overlay).lower() not in self._CAPTURE_OVERLAYS:
+            return {"error": f"overlay '{overlay}' not valid; valid: {list(self._CAPTURE_OVERLAYS)}"}
 
         area = next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None)
         if not area:
@@ -667,6 +1263,18 @@ class BlenderMCPServer:
         orig_perspective = r3d.view_perspective
         orig_smooth_view = prefs_view.smooth_view
 
+        try:
+            with self._capture_overlay(space, overlay):
+                return self._capture_angle_inner(angle, max_size, filepath, area, space, region, r3d, prefs_view, overlay)
+        except ValueError as e:
+            return {"error": str(e)}
+        finally:
+            prefs_view.smooth_view = orig_smooth_view
+            r3d.view_matrix = orig_view_matrix
+            r3d.view_perspective = orig_perspective
+
+    def _capture_angle_inner(self, angle, max_size, filepath, area, space, region, r3d, prefs_view, overlay):
+        import math
         try:
             # Smooth-view animates view changes over time; the screenshot is taken
             # right away, so it must be applied instantly.
@@ -691,10 +1299,16 @@ class BlenderMCPServer:
             if os.path.exists(filepath):
                 os.remove(filepath)
 
+            # Make sure the new view is drawn before it is read back. The redraw runs OUTSIDE
+            # the area/region override: on Blender 5.2 a DRAW_WIN_SWAP redraw inside the
+            # override makes the following screenshot_area write a 1x1 image (measured live,
+            # 2026-09-11); outside it the capture is full size and shows the new view.
+            with suppress(Exception):
+                bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
             with bpy.context.temp_override(area=area, region=region):
-                # Make sure the new view is drawn before it is read back
-                with suppress(Exception):
-                    bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+                if not bpy.ops.screen.screenshot_area.poll():
+                    return {"error": "Viewport capture needs a GUI session: screen.screenshot_area is "
+                                     "unavailable in --background (use render_from_camera headless)"}
                 bpy.ops.screen.screenshot_area(filepath=filepath)
             if not os.path.exists(filepath):
                 return {"error": "Screenshot was not written"}
@@ -703,6 +1317,17 @@ class BlenderMCPServer:
             img = bpy.data.images.load(filepath)
             try:
                 w, h = img.size
+                if w <= 1 or h <= 1:
+                    # Viewport was not drawn when read back: one retry without any redraw
+                    bpy.data.images.remove(img)
+                    img = None
+                    os.remove(filepath)
+                    with bpy.context.temp_override(area=area, region=region):
+                        bpy.ops.screen.screenshot_area(filepath=filepath)
+                    img = bpy.data.images.load(filepath)
+                    w, h = img.size
+                    if w <= 1 or h <= 1:
+                        return {"error": f"screenshot_area wrote a {w}x{h} image; the viewport was not drawn"}
                 if max(w, h) > max_size:
                     scale = max_size / max(w, h)
                     img.scale(max(1, int(w * scale)), max(1, int(h * scale)))
@@ -710,27 +1335,32 @@ class BlenderMCPServer:
                     img.save()
                     w, h = img.size
             finally:
-                bpy.data.images.remove(img)
+                if img is not None:
+                    bpy.data.images.remove(img)
 
-            return {"success": True, "angle": angle, "filepath": filepath, "width": w, "height": h}
+            reply = {"success": True, "angle": angle, "filepath": filepath, "width": w, "height": h}
+            if overlay:
+                reply["overlay"] = str(overlay).lower()
+            return reply
 
         finally:
-            prefs_view.smooth_view = orig_smooth_view
-            r3d.view_matrix = orig_view_matrix
-            r3d.view_perspective = orig_perspective
+            pass  # view / smooth_view restore happens in capture_viewport_angle's own finally
 
-    def capture_contact_sheet(self, angles=None, max_size=512, filepath=None):
+    def capture_contact_sheet(self, angles=None, max_size=512, filepath=None, overlay=None):
         """
         Capture multiple viewport angles and return paths for each.
         angles: list of angle names; defaults to [front, right, top, iso_front_right]
+        overlay: forwarded to capture_viewport_angle (bones_in_front, wireframe, weight_paint)
         """
         if angles is None:
             angles = ["front", "right", "top", "iso_front_right"]
+        if overlay is not None and str(overlay).lower() not in self._CAPTURE_OVERLAYS:
+            return {"error": f"overlay '{overlay}' not valid; valid: {list(self._CAPTURE_OVERLAYS)}"}
 
         results = {}
         for angle in angles:
             fp = os.path.join(tempfile.gettempdir(), f"blender_cs_{angle}_{os.getpid()}.png")
-            r = self.capture_viewport_angle(angle=angle, max_size=max_size, filepath=fp)
+            r = self.capture_viewport_angle(angle=angle, max_size=max_size, filepath=fp, overlay=overlay)
             results[angle] = r
 
         return {"images": results}
@@ -753,56 +1383,75 @@ class BlenderMCPServer:
         view_layer_name = bpy.context.view_layer.name
         tmp = src.copy()
         tmp.name = f"{src.name}_mcp_depth"
+        group = None
         try:
-            # Workbench has no Z pass; fall back to EEVEE (identifier changed in 4.2)
+            # Workbench has no Z pass; fall back to EEVEE by try-assign (BLENDER_EEVEE on 5.x,
+            # BLENDER_EEVEE_NEXT on 4.2-4.5; _set_render_engine tries both spellings)
             if tmp.render.engine == 'BLENDER_WORKBENCH':
-                engines = [e.identifier for e in
-                           bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items]
-                for eng in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
-                    if eng in engines:
-                        tmp.render.engine = eng
-                        break
+                self._set_render_engine(tmp.render, 'BLENDER_EEVEE')
             # Depth is deterministic: one sample is enough
             with suppress(Exception):
                 tmp.eevee.taa_render_samples = 1
             with suppress(Exception):
                 tmp.cycles.samples = 1
 
+            # The Depth socket only exists on the Render Layers node once the pass is enabled
             for vl in tmp.view_layers:
                 vl.use_pass_z = True
 
-            tmp.use_nodes = True
-            tree = tmp.node_tree
+            if hasattr(tmp, "compositing_node_group"):
+                # 5.0+: Scene.node_tree is gone; the compositor is a node group assigned to the
+                # scene, and its output is a NodeGroupOutput with an Image interface socket.
+                group = bpy.data.node_groups.new(f"{tmp.name}_tree", "CompositorNodeTree")
+                group.interface.new_socket(name="Image", in_out='OUTPUT', socket_type='NodeSocketColor')
+                tmp.compositing_node_group = group
+                tree = group
+            else:
+                tmp.use_nodes = True
+                tree = tmp.node_tree
             nodes, links = tree.nodes, tree.links
             nodes.clear()
 
-            # RenderLayers -> Map Range (0..max_depth -> 0..1) -> Invert -> Composite
-            rl = nodes.new("CompositorNodeRLayers")
+            # RenderLayers -> Map Range (0..max_depth -> 0..1) -> Invert -> output
+            rl = self._new_node(tree, "CompositorNodeRLayers")
             rl.scene = tmp
             if view_layer_name in tmp.view_layers:
                 rl.layer = view_layer_name
             rl.location = (0, 0)
 
-            map_node = nodes.new("CompositorNodeMapRange")
+            map_node = self._new_node(tree, "CompositorNodeMapRange", "ShaderNodeMapRange")
             map_node.location = (250, 0)
             map_node.inputs["From Min"].default_value = 0.0
             map_node.inputs["From Max"].default_value = max_depth
             map_node.inputs["To Min"].default_value = 0.0
             map_node.inputs["To Max"].default_value = 1.0
-            map_node.use_clamp = True
+            for clamp_attr in ("use_clamp", "clamp"):   # Compositor id vs Shader id spelling
+                if hasattr(map_node, clamp_attr):
+                    setattr(map_node, clamp_attr, True)
+            map_out = map_node.outputs.get("Value") or map_node.outputs.get("Result")
+            if map_out is None:
+                return {"error": f"Map Range node has no Value/Result output; outputs: {[s.name for s in map_node.outputs]}"}
 
-            invert = nodes.new("CompositorNodeInvert")
+            invert = self._new_node(tree, "CompositorNodeInvert", "ShaderNodeInvert")
             invert.location = (450, 0)
 
-            composite = nodes.new("CompositorNodeComposite")
-            composite.location = (650, 0)
+            if group is not None:
+                out_node = self._new_node(tree, "NodeGroupOutput")
+            else:
+                out_node = self._new_node(tree, "CompositorNodeComposite")
+            out_node.location = (650, 0)
 
-            links.new(rl.outputs["Depth"], map_node.inputs["Value"])
-            links.new(map_node.outputs["Value"], invert.inputs["Color"])
-            links.new(invert.outputs["Color"], composite.inputs["Image"])
+            depth_out = rl.outputs.get("Depth") or rl.outputs.get("Z")
+            if depth_out is None:
+                return {"error": f"Render Layers node has no Depth output; outputs: {[s.name for s in rl.outputs]}"}
+            links.new(depth_out, map_node.inputs["Value"])
+            links.new(map_out, invert.inputs["Color"])
+            links.new(invert.outputs["Color"], out_node.inputs["Image"])
 
             tmp.render.filepath = filepath
-            tmp.render.image_settings.file_format = 'PNG'
+            err = self._set_file_format(tmp.render.image_settings, 'PNG')
+            if err:
+                return err
             tmp.render.image_settings.color_mode = 'BW'
             if os.path.exists(filepath):
                 os.remove(filepath)
@@ -813,6 +1462,9 @@ class BlenderMCPServer:
         finally:
             with suppress(Exception):
                 bpy.data.scenes.remove(tmp, do_unlink=True)
+            if group is not None:
+                with suppress(Exception):
+                    bpy.data.node_groups.remove(group, do_unlink=True)
 
         return {"success": True, "filepath": filepath, "max_depth": max_depth}
 
@@ -911,7 +1563,7 @@ class BlenderMCPServer:
         else:
             if len(mesh.vertices) > max_verts:
                 return {
-                    "error": f"Mesh has {len(mesh.vertices)} vertices — exceeds max_verts={max_verts}. "
+                    "error": f"Mesh has {len(mesh.vertices)} vertices - exceeds max_verts={max_verts}. "
                              f"Pass specific indices or increase max_verts."
                 }
             verts = list(enumerate(mesh.vertices))
@@ -1085,6 +1737,26 @@ class BlenderMCPServer:
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────
 
+    def get_version(self):
+        """Addon version, wire protocol and the Blender / Python it runs in (never raises)."""
+        return {"addon": ".".join(str(v) for v in bl_info["version"]),
+                "protocol": PROTOCOL,
+                "blender": bpy.app.version_string,
+                "python": platform.python_version(),
+                "addon_file": __file__,
+                "background": bool(bpy.app.background)}
+
+    def ensure_server_running(self, port=None):
+        """
+        Start the socket server if it is not running (it trivially is when this arrives over
+        the socket; the panel button and the launch hook share the same function).
+        Reply: {"success": True, "running", "port", "host", "started_now"}.
+        """
+        info = ensure_server(port)
+        if "error" in info:
+            return {"error": f"Server not running: {info['error']}", **{k: v for k, v in info.items() if k != "error"}}
+        return {"success": True, **info}
+
     def quit_blender(self, save_prompt=False, save=False):
         """
         Quit Blender. The quit is deferred to the next timer tick so this reply
@@ -1135,7 +1807,7 @@ class BlenderMCPServer:
 
         if indices is None:
             if len(mesh.edges) > max_edges:
-                return {"error": f"Mesh has {len(mesh.edges)} edges — exceeds "
+                return {"error": f"Mesh has {len(mesh.edges)} edges - exceeds "
                                   f"max_edges={max_edges}. Pass specific indices or increase max_edges."}
         else:
             err = self._check_indices(indices, len(mesh.edges), "Edge")
@@ -1269,7 +1941,7 @@ class BlenderMCPServer:
             polys = [(i, mesh.polygons[i]) for i in indices]
         else:
             if len(mesh.polygons) > max_faces:
-                return {"error": f"Mesh has {len(mesh.polygons)} faces — exceeds "
+                return {"error": f"Mesh has {len(mesh.polygons)} faces - exceeds "
                                   f"max_faces={max_faces}. Pass specific indices or increase max_faces."}
             polys = list(enumerate(mesh.polygons))
 
@@ -1353,13 +2025,28 @@ class BlenderMCPServer:
         with self._bmesh_edit(obj) as bm:
             faces = [bm.faces[i] for i in face_indices]
             result = bmesh.ops.extrude_face_region(bm, geom=faces)
+            new_faces = {g for g in result["geom"] if isinstance(g, bmesh.types.BMFace)}
             new_verts = [g for g in result["geom"] if isinstance(g, bmesh.types.BMVert)]
-            # Translate each new vert along its normal
+            # extrude_face_region does not recompute normals; do it before reading them
+            bm.normal_update()
+            # Move every new vert once, along the mean normal of the NEW faces it belongs to
+            # (a vert shared by two extruded faces follows their average, as edit-mode extrude does)
             for v in new_verts:
-                v.co += v.normal * amount
+                n = mathutils.Vector((0.0, 0.0, 0.0))
+                for f in v.link_faces:
+                    if f in new_faces:
+                        n += f.normal
+                if n.length_squared > 0.0:
+                    n.normalize()
+                else:
+                    n = v.normal
+                v.co += n * amount
+            # extrude_face_region keeps the source faces; remove them so no cap is left inside
+            bmesh.ops.delete(bm, geom=faces, context='FACES')
 
         return {"success": True, "name": name,
-                "extruded_faces": len(face_indices), "amount": amount}
+                "extruded_faces": len(face_indices), "new_faces": len(new_faces),
+                "amount": amount}
 
     def inset_faces(self, name, face_indices, thickness=0.1, depth=0.0,
                     use_individual=True):
@@ -1466,13 +2153,14 @@ class BlenderMCPServer:
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh object"}
 
-        self._select_only(obj)
-        bpy.ops.object.mode_set(mode='EDIT')
-        try:
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.mesh.subdivide(number_cuts=cuts, smoothness=smoothness)
-        finally:
-            bpy.ops.object.mode_set(mode='OBJECT')
+        with self._selection_scope():
+            self._select_only(obj)
+            bpy.ops.object.mode_set(mode='EDIT')
+            try:
+                bpy.ops.mesh.select_all(action='SELECT')
+                bpy.ops.mesh.subdivide(number_cuts=cuts, smoothness=smoothness)
+            finally:
+                bpy.ops.object.mode_set(mode='OBJECT')
 
         return {"success": True, "name": name, "cuts": cuts,
                 "vertices": len(obj.data.vertices), "faces": len(obj.data.polygons)}
@@ -1485,9 +2173,10 @@ class BlenderMCPServer:
         mod = obj.modifiers.get(modifier_name)
         if not mod:
             return {"error": f"Modifier '{modifier_name}' not found on {name}"}
-        self._select_only(obj)
-        with bpy.context.temp_override(object=obj, active_object=obj):
-            bpy.ops.object.modifier_apply(modifier=modifier_name)
+        with self._selection_scope():
+            self._select_only(obj)
+            with bpy.context.temp_override(object=obj, active_object=obj):
+                bpy.ops.object.modifier_apply(modifier=modifier_name)
         return {"success": True, "name": name, "applied_modifier": modifier_name}
 
     def get_mesh_stats(self, name):
@@ -1554,33 +2243,247 @@ class BlenderMCPServer:
         bpy.context.scene.camera = obj
         return {"success": True, "active_camera": name}
 
+    # ─── Settings scopes (shared by every temporary-settings tool) ───────────
+
+    _SCOPES = ("SCENE", "RENDER", "OUTPUT", "CYCLES", "EEVEE", "COLOR", "UNITS", "VIEWPORT",
+               "PREFS_FILEPATHS", "PREFS_VIEW", "PREFS_EDIT", "PREFS_SYSTEM", "PREFS_INPUT",
+               "ADDON:<module>", "MCP")
+    # Properties that must be restored before the rest of their scope (dependent enums).
+    _SCOPE_RESTORE_FIRST = {"OUTPUT": ("media_type",), "RENDER": ("engine",)}
+
+    def _scope_owner(self, scope, scene=None):
+        """
+        Map a scope name to the RNA struct instances it covers. Returns [] when the scope
+        exists but has no owner on this Blender / session (no VIEW_3D, add-on without prefs);
+        raises ValueError for an unknown scope name (the caller turns it into an error reply).
+        """
+        scene = scene or bpy.context.scene
+        name = str(scope).upper()
+        if name == "SCENE":
+            return [scene]
+        if name == "RENDER":
+            return [scene.render]
+        if name == "OUTPUT":
+            return [scene.render.image_settings]
+        if name == "CYCLES":
+            return [scene.cycles] if hasattr(scene, "cycles") else []
+        if name == "EEVEE":
+            return [scene.eevee] if hasattr(scene, "eevee") else []
+        if name == "COLOR":
+            return [scene.view_settings, scene.display_settings]
+        if name == "UNITS":
+            return [scene.unit_settings]
+        if name == "VIEWPORT":
+            wm = bpy.context.window_manager
+            for win in (wm.windows if wm else []):
+                for area in win.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        space = area.spaces.active
+                        return [space.shading, space.overlay]
+            return []
+        if name.startswith("PREFS_"):
+            section = name[6:].lower()
+            section = {"input": "inputs"}.get(section, section)
+            prefs = bpy.context.preferences
+            return [getattr(prefs, section)] if hasattr(prefs, section) else []
+        if name.startswith("ADDON:"):
+            entry = bpy.context.preferences.addons.get(scope[6:])
+            return [entry.preferences] if entry is not None and entry.preferences is not None else []
+        if name == "MCP":
+            prefs = _prefs()
+            return [prefs] if prefs is not None else []
+        raise ValueError(f"Unknown settings scope '{scope}'; valid: {list(self._SCOPES)}")
+
+    @staticmethod
+    def _rna_simple_props(owner):
+        """Identifiers of owner's writable, non-pointer, non-collection RNA properties."""
+        return [p.identifier for p in owner.bl_rna.properties
+                if p.identifier != "rna_type" and not p.is_readonly
+                and p.type not in ('POINTER', 'COLLECTION')]
+
+    @staticmethod
+    def _rna_get(owner, ident):
+        """Read a simple RNA property as plain Python (arrays -> list, enum flags -> sorted list)."""
+        value = getattr(owner, ident)
+        if isinstance(value, (set, frozenset)):
+            return sorted(value)
+        if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+            try:
+                return list(value)
+            except TypeError:
+                return value
+        return value
+
+    @staticmethod
+    def _rna_set_validated(owner, key, value):
+        """
+        Validate value against owner's RNA property (existence, read-only, type, enum membership,
+        numeric range) and assign it. Returns None on success, else the reason string.
+        Dynamic enums whose static item list is empty (view_transform, compute_device_type
+        headless) are validated by the assignment itself and the exception text is the reason.
+        """
+        prop = owner.bl_rna.properties.get(key)
+        if prop is None:
+            return f"no such property on {owner.bl_rna.identifier}"
+        if prop.is_readonly:
+            return "read-only"
+        if prop.type in ('POINTER', 'COLLECTION'):
+            return f"{prop.type.lower()} property; set it through its dedicated tool"
+        is_array = bool(getattr(prop, "is_array", False)) and getattr(prop, "array_length", 0) > 0
+        try:
+            if prop.type == 'ENUM':
+                if prop.is_enum_flag:
+                    value = {value} if isinstance(value, str) else set(value)
+                else:
+                    # The static item list is only a hint: dynamic enums (view_transform, length_unit,
+                    # compute_device_type) read ['NONE'] / ['DEFAULT'] / [] headless. Match case-
+                    # insensitively when possible, otherwise let the assignment decide: Blender's own
+                    # TypeError text carries the live tuple and becomes the reason.
+                    value = str(value)
+                    ids = [i.identifier for i in prop.enum_items]
+                    if ids and value not in ids:
+                        match = next((i for i in ids if i.upper() == value.upper()), None)
+                        if match is not None:
+                            value = match
+            elif prop.type in ('INT', 'FLOAT'):
+                cast = int if prop.type == 'INT' else float
+                if is_array:
+                    value = [cast(v) for v in value]
+                    bad = [v for v in value if not (prop.hard_min <= v <= prop.hard_max)]
+                    if bad:
+                        return f"{bad} outside [{prop.hard_min}, {prop.hard_max}]"
+                else:
+                    value = cast(value)
+                    if not (prop.hard_min <= value <= prop.hard_max):
+                        return f"{value} outside [{prop.hard_min}, {prop.hard_max}]"
+            elif prop.type == 'BOOLEAN':
+                value = [bool(v) for v in value] if is_array else bool(value)
+            elif prop.type == 'STRING':
+                value = str(value)
+            setattr(owner, key, value)
+        except Exception as e:
+            return str(e)
+        return None
+
+    def _apply_settings(self, scope, values, scene=None):
+        """
+        Set several properties in one scope with per-key validation. Returns
+        {"set": [keys], "unset": {key: reason}} in the add_modifier shape. Raises ValueError for
+        an unknown scope (from _scope_owner); a scope with no owner marks every key unset.
+        """
+        owners = self._scope_owner(scope, scene)
+        name = str(scope).upper()
+        done, unset = [], {}
+        for key, value in dict(values or {}).items():
+            if not owners:
+                unset[key] = f"scope {scope} has no owner in this session"
+                continue
+            # Two enums whose static item list is incomplete go through the live-tuple setters
+            if name == "RENDER" and key == "engine":
+                err = self._set_render_engine(owners[0], value)
+            elif name == "OUTPUT" and key == "file_format":
+                err = self._set_file_format(owners[0], value)
+            elif name == "OUTPUT" and key == "ffmpeg":
+                # Nested video settings (presets carry {"ffmpeg": {format, codec, constant_rate_factor}})
+                sub, jerr = self._json_arg(value, "ffmpeg")
+                if jerr or not isinstance(sub, dict):
+                    unset[key] = "ffmpeg must be an object {format, codec, constant_rate_factor, ...}"
+                    continue
+                ff = (scene or bpy.context.scene).render.ffmpeg
+                for sk, sv in sub.items():
+                    reason = self._rna_set_validated(ff, sk, sv)
+                    if reason is None:
+                        done.append(f"ffmpeg.{sk}")
+                    else:
+                        unset[f"ffmpeg.{sk}"] = reason
+                continue
+            else:
+                err = "not special"
+            if err != "not special":
+                if err is None:
+                    done.append(key)
+                else:
+                    unset[key] = err["error"]
+                continue
+            reason = None
+            for owner in owners:
+                if owner.bl_rna.properties.get(key) is None:
+                    continue
+                reason = self._rna_set_validated(owner, key, value)
+                break
+            else:
+                reason = f"no such property in scope {scope}"
+            if reason is None:
+                done.append(key)
+            else:
+                unset[key] = reason
+        return {"set": done, "unset": unset}
+
+    @contextmanager
+    def _settings_scope(self, scopes=("RENDER", "OUTPUT", "CYCLES", "EEVEE"), scene=None):
+        """
+        Snapshot every simple property of the named scopes (plus scene.camera and
+        scene.frame_current) on enter and restore whatever changed in finally, whatever
+        happens inside. Yields a list that collects {"scope", "key", "error"} entries for
+        values that could not be restored (dynamic enums that read empty headless, properties
+        the engine refuses); callers may report it, nothing raises. Restore order: media_type
+        before file_format, engine before the engine-specific properties.
+        """
+        scene = scene or bpy.context.scene
+        snapshot = []
+        for scope in scopes:
+            for owner in self._scope_owner(scope, scene):
+                values = {}
+                for ident in self._rna_simple_props(owner):
+                    try:
+                        values[ident] = self._rna_get(owner, ident)
+                    except Exception:
+                        pass
+                snapshot.append((str(scope).upper(), owner, values))
+        camera, frame = scene.camera, scene.frame_current
+        failed = []
+        try:
+            yield failed
+        finally:
+            for scope, owner, values in snapshot:
+                first = self._SCOPE_RESTORE_FIRST.get(scope, ())
+                order = [k for k in first if k in values] + [k for k in values if k not in first]
+                for ident in order:
+                    saved = values[ident]
+                    try:
+                        if self._rna_get(owner, ident) == saved:
+                            continue
+                        prop = owner.bl_rna.properties[ident]
+                        if prop.type == 'ENUM' and prop.is_enum_flag:
+                            saved = set(saved)
+                        setattr(owner, ident, saved)
+                    except Exception as e:
+                        failed.append({"scope": scope, "key": ident, "error": str(e)})
+            with suppress(Exception):
+                if scene.camera != camera:
+                    scene.camera = camera
+            with suppress(Exception):
+                if scene.frame_current != frame:
+                    scene.frame_set(frame)
+
     @contextmanager
     def _render_settings(self, scene, width, height, samples, file_format='PNG'):
-        """Temporarily apply render settings, restoring everything afterwards."""
-        r = scene.render
-        cyc = getattr(scene, "cycles", None)
-        eev = getattr(scene, "eevee", None)
-        saved = (scene.camera, r.resolution_x, r.resolution_y, r.resolution_percentage,
-                 r.filepath, r.image_settings.file_format,
-                 cyc.samples if cyc else None,
-                 getattr(eev, "taa_render_samples", None) if eev else None)
-        try:
+        """Temporarily apply render settings; _settings_scope restores everything afterwards."""
+        with self._settings_scope(("RENDER", "OUTPUT", "CYCLES", "EEVEE"), scene=scene):
+            r = scene.render
             r.resolution_x = int(width)
             r.resolution_y = int(height)
             r.resolution_percentage = 100
-            r.image_settings.file_format = file_format
+            err = self._set_file_format(r.image_settings, file_format)
+            if err:
+                raise ValueError(err["error"])
+            cyc = getattr(scene, "cycles", None)
+            eev = getattr(scene, "eevee", None)
             if cyc:
                 cyc.samples = int(samples)
             if eev and hasattr(eev, "taa_render_samples"):
                 eev.taa_render_samples = int(samples)
             yield
-        finally:
-            (scene.camera, r.resolution_x, r.resolution_y, r.resolution_percentage,
-             r.filepath, r.image_settings.file_format, cyc_s, eev_s) = saved
-            if cyc and cyc_s is not None:
-                cyc.samples = cyc_s
-            if eev and eev_s is not None:
-                eev.taa_render_samples = eev_s
 
     @staticmethod
     def _render_to_file(scene, filepath):
@@ -1778,10 +2681,32 @@ class BlenderMCPServer:
 
     # ─── Export / import ────────────────────────────────────────────────────
 
-    def export_object(self, name=None, filepath=None, file_format="glb"):
+    _FBX_EXPORT_PARAMS = ("bake_anim", "add_leaf_bones", "use_armature_deform_only", "bake_anim_simplify_factor",
+                          "mesh_smooth_type", "primary_bone_axis", "secondary_bone_axis", "apply_scale_options")
+    _GLTF_EXPORT_PARAMS = ("export_animations", "export_skins", "export_morph")
+
+    @staticmethod
+    def _op_enum_ids(op, prop):
+        try:
+            return [e.identifier for e in op.get_rna_type().properties[prop].enum_items]
+        except Exception:
+            return []
+
+    def export_object(self, name=None, filepath=None, file_format="glb", include_hierarchy=True,
+                      bake_anim=True, add_leaf_bones=False, use_armature_deform_only=True,
+                      bake_anim_simplify_factor=0.0, mesh_smooth_type=None, primary_bone_axis=None,
+                      secondary_bone_axis=None, apply_scale_options=None,
+                      export_animations=True, export_skins=True, export_morph=True):
         """
         Export an object (or the entire scene if name is None).
         file_format: glb, gltf, fbx, obj, stl, ply
+        include_hierarchy: also select the parent armature (if any) and every child, so a
+                           skinned mesh exports rigged (selection restored afterwards).
+        FBX only: bake_anim, add_leaf_bones (default False: no *_end bones), use_armature_deform_only,
+                  bake_anim_simplify_factor, mesh_smooth_type (live enum: OFF/FACE/EDGE, +SMOOTH_GROUP
+                  on 5.2), primary_bone_axis / secondary_bone_axis (X/Y/Z/-X/-Y/-Z), apply_scale_options.
+        glTF only: export_animations, export_skins, export_morph.
+        Params that do not apply to the chosen format are reported under "ignored".
         """
         file_format = (file_format or "glb").lower().lstrip(".")
         supported = ("glb", "gltf", "fbx", "obj", "stl", "ply")
@@ -1791,64 +2716,139 @@ class BlenderMCPServer:
             filepath = os.path.join(tempfile.gettempdir(),
                                     f"blender_export_{os.getpid()}.{file_format}")
 
-        # Select only the target object if specified
+        # Select only the target object (and its rig hierarchy) if specified
         selected = name is not None
+        obj = None
         if name:
             obj = bpy.data.objects.get(name)
             if not obj:
                 return {"error": f"Object not found: {name}"}
-            self._select_only(obj)
 
+        fbx_given = {k: v for k, v in {"bake_anim": bake_anim, "add_leaf_bones": add_leaf_bones,
+                                       "use_armature_deform_only": use_armature_deform_only,
+                                       "bake_anim_simplify_factor": bake_anim_simplify_factor,
+                                       "mesh_smooth_type": mesh_smooth_type, "primary_bone_axis": primary_bone_axis,
+                                       "secondary_bone_axis": secondary_bone_axis,
+                                       "apply_scale_options": apply_scale_options}.items() if v is not None}
+        gltf_given = {"export_animations": bool(export_animations), "export_skins": bool(export_skins),
+                      "export_morph": bool(export_morph)}
+        ignored = []
+        fbx_kwargs, gltf_kwargs = {}, {}
+        if file_format == "fbx":
+            for key in ("mesh_smooth_type", "primary_bone_axis", "secondary_bone_axis", "apply_scale_options"):
+                if key in fbx_given:
+                    valid = self._op_enum_ids(bpy.ops.export_scene.fbx, key)
+                    value = str(fbx_given[key]).upper()
+                    if valid and value not in valid:
+                        return {"error": f"{key} '{fbx_given[key]}' not valid on this Blender; valid: {valid}"}
+                    fbx_given[key] = value
+            fbx_kwargs = dict(fbx_given)
+            fbx_kwargs["bake_anim"] = bool(fbx_kwargs.get("bake_anim", True))
+            fbx_kwargs["add_leaf_bones"] = bool(fbx_kwargs.get("add_leaf_bones", False))
+            fbx_kwargs["use_armature_deform_only"] = bool(fbx_kwargs.get("use_armature_deform_only", True))
+            fbx_kwargs["bake_anim_simplify_factor"] = float(fbx_kwargs.get("bake_anim_simplify_factor", 0.0))
+            ignored = [k for k in self._GLTF_EXPORT_PARAMS if gltf_given[k] is not True]
+        elif file_format in ("glb", "gltf"):
+            gltf_kwargs = dict(gltf_given)
+            defaults = {"bake_anim": True, "add_leaf_bones": False, "use_armature_deform_only": True,
+                        "bake_anim_simplify_factor": 0.0}
+            ignored = [k for k, v in fbx_given.items() if defaults.get(k, None) != v]
+        else:
+            defaults = {"bake_anim": True, "add_leaf_bones": False, "use_armature_deform_only": True,
+                        "bake_anim_simplify_factor": 0.0}
+            ignored = [k for k, v in fbx_given.items() if defaults.get(k, None) != v] + \
+                      [k for k in self._GLTF_EXPORT_PARAMS if gltf_given[k] is not True]
+
+        exported = []
         # Blender 4.x: OBJ/STL/PLY moved from the Python add-ons to wm.* C operators
         try:
-            if file_format in ("glb", "gltf"):
-                bpy.ops.export_scene.gltf(
-                    filepath=filepath,
-                    export_format="GLB" if file_format == "glb" else "GLTF_SEPARATE",
-                    use_selection=selected,
-                )
-            elif file_format == "fbx":
-                bpy.ops.export_scene.fbx(filepath=filepath, use_selection=selected)
-            elif file_format == "obj":
-                if self._op_exists(bpy.ops.wm.obj_export):
-                    bpy.ops.wm.obj_export(filepath=filepath, export_selected_objects=selected)
-                else:
-                    bpy.ops.export_scene.obj(filepath=filepath, use_selection=selected)
-            elif file_format == "stl":
-                if self._op_exists(bpy.ops.wm.stl_export):
-                    bpy.ops.wm.stl_export(filepath=filepath, export_selected_objects=selected)
-                else:
-                    bpy.ops.export_mesh.stl(filepath=filepath, use_selection=selected)
-            elif file_format == "ply":
-                if self._op_exists(bpy.ops.wm.ply_export):
-                    bpy.ops.wm.ply_export(filepath=filepath, export_selected_objects=selected)
-                else:
-                    bpy.ops.export_mesh.ply(filepath=filepath, use_selection=selected)
+            with self._selection_scope():
+                if obj is not None:
+                    self._select_only(obj)
+                    if include_hierarchy:
+                        extra = []
+                        if obj.parent is not None and obj.parent.type == 'ARMATURE':
+                            extra.append(obj.parent)
+                            extra += list(obj.parent.children_recursive)
+                        arm_mod = next((m for m in obj.modifiers if m.type == 'ARMATURE' and m.object), None)
+                        if arm_mod is not None:
+                            extra.append(arm_mod.object)
+                        extra += list(obj.children_recursive)
+                        for o in extra:
+                            if o.name in bpy.context.view_layer.objects:
+                                o.select_set(True)
+                    exported = sorted(o.name for o in bpy.context.view_layer.objects if o.select_get())
+                if file_format in ("glb", "gltf"):
+                    bpy.ops.export_scene.gltf(
+                        filepath=filepath,
+                        export_format="GLB" if file_format == "glb" else "GLTF_SEPARATE",
+                        use_selection=selected, **gltf_kwargs,
+                    )
+                elif file_format == "fbx":
+                    bpy.ops.export_scene.fbx(filepath=filepath, use_selection=selected, **fbx_kwargs)
+                elif file_format == "obj":
+                    if self._op_exists(bpy.ops.wm.obj_export):
+                        bpy.ops.wm.obj_export(filepath=filepath, export_selected_objects=selected)
+                    else:
+                        bpy.ops.export_scene.obj(filepath=filepath, use_selection=selected)
+                elif file_format == "stl":
+                    if self._op_exists(bpy.ops.wm.stl_export):
+                        bpy.ops.wm.stl_export(filepath=filepath, export_selected_objects=selected)
+                    else:
+                        bpy.ops.export_mesh.stl(filepath=filepath, use_selection=selected)
+                elif file_format == "ply":
+                    if self._op_exists(bpy.ops.wm.ply_export):
+                        bpy.ops.wm.ply_export(filepath=filepath, export_selected_objects=selected)
+                    else:
+                        bpy.ops.export_mesh.ply(filepath=filepath, use_selection=selected)
         except Exception as e:
             return {"error": f"Export failed: {e}"}
 
         if not os.path.exists(filepath) and file_format != "gltf":
             return {"error": f"Exporter finished but {filepath} was not written"}
-        return {"success": True, "filepath": filepath, "format": file_format}
+        reply = {"success": True, "filepath": filepath, "format": file_format,
+                 "exported_objects": exported if selected else "all",
+                 "include_hierarchy": bool(include_hierarchy) if selected else None}
+        if fbx_kwargs:
+            reply["fbx_options"] = fbx_kwargs
+        if gltf_kwargs:
+            reply["gltf_options"] = gltf_kwargs
+        if ignored:
+            reply["ignored"] = ignored
+        return reply
 
     def import_file(self, filepath):
         """
-        Import a 3D file. Supports: glb/gltf, fbx, obj, stl, ply, blend.
+        Import a 3D file. Supports: glb/gltf, fbx, obj, stl, ply, blend, bvh (needs the
+        io_anim_bvh add-on, enabled in factory preferences).
+        Reply: imported_objects (user geometry), armatures, actions (all), new_actions, and
+        bone_shape_objects (the glTF importer's bone custom-shape meshes, e.g. "Icosphere",
+        which are not user geometry).
         """
         if not os.path.exists(filepath):
             return {"error": f"File not found: {filepath}"}
 
         ext = os.path.splitext(filepath)[1].lower()
-        supported = (".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply", ".blend")
+        supported = (".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply", ".blend", ".bvh")
         if ext not in supported:
             return {"error": f"Unsupported file extension: {ext}. Choose from: {list(supported)}"}
+        if ext == ".bvh" and not self._addon_enabled("io_anim_bvh"):
+            return {"error": "BVH import needs the io_anim_bvh add-on; enable it with enable_addon('io_anim_bvh')"}
         before = set(bpy.data.objects.keys())
+        actions_before = set(bpy.data.actions.keys())
 
         try:
             if ext in (".glb", ".gltf"):
-                bpy.ops.import_scene.gltf(filepath=filepath)
+                # K8: the importer's bone custom-shape mesh (Icosphere) is suppressed at the source
+                # on both versions; the kwarg is try-passed so an importer without it still works
+                try:
+                    bpy.ops.import_scene.gltf(filepath=filepath, disable_bone_shape=True)
+                except TypeError:
+                    bpy.ops.import_scene.gltf(filepath=filepath)
             elif ext == ".fbx":
                 bpy.ops.import_scene.fbx(filepath=filepath)
+            elif ext == ".bvh":
+                bpy.ops.import_anim.bvh(filepath=filepath)
             elif ext == ".obj":
                 if self._op_exists(bpy.ops.wm.obj_import):
                     bpy.ops.wm.obj_import(filepath=filepath)
@@ -1876,48 +2876,167 @@ class BlenderMCPServer:
             return {"error": f"Import failed: {e}"}
 
         after = set(bpy.data.objects.keys())
-        new_objects = list(after - before)
-        return {"success": True, "filepath": filepath, "imported_objects": new_objects}
+        new_names = sorted(after - before)
+        new_objs = [bpy.data.objects[n] for n in new_names]
+        armatures = [o.name for o in new_objs if o.type == 'ARMATURE']
+        # Bone custom-shape meshes the importer adds (glTF: "Icosphere") are not user geometry
+        shapes = set()
+        for o in new_objs:
+            if o.type == 'ARMATURE':
+                for pb in o.pose.bones:
+                    if pb.custom_shape is not None:
+                        shapes.add(pb.custom_shape.name)
+        bone_shapes = [o.name for o in new_objs
+                       if o.name in shapes or (o.type == 'MESH' and not o.users_collection)]
+        imported = [n for n in new_names if n not in bone_shapes]
+        new_actions = sorted(set(bpy.data.actions.keys()) - actions_before)
+        return {"success": True, "filepath": filepath, "imported_objects": imported,
+                "armatures": armatures, "actions": sorted(bpy.data.actions.keys()),
+                "new_actions": new_actions, "bone_shape_objects": bone_shapes}
 
-    def save_blend(self, filepath=None):
+    def save_blend(self, filepath=None, compress=None, relative_remap=True, copy=False,
+                   incremental=False, backup=True, overwrite=True, purge_orphans=False):
         """
         Save the current Blender project as a .blend file.
-        If filepath is omitted, saves over the currently open file (or to a temp path
-        if the file has never been saved before).
+        filepath: omitted = save over the open file, or to a temp path when the file has never
+                  been saved (reply then carries warning "unsaved file, saved to temp").
+        compress: None = the use_file_compression preference (default False on 4.3, True on 5.x);
+                  the reply reports the effective value.
+        copy: save a copy WITHOUT changing the working file path (wm.save_as_mainfile(copy=True)).
+        incremental: Blender's own numbering beside the open file (a.blend -> a1.blend); needs a
+                  saved file and no filepath.
+        backup: False disables the .blend1 backup for this save (save_version preference is
+                  restored afterwards); the reply reports the preference in "save_versions".
+        overwrite: False refuses when the target exists and is not the file already open.
+        purge_orphans: run bpy.data.orphans_purge before saving; the reply reports the count.
+        Reply: filepath, bytes, is_dirty (reported, differs per Blender version), elapsed, compress.
         """
-        import tempfile
+        t0 = time.perf_counter()
+        fp_prefs = bpy.context.preferences.filepaths
+        current = os.path.abspath(bpy.data.filepath) if bpy.data.filepath else ""
+        warning = None
+
+        if incremental:
+            if not current:
+                return {"error": "incremental=True needs a file that has already been saved; "
+                                 "pass filepath (or use incremental=False) for the first save"}
+            if filepath:
+                return {"error": "incremental=True saves beside the open file; do not pass filepath"}
+            if copy:
+                return {"error": "incremental=True and copy=True are exclusive; choose one"}
         if not filepath:
-            current = bpy.data.filepath
             if current:
                 filepath = current
             else:
-                filepath = os.path.join(tempfile.gettempdir(),
-                                        f"blender_unsaved_{os.getpid()}.blend")
-
-        if not filepath.endswith(".blend"):
+                filepath = os.path.join(tempfile.gettempdir(), f"blender_unsaved_{os.getpid()}.blend")
+                warning = "unsaved file, saved to temp"
+        if not filepath.lower().endswith(".blend"):
             filepath += ".blend"
+        filepath = os.path.abspath(filepath)
 
-        bpy.ops.wm.save_as_mainfile(filepath=filepath)
-        return {"success": True, "filepath": filepath}
+        if not overwrite and not incremental and os.path.exists(filepath) and filepath != current:
+            return {"error": f"{filepath} exists and overwrite=False; pass overwrite=True or another filepath"}
 
-    def load_blend(self, filepath):
+        compress = bool(fp_prefs.use_file_compression) if compress is None else bool(compress)
+        purged = None
+        if purge_orphans:
+            purged = int(bpy.data.orphans_purge(do_local_ids=True, do_linked_ids=False, do_recursive=True))
+
+        saved_versions = int(fp_prefs.save_version)
+        try:
+            if not backup:
+                fp_prefs.save_version = 0
+            # never pass show_save_modified_images_dialog (5.2 only); keyword args only
+            if incremental:
+                result = bpy.ops.wm.save_mainfile(incremental=True, compress=compress,
+                                                  relative_remap=bool(relative_remap))
+            elif copy:
+                result = bpy.ops.wm.save_as_mainfile(filepath=filepath, copy=True, compress=compress,
+                                                     relative_remap=bool(relative_remap))
+            elif filepath == current:
+                result = bpy.ops.wm.save_mainfile(filepath=filepath, compress=compress,
+                                                  relative_remap=bool(relative_remap))
+            else:
+                result = bpy.ops.wm.save_as_mainfile(filepath=filepath, compress=compress,
+                                                     relative_remap=bool(relative_remap))
+            if 'FINISHED' not in result:
+                return {"error": f"save operator returned {set(result)}"}
+        except Exception as e:
+            return {"error": f"Save failed: {e}"}
+        finally:
+            if not backup:
+                fp_prefs.save_version = saved_versions
+
+        written = os.path.abspath(bpy.data.filepath) if (incremental or (not copy and bpy.data.filepath)) else filepath
+        if not os.path.exists(written):
+            return {"error": f"save finished but {written} was not written"}
+        reply = {"success": True, "filepath": written, "bytes": os.path.getsize(written),
+                 "is_dirty": bool(bpy.data.is_dirty), "elapsed": round(time.perf_counter() - t0, 3),
+                 "compress": compress, "copy": bool(copy), "incremental": bool(incremental),
+                 "save_versions": saved_versions, "purged": purged}
+        if warning:
+            reply["warning"] = warning
+        return reply
+
+    def load_blend(self, filepath, force=False, save_first=False, load_ui=None, use_scripts=None,
+                   revert_on_fail=True):
         """
         Open a .blend file, replacing the current scene.
-        WARNING: unsaved changes to the current file will be lost.
+        Refuses while bpy.data.is_dirty unless force=True (discard) or save_first=True (save the
+        open file, which must already have a path, then load). Note 4.3.2 reports is_dirty True
+        right after startup, 5.2.1 False.
+        load_ui / use_scripts: None = the use_load_ui / use_scripts_auto_execute preferences.
+        revert_on_fail: reopen the previous file when the load raises.
+        Reply: previous_file, blender_version_of_file (the saving Blender), unsaved_changes_discarded.
         """
         if not os.path.exists(filepath):
             return {"error": f"File not found: {filepath}"}
         if not filepath.lower().endswith(".blend"):
             return {"error": "load_blend only accepts .blend files. Use import_file for 3D model formats."}
 
-        bpy.ops.wm.open_mainfile(filepath=filepath)
-        # After open, report the new scene state
+        previous = bpy.data.filepath
+        dirty = bool(bpy.data.is_dirty)
+        discarded = False
+        if dirty and not force and not save_first:
+            return {"error": f"Unsaved changes in {previous or '<never-saved file>'} would be lost. "
+                             "Pass force=True to discard them or save_first=True to save them first."}
+        if dirty and save_first:
+            if not previous:
+                return {"error": "save_first=True but the open file has never been saved; "
+                                 "call save_blend(filepath=...) first or pass force=True"}
+            try:
+                bpy.ops.wm.save_mainfile()
+            except Exception as e:
+                return {"error": f"save_first failed: {e}"}
+        elif dirty and force:
+            discarded = True
+
+        fp_prefs = bpy.context.preferences.filepaths
+        load_ui = bool(fp_prefs.use_load_ui) if load_ui is None else bool(load_ui)
+        use_scripts = bool(fp_prefs.use_scripts_auto_execute) if use_scripts is None else bool(use_scripts)
+        try:
+            result = bpy.ops.wm.open_mainfile(filepath=filepath, load_ui=load_ui, use_scripts=use_scripts)
+            if 'FINISHED' not in result:
+                raise RuntimeError(f"open operator returned {set(result)}")
+        except Exception as e:
+            reverted = False
+            if revert_on_fail and previous and os.path.exists(previous):
+                with suppress(Exception):
+                    bpy.ops.wm.open_mainfile(filepath=previous, load_ui=load_ui, use_scripts=use_scripts)
+                    reverted = True
+            return {"error": f"Could not open {filepath}: {e}", "reverted_to": previous if reverted else None}
+
         scene = bpy.context.scene
         return {
             "success": True,
-            "filepath": filepath,
+            "filepath": bpy.data.filepath,
+            "previous_file": previous,
+            "blender_version_of_file": list(bpy.data.version),
+            "unsaved_changes_discarded": discarded,
             "scene_name": scene.name,
             "object_count": len(scene.objects),
+            "load_ui": load_ui,
+            "use_scripts": use_scripts,
         }
 
     # ─── Primitives & object management ─────────────────────────────────────
@@ -2078,8 +3197,9 @@ class BlenderMCPServer:
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
-        self._select_only(obj)
-        bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
+        with self._selection_scope():
+            self._select_only(obj)
+            bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
         return {"success": True, "name": name, "origin_type": origin_type,
                 "new_location": list(obj.location)}
 
@@ -2103,44 +3223,68 @@ class BlenderMCPServer:
         obj = bpy.data.objects.get(name)
         if not obj or obj.type != 'MESH':
             return {"error": f"Mesh object not found: {name}"}
-        self._select_only(obj)
         auto_method = None
-        if smooth:
-            if auto_smooth and hasattr(obj.data, 'use_auto_smooth'):
-                bpy.ops.object.shade_smooth()
-                obj.data.use_auto_smooth = True
-                obj.data.auto_smooth_angle = math.radians(angle)
-                auto_method = "mesh.use_auto_smooth"
-            elif auto_smooth and self._op_exists(bpy.ops.object.shade_smooth_by_angle):
-                bpy.ops.object.shade_smooth_by_angle(angle=math.radians(angle))
-                auto_method = "smooth_by_angle"
-            elif auto_smooth and self._op_exists(bpy.ops.object.shade_auto_smooth):
-                bpy.ops.object.shade_auto_smooth(use_auto_smooth=True, angle=math.radians(angle))
-                auto_method = "smooth_by_angle_modifier"
+        with self._selection_scope():
+            self._select_only(obj)
+            if smooth:
+                if auto_smooth and hasattr(obj.data, 'use_auto_smooth'):
+                    bpy.ops.object.shade_smooth()
+                    obj.data.use_auto_smooth = True
+                    obj.data.auto_smooth_angle = math.radians(angle)
+                    auto_method = "mesh.use_auto_smooth"
+                elif auto_smooth and self._op_exists(bpy.ops.object.shade_smooth_by_angle):
+                    bpy.ops.object.shade_smooth_by_angle(angle=math.radians(angle))
+                    auto_method = "smooth_by_angle"
+                elif auto_smooth and self._op_exists(bpy.ops.object.shade_auto_smooth):
+                    bpy.ops.object.shade_auto_smooth(use_auto_smooth=True, angle=math.radians(angle))
+                    auto_method = "smooth_by_angle_modifier"
+                else:
+                    bpy.ops.object.shade_smooth()
             else:
-                bpy.ops.object.shade_smooth()
-        else:
-            bpy.ops.object.shade_flat()
+                bpy.ops.object.shade_flat()
         return {"success": True, "name": name, "smooth": smooth,
                 "auto_smooth": auto_method is not None,
                 "auto_smooth_method": auto_method,
                 "auto_smooth_angle": angle if auto_method else None}
 
-    def parent_object(self, child_name, parent_name, keep_transform=True):
-        """Parent child_name to parent_name, optionally preserving world transform."""
+    def parent_object(self, child_name, parent_name, keep_transform=True, parent_type="OBJECT", bone=None):
+        """
+        Parent child_name to parent_name, optionally preserving the world transform.
+        parent_type: OBJECT (default) or BONE (+ bone: a bone of the ARMATURE parent; the child
+        follows that bone). Armature deform binding is bind_armature, not this tool.
+        """
         child = bpy.data.objects.get(child_name)
         parent = bpy.data.objects.get(parent_name)
         if not child:
             return {"error": f"Child object not found: {child_name}"}
         if not parent:
             return {"error": f"Parent object not found: {parent_name}"}
+        if child is parent or parent in child.children_recursive:
+            return {"error": f"{parent_name} is {child_name} itself or one of its descendants"}
+        ptype = str(parent_type or "OBJECT").upper()
+        if ptype not in ("OBJECT", "BONE"):
+            return {"error": f"parent_type '{parent_type}' not valid; valid: ['OBJECT', 'BONE']"}
+        if ptype == "BONE":
+            if parent.type != 'ARMATURE':
+                return {"error": f"parent_type BONE needs an ARMATURE parent; {parent_name} is a {parent.type}"}
+            if not bone or bone not in parent.data.bones:
+                return {"error": f"bone {bone!r} not found on {parent_name}; bones: {[b.name for b in parent.data.bones][:50]}"}
 
         orig_matrix = child.matrix_world.copy() if keep_transform else None
         child.parent = parent
-        child.matrix_parent_inverse = parent.matrix_world.inverted()
+        if ptype == "BONE":
+            child.parent_type = 'BONE'
+            child.parent_bone = bone
+            child.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        else:
+            child.parent_type = 'OBJECT'
+            child.matrix_parent_inverse = parent.matrix_world.inverted()
         if keep_transform and orig_matrix:
             child.matrix_world = orig_matrix
-        return {"success": True, "child": child_name, "parent": parent_name}
+        reply = {"success": True, "child": child_name, "parent": parent_name, "parent_type": ptype}
+        if ptype == "BONE":
+            reply["bone"] = bone
+        return reply
 
     def select_objects(self, names=None, action="SELECT", obj_type=None):
         """
@@ -2303,7 +3447,7 @@ class BlenderMCPServer:
         if img is None:
             img = bpy.data.images.load(image_path)
 
-        # TexCoord → Mapping → Image Texture
+        # TexCoord -> Mapping -> Image Texture
         tc  = nodes.new("ShaderNodeTexCoord")
         mp  = nodes.new("ShaderNodeMapping")
         tex = nodes.new("ShaderNodeTexImage")
@@ -2342,7 +3486,7 @@ class BlenderMCPServer:
         Add a modifier to an object.
         modifier_type: MIRROR, BEVEL, ARRAY, SOLIDIFY, SUBSURF, BOOLEAN,
                        DECIMATE, DISPLACE, SHRINKWRAP, WIREFRAME, SKIN, etc.
-        props: dict of modifier property name → value (extra kwargs are merged in).
+        props: dict of modifier property name -> value (extra kwargs are merged in).
         Properties that could not be set are reported under "unset".
         Common examples:
           MIRROR:   use_axis=[True,True,False], use_clip=True
@@ -2398,8 +3542,10 @@ class BlenderMCPServer:
         """
         Apply a boolean modifier on target_name using cutter_name.
         operation: DIFFERENCE, UNION, INTERSECT
-        solver: EXACT (better quality), FAST (faster, less reliable)
+        solver: EXACT (better quality), FAST / FLOAT (faster, less reliable; FAST was renamed
+                FLOAT in Blender 5.0, either spelling is mapped to the live enum), MANIFOLD (Blender 5.2+)
         apply: if True, applies the modifier and removes the cutter object
+        Reply carries "solver": the identifier actually set on this Blender.
         """
         target = bpy.data.objects.get(target_name)
         cutter = bpy.data.objects.get(cutter_name)
@@ -2407,78 +3553,144 @@ class BlenderMCPServer:
             return {"error": f"Target not found: {target_name}"}
         if not cutter:
             return {"error": f"Cutter not found: {cutter_name}"}
+        if target.type != 'MESH':
+            return {"error": f"Target must be a MESH object, {target_name} is {target.type}"}
+
+        operation_id = str(operation or "").strip().upper()
+        solver_id = str(solver or "").strip().upper()
 
         mod = target.modifiers.new(name="Boolean", type="BOOLEAN")
-        mod.operation = operation
-        mod.object    = cutter
+        ops_valid = [e.identifier for e in mod.bl_rna.properties['operation'].enum_items]
+        if operation_id not in ops_valid:
+            target.modifiers.remove(mod)
+            return {"error": f"operation '{operation}' not valid; valid: {ops_valid}"}
+        mod.operation = operation_id
+        mod.object = cutter
+
+        resolved_solver = None
         if hasattr(mod, 'solver'):
-            mod.solver = solver
+            solvers_valid = [e.identifier for e in mod.bl_rna.properties['solver'].enum_items]
+            alias = {'FAST': 'FLOAT', 'FLOAT': 'FAST'}
+            for cand in (solver_id, alias.get(solver_id)):
+                if cand and cand in solvers_valid:
+                    mod.solver = cand
+                    resolved_solver = cand
+                    break
+            if resolved_solver is None:
+                target.modifiers.remove(mod)
+                return {"error": f"solver '{solver}' not valid; valid: {solvers_valid} "
+                                 "(FAST and FLOAT are accepted as aliases of each other)"}
 
         if apply:
-            bpy.context.view_layer.objects.active = target
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-            bpy.data.objects.remove(cutter, do_unlink=True)
+            with self._selection_scope():
+                self._select_only(target)
+                bpy.ops.object.modifier_apply(modifier=mod.name)
+                bpy.data.objects.remove(cutter, do_unlink=True)
 
         return {"success": True, "target": target_name, "cutter": cutter_name,
-                "operation": operation, "applied": apply}
+                "operation": operation_id, "solver": resolved_solver, "applied": bool(apply)}
 
     # ─── Render settings ─────────────────────────────────────────────────────
 
     def set_render_settings(self, engine=None, width=None, height=None,
                             samples=None, output_path=None, file_format=None,
-                            transparent_background=None):
+                            transparent_background=None, fps=None, fps_base=None,
+                            frame_start=None, frame_end=None, resolution_percentage=None,
+                            color_mode=None, color_depth=None, compression=None, denoise=None,
+                            device=None, use_persistent_data=None, use_simplify=None,
+                            simplify_subdivision=None):
         """
-        Configure scene render settings.
-        engine: CYCLES, BLENDER_EEVEE, BLENDER_WORKBENCH
-        file_format: PNG, JPEG, EXR, TIFF
+        Configure scene render settings (the convenience wrapper over the RENDER / OUTPUT /
+        SCENE / CYCLES settings scopes; every value goes through the same RNA validation as
+        set_settings and lands in "set" / "unset" {key: reason} exactly like add_modifier).
+        engine: CYCLES, BLENDER_EEVEE (or EEVEE), BLENDER_WORKBENCH (or WORKBENCH), case-insensitive;
+                the EEVEE id differs per Blender version and is resolved by try-assign
+        file_format: PNG, JPEG, OPEN_EXR, TIFF, FFMPEG, ... (live enum listed in the error)
+        color_mode: BW / RGB / RGBA; color_depth: '8' / '16' / '32' (format dependent);
+        device: CPU / GPU (Cycles); denoise: Cycles use_denoising.
+        Reply carries "engine": the identifier actually set on this Blender.
         """
         scene = bpy.context.scene
-        if engine:
-            # Normalise legacy name: BLENDER_EEVEE was renamed to BLENDER_EEVEE_NEXT in Blender 4.x
-            engine_upper = engine.upper()
-            if engine_upper == 'BLENDER_EEVEE' and bpy.app.version >= (4, 0, 0):
-                engine_upper = 'BLENDER_EEVEE_NEXT'
-            scene.render.engine = engine_upper
-        if width:
-            scene.render.resolution_x = int(width)
-        if height:
-            scene.render.resolution_y = int(height)
-        if output_path:
-            scene.render.filepath = output_path
-        if file_format:
-            scene.render.image_settings.file_format = file_format.upper()
-        if transparent_background is not None:
-            scene.render.film_transparent = bool(transparent_background)
+        if engine is not None:
+            err = self._set_render_engine(scene.render, engine)
+            if err:
+                return err
+        if file_format is not None:
+            err = self._set_file_format(scene.render.image_settings, file_format)
+            if err:
+                return err
+
+        plan = {
+            "RENDER": {"resolution_x": width, "resolution_y": height, "filepath": output_path,
+                       "film_transparent": transparent_background, "fps": fps, "fps_base": fps_base,
+                       "resolution_percentage": resolution_percentage,
+                       "use_persistent_data": use_persistent_data, "use_simplify": use_simplify,
+                       "simplify_subdivision": simplify_subdivision},
+            "SCENE": {"frame_start": frame_start, "frame_end": frame_end},
+            "OUTPUT": {"color_mode": color_mode, "color_depth": color_depth, "compression": compression},
+            "CYCLES": {"use_denoising": denoise, "device": device},
+        }
+        done, unset = [], {}
+        for scope, values in plan.items():
+            wanted = {k: v for k, v in values.items() if v is not None}
+            if not wanted:
+                continue
+            outcome = self._apply_settings(scope, wanted, scene)
+            done += outcome["set"]
+            unset.update(outcome["unset"])
+        if engine is not None:
+            done.append("engine")
+        if file_format is not None:
+            done.append("file_format")
 
         if samples is not None:
             if scene.render.engine == 'CYCLES':
                 scene.cycles.samples = int(samples)
-            elif scene.render.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'):
-                if hasattr(scene, 'eevee'):
-                    scene.eevee.taa_render_samples = int(samples)
+                done.append("samples")
+            elif scene.render.engine in ('BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT') and hasattr(scene, 'eevee'):
+                scene.eevee.taa_render_samples = int(samples)
+                done.append("samples")
+            else:
+                unset["samples"] = f"engine {scene.render.engine} has no sample count here"
 
-        return {
+        reply = {
             "success": True,
             "engine": scene.render.engine,
             "resolution": [scene.render.resolution_x, scene.render.resolution_y],
             "output": scene.render.filepath,
             "transparent": scene.render.film_transparent,
+            "set": done,
         }
+        if unset:
+            reply["unset"] = unset
+        return reply
 
     # ─── Animation ───────────────────────────────────────────────────────────
 
-    def add_keyframe(self, name, data_path="location", frame=None, value=None):
+    def add_keyframe(self, name, data_path="location", frame=None, value=None, bone=None):
         """
         Insert a keyframe on an object property.
         data_path: 'location', 'rotation_euler', 'scale', or any animatable path
         frame: frame number (defaults to current scene frame)
         value: if given, sets the property to this value before keying.
-               For location/rotation/scale pass [x, y, z]; for single values pass a number.
+               For location/rotation/scale pass [x, y, z] (rotation in degrees); for single values pass a number.
+        bone: pose bone name on an ARMATURE object; data_path is then relative to the pose bone.
+        Pose bones (and objects) whose rotation_mode is QUATERNION / AXIS_ANGLE are switched to
+        XYZ when rotation_euler is keyed (reply: rotation_mode_changed), otherwise the key is invisible.
         """
         import math
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
+
+        root = obj
+        if bone is not None:
+            if obj.type != 'ARMATURE':
+                return {"error": f"bone={bone!r} needs an ARMATURE object; {name} is a {obj.type}"}
+            pb = obj.pose.bones.get(bone)
+            if pb is None:
+                return {"error": f"Bone not found: {bone}; bones: {[b.name for b in obj.pose.bones][:50]}"}
+            root = pb
 
         scene = bpy.context.scene
         if frame is not None:
@@ -2495,13 +3707,19 @@ class BlenderMCPServer:
                 split_at = i
         try:
             if split_at >= 0:
-                owner = obj.path_resolve(data_path[:split_at])
+                owner = root.path_resolve(data_path[:split_at])
                 attr = data_path[split_at + 1:]
             else:
-                owner, attr = obj, data_path
+                owner, attr = root, data_path
             current = getattr(owner, attr)
         except Exception as e:
-            return {"error": f"Cannot resolve '{data_path}' on {name}: {e}"}
+            return {"error": f"Cannot resolve '{data_path}' on {name}{'.' + bone if bone else ''}: {e}"}
+
+        rotation_mode_changed = None
+        if attr in ("rotation_euler", "delta_rotation_euler") and hasattr(owner, "rotation_mode"):
+            if owner.rotation_mode in ('QUATERNION', 'AXIS_ANGLE'):
+                rotation_mode_changed = {"from": owner.rotation_mode, "to": "XYZ"}
+                owner.rotation_mode = 'XYZ'
 
         if value is not None:
             is_vector = hasattr(current, "__len__") and not isinstance(current, str)
@@ -2528,8 +3746,18 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": f"Could not insert keyframe on {data_path}: {e}"}
 
-        return {"success": True, "name": name, "data_path": data_path,
-                "keyed_on": id_owner.name, "frame": scene.frame_current}
+        reply = {"success": True, "name": name, "data_path": data_path,
+                 "keyed_on": id_owner.name, "frame": scene.frame_current}
+        if bone is not None:
+            reply["bone"] = bone
+        if rotation_mode_changed:
+            reply["rotation_mode_changed"] = rotation_mode_changed
+        ad = getattr(id_owner, "animation_data", None)
+        if ad is not None and ad.action is not None:
+            reply["action"] = ad.action.name
+            fcurves, _groups, _new = self._action_channels(id_owner)
+            reply["fcurve_count"] = len(fcurves) if fcurves is not None else 0
+        return reply
 
     def set_frame(self, frame):
         """Set the current scene frame."""
@@ -2579,6 +3807,2423 @@ class BlenderMCPServer:
             moved.append(n)
 
         return {"success": True, "collection": collection_name, "moved": moved}
+
+    # ─── Settings, save and load (B0 Tier 1) ────────────────────────────────
+
+    _SNAPSHOT_SCOPES = ("SCENE", "RENDER", "OUTPUT", "CYCLES", "EEVEE", "COLOR", "UNITS", "VIEWPORT")
+    _UNIT_PRESETS = {"UNREAL": ("METRIC", 0.01, "CENTIMETERS"), "UNITY": ("METRIC", 1.0, "METERS"),
+                     "GODOT": ("METRIC", 1.0, "METERS"), "BEVY": ("METRIC", 1.0, "METERS"),
+                     "TIMBERMESH": ("METRIC", 1.0, "METERS"), "NONE": None}
+    _PROFILE_KEY = "blendermcp_profile"
+
+    @staticmethod
+    def _scope_list(scopes, default):
+        if scopes is None:
+            return list(default)
+        if isinstance(scopes, str):
+            return [s.strip().upper() for s in scopes.split(",") if s.strip()]
+        return [str(s).upper() for s in scopes]
+
+    @staticmethod
+    def _json_arg(value, label):
+        """Accept a dict/list or a JSON string; return (parsed, error dict|None)."""
+        if value is None or isinstance(value, (dict, list)):
+            return value, None
+        try:
+            return json.loads(value), None
+        except Exception as e:
+            return None, {"error": f"{label} must be JSON (or a dict/list): {e}"}
+
+    @staticmethod
+    def _dirty_guard(force):
+        """Error dict when unsaved changes would be discarded, else None."""
+        if bpy.data.is_dirty and not force:
+            return {"error": f"Unsaved changes in {bpy.data.filepath or '<never-saved file>'} would be lost; "
+                             "pass force=True to discard them (4.3.2 reports is_dirty right after startup)"}
+        return None
+
+    @staticmethod
+    def _missing_files():
+        missing = []
+        for img in bpy.data.images:
+            if img.source == 'FILE' and not img.packed_file and img.filepath:
+                path = bpy.path.abspath(img.filepath)
+                if not os.path.exists(path):
+                    missing.append({"type": "image", "name": img.name, "path": path})
+        for lib in bpy.data.libraries:
+            path = bpy.path.abspath(lib.filepath)
+            if not os.path.exists(path):
+                missing.append({"type": "library", "name": lib.name, "path": path})
+        return missing
+
+    def get_file_state(self):
+        """File lifecycle facts; is_dirty and file_version are reported, never assumed."""
+        fp = bpy.data.filepath
+        tempdir = bpy.app.tempdir
+        autosaves = []
+        with suppress(Exception):
+            for entry in os.scandir(tempdir):
+                if entry.is_file() and entry.name.lower().endswith(".blend"):
+                    autosaves.append({"path": entry.path, "mtime": entry.stat().st_mtime})
+        autosaves.sort(key=lambda d: d["mtime"], reverse=True)
+        recent = []
+        with suppress(Exception):
+            recent_txt = os.path.join(bpy.utils.user_resource('CONFIG'), "recent-files.txt")
+            if os.path.exists(recent_txt):
+                recent = [l.strip() for l in open(recent_txt, encoding="utf-8", errors="replace") if l.strip()]
+        backups = []
+        if fp:
+            n = 1
+            while os.path.exists(f"{fp}{n}"):
+                backups.append(f"{fp}{n}")
+                n += 1
+        return {"success": True, "filepath": fp, "is_saved": bool(bpy.data.is_saved),
+                "is_dirty": bool(bpy.data.is_dirty), "file_version": list(bpy.data.version),
+                "blender_version": bpy.app.version_string, "use_autopack": bool(bpy.data.use_autopack),
+                "packed_images": [i.name for i in bpy.data.images if i.packed_file],
+                "missing_files": self._missing_files(),
+                "libraries": [bpy.path.abspath(l.filepath) for l in bpy.data.libraries],
+                "autosave_dir": tempdir, "autosave_files": autosaves[:20],
+                "recent_files": recent, "backup_files": backups}
+
+    def new_file(self, template=None, empty=False, load_ui=False, force=False):
+        """wm.read_homefile with the same dirty guard as load_blend. Reply: object count after."""
+        err = self._dirty_guard(force)
+        if err:
+            return err
+        kwargs = {"use_empty": bool(empty), "load_ui": bool(load_ui)}
+        if template:
+            kwargs["app_template"] = str(template)
+        try:
+            result = bpy.ops.wm.read_homefile(**kwargs)
+            if 'FINISHED' not in result:
+                return {"error": f"read_homefile returned {set(result)}"}
+        except Exception as e:
+            return {"error": f"new_file failed: {e}"}
+        return {"success": True, "template": template, "empty": bool(empty),
+                "object_count": len(bpy.context.scene.objects), "filepath": bpy.data.filepath}
+
+    def revert_file(self, force=False, use_scripts=None):
+        """wm.revert_mainfile; refuses when the file was never saved."""
+        if not bpy.data.filepath:
+            return {"error": "revert_file needs a saved file; this file has never been saved"}
+        err = self._dirty_guard(force)
+        if err:
+            return err
+        fp_prefs = bpy.context.preferences.filepaths
+        use_scripts = bool(fp_prefs.use_scripts_auto_execute) if use_scripts is None else bool(use_scripts)
+        try:
+            result = bpy.ops.wm.revert_mainfile(use_scripts=use_scripts)
+            if 'FINISHED' not in result:
+                return {"error": f"revert_mainfile returned {set(result)}"}
+        except Exception as e:
+            return {"error": f"revert failed: {e}"}
+        return {"success": True, "filepath": bpy.data.filepath, "object_count": len(bpy.context.scene.objects),
+                "is_dirty": bool(bpy.data.is_dirty)}
+
+    def recover_file(self, mode="LAST_SESSION", filepath=None, force=False):
+        """wm.recover_last_session / wm.recover_auto_save(filepath from get_file_state.autosave_files)."""
+        mode = str(mode or "").upper()
+        if mode not in ("LAST_SESSION", "AUTOSAVE"):
+            return {"error": f"mode '{mode}' not valid; valid: ['LAST_SESSION', 'AUTOSAVE']"}
+        err = self._dirty_guard(force)
+        if err:
+            return err
+        try:
+            if mode == "LAST_SESSION":
+                result = bpy.ops.wm.recover_last_session()
+            else:
+                if not filepath or not os.path.exists(filepath):
+                    return {"error": f"AUTOSAVE needs an existing filepath (see get_file_state.autosave_files); got {filepath!r}"}
+                result = bpy.ops.wm.recover_auto_save(filepath=filepath)
+            if 'FINISHED' not in result:
+                return {"error": f"recover returned {set(result)} (no session file to recover?)"}
+        except Exception as e:
+            return {"error": f"recover failed: {e}"}
+        return {"success": True, "mode": mode, "filepath": bpy.data.filepath,
+                "object_count": len(bpy.context.scene.objects)}
+
+    def save_copy(self, filepath, compress=None, relative_remap=True, pack_images=False):
+        """save_blend(copy=True) plus an optional temporary pack of external images, undone afterwards."""
+        if not filepath:
+            return {"error": "filepath is required"}
+        newly_packed = []
+        if pack_images:
+            for img in bpy.data.images:
+                if img.source == 'FILE' and not img.packed_file and img.filepath:
+                    try:
+                        img.pack()
+                        newly_packed.append(img.name)
+                    except Exception as e:
+                        return {"error": f"could not pack image {img.name}: {e}"}
+        try:
+            reply = self.save_blend(filepath=filepath, compress=compress, relative_remap=relative_remap, copy=True)
+        finally:
+            for name in newly_packed:
+                img = bpy.data.images.get(name)
+                if img is not None and img.packed_file:
+                    with suppress(Exception):
+                        img.unpack(method='USE_ORIGINAL')
+        if "error" in reply:
+            return reply
+        reply["packed_images"] = newly_packed
+        return reply
+
+    @staticmethod
+    def _tri_count():
+        return sum(sum(len(p.vertices) - 2 for p in o.data.polygons)
+                   for o in bpy.context.scene.objects if o.type == 'MESH')
+
+    @staticmethod
+    def _sidecar_path(filepath, suffix):
+        return f"{filepath}{suffix}"
+
+    def save_version(self, note=None, pattern="{stem}_v{n:03d}", dir=None, copy=True):
+        """
+        Numbered copy of the open file (a.blend -> a_v001.blend) plus a sidecar
+        <file>.versions.json (n, path, timestamp, note, object_count, tri_count). copy=True keeps
+        working on the original; copy=False switches to the new version. Needs a saved file.
+        """
+        current = bpy.data.filepath
+        if not current:
+            return {"error": "save_version needs a saved file; call save_blend(filepath=...) first"}
+        current = os.path.abspath(current)
+        stem = os.path.splitext(os.path.basename(current))[0]
+        folder = os.path.abspath(dir) if dir else os.path.dirname(current)
+        os.makedirs(folder, exist_ok=True)
+        sidecar = self._sidecar_path(current, ".versions.json")
+        entries = []
+        if os.path.exists(sidecar):
+            with suppress(Exception):
+                entries = json.load(open(sidecar, encoding="utf-8"))
+        n = (max((e.get("n", 0) for e in entries), default=0)) + 1
+        try:
+            name = pattern.format(stem=stem, n=n)
+        except Exception as e:
+            return {"error": f"pattern '{pattern}' is not valid; use {{stem}} and {{n}} placeholders: {e}"}
+        target = os.path.join(folder, name + (".blend" if not name.lower().endswith(".blend") else ""))
+        while os.path.exists(target):
+            n += 1
+            name = pattern.format(stem=stem, n=n)
+            target = os.path.join(folder, name + (".blend" if not name.lower().endswith(".blend") else ""))
+        reply = self.save_blend(filepath=target, copy=bool(copy))
+        if "error" in reply:
+            return reply
+        entry = {"n": n, "path": target, "timestamp": datetime.now().isoformat(timespec="seconds"),
+                 "note": note, "object_count": len(bpy.context.scene.objects), "tri_count": self._tri_count()}
+        entries.append(entry)
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2)
+        return {"success": True, "version": entry, "sidecar": sidecar, "working_file": bpy.data.filepath,
+                "count": len(entries)}
+
+    def list_versions(self, filepath=None):
+        """Read <file>.versions.json beside filepath (default: the open file) and check each version exists."""
+        base = os.path.abspath(filepath) if filepath else bpy.data.filepath
+        if not base:
+            return {"error": "no filepath given and the open file has never been saved"}
+        sidecar = self._sidecar_path(base, ".versions.json")
+        if not os.path.exists(sidecar):
+            return {"success": True, "file": base, "sidecar": sidecar, "versions": []}
+        try:
+            entries = json.load(open(sidecar, encoding="utf-8"))
+        except Exception as e:
+            return {"error": f"could not read {sidecar}: {e}"}
+        for e in entries:
+            e["exists"] = os.path.exists(e.get("path", ""))
+        return {"success": True, "file": base, "sidecar": sidecar, "versions": entries}
+
+    _LIB_KINDS = ("objects", "collections", "materials", "node_groups", "meshes", "images",
+                  "actions", "worlds", "cameras", "lights", "armatures", "curves", "texts")
+
+    def append_from_blend(self, filepath, datablocks=None, names=None, kind="objects", link=False,
+                          collection=None, instance_collections=False, relative=True, list_only=False):
+        """
+        Append (link=False) or link (link=True) data-blocks from another .blend through
+        bpy.data.libraries.load (keyword-only on both versions; refuses the open file).
+        datablocks: {"objects": [...], "collections": [...], ...} (JSON or dict), or names + kind.
+        list_only=True returns the file's contents per data type without loading anything.
+        Objects land in `collection` (default: the scene collection); collections are linked to
+        the scene collection, or instanced as empties when instance_collections=True.
+        """
+        if not filepath or not os.path.exists(filepath):
+            return {"error": f"File not found: {filepath}"}
+        if not filepath.lower().endswith(".blend"):
+            return {"error": f"{filepath} is not a .blend file"}
+        if bpy.data.filepath and os.path.abspath(filepath) == os.path.abspath(bpy.data.filepath):
+            return {"error": "cannot load from the currently open file (Blender refuses it)"}
+        wanted, err = self._json_arg(datablocks, "datablocks")
+        if err:
+            return err
+        if wanted is None:
+            if names is None:
+                if not list_only:
+                    return {"error": "pass datablocks (JSON per kind) or names + kind, or list_only=True"}
+                wanted = {}
+            else:
+                if isinstance(names, str):
+                    names = [n.strip() for n in names.split(",") if n.strip()]
+                k = str(kind or "objects").lower()
+                if k not in self._LIB_KINDS:
+                    return {"error": f"kind '{kind}' not valid; valid: {list(self._LIB_KINDS)}"}
+                wanted = {k: list(names)}
+        bad_kinds = [k for k in wanted if k not in self._LIB_KINDS]
+        if bad_kinds:
+            return {"error": f"unknown data kinds {bad_kinds}; valid: {list(self._LIB_KINDS)}"}
+
+        try:
+            if list_only:
+                with bpy.data.libraries.load(filepath, link=False, relative=bool(relative)) as (data_from, _):
+                    listing = {k: list(getattr(data_from, k)) for k in self._LIB_KINDS if hasattr(data_from, k)}
+                return {"success": True, "filepath": filepath, "contents": listing}
+
+            missing, plan = {}, {}
+            before_objects = set(bpy.data.objects.keys())
+            with bpy.data.libraries.load(filepath, link=bool(link), relative=bool(relative)) as (data_from, data_to):
+                for k, wanted_names in wanted.items():
+                    available = list(getattr(data_from, k))
+                    found = [n for n in wanted_names if n in available]
+                    lost = [n for n in wanted_names if n not in available]
+                    if lost:
+                        missing[k] = lost
+                    if found:
+                        setattr(data_to, k, found)
+                        plan[k] = found
+        except Exception as e:
+            return {"error": f"libraries.load failed: {e}"}
+
+        scene = bpy.context.scene
+        target = scene.collection
+        if collection:
+            target = bpy.data.collections.get(collection)
+            if target is None:
+                return {"error": f"Collection not found: {collection}"}
+        linked = {}
+        for obj in getattr(data_to, "objects", []) or []:
+            if obj is not None and obj.name not in target.objects:
+                target.objects.link(obj)
+                linked.setdefault("objects", []).append(obj.name)
+        for col in getattr(data_to, "collections", []) or []:
+            if col is None:
+                continue
+            if instance_collections:
+                empty = bpy.data.objects.new(col.name, None)
+                empty.instance_type = 'COLLECTION'
+                empty.instance_collection = col
+                target.objects.link(empty)
+                linked.setdefault("instances", []).append(empty.name)
+            elif col.name not in target.children:
+                target.children.link(col)
+                linked.setdefault("collections", []).append(col.name)
+        appended = {k: [d.name for d in (getattr(data_to, k) or []) if d is not None] for k in plan}
+        reply = {"success": True, "filepath": filepath, "link": bool(link), "appended": appended,
+                 "linked_into": target.name, "new_objects": sorted(set(bpy.data.objects.keys()) - before_objects),
+                 "object_count": len(scene.objects)}
+        if missing:
+            reply["missing"] = missing
+        if linked:
+            reply["scene_links"] = linked
+        return reply
+
+    def link_from_blend(self, filepath, datablocks=None, names=None, kind="objects", collection=None,
+                        instance_collections=False, relative=True, list_only=False):
+        """append_from_blend with link=True (data stays in the library file)."""
+        return self.append_from_blend(filepath, datablocks=datablocks, names=names, kind=kind, link=True,
+                                      collection=collection, instance_collections=instance_collections,
+                                      relative=relative, list_only=list_only)
+
+    def _persist_prefs(self, persist):
+        """Consent rule: preferences are written only on explicit request. Returns (persisted, error)."""
+        if not persist:
+            return False, None
+        try:
+            bpy.ops.wm.save_userpref()
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    def set_autosave(self, enabled=None, interval_minutes=None, save_versions=None, temp_dir=None, persist=False):
+        """Preferences filepaths.use_auto_save_temporary_files / auto_save_time / save_version / temporary_directory."""
+        fp = bpy.context.preferences.filepaths
+        values = {"use_auto_save_temporary_files": enabled, "auto_save_time": interval_minutes,
+                  "save_version": save_versions, "temporary_directory": temp_dir}
+        outcome = self._apply_settings("PREFS_FILEPATHS", {k: v for k, v in values.items() if v is not None})
+        persisted, perr = self._persist_prefs(persist)
+        reply = {"success": True, "enabled": fp.use_auto_save_temporary_files, "interval_minutes": fp.auto_save_time,
+                 "save_versions": fp.save_version, "temp_dir": fp.temporary_directory,
+                 "set": outcome["set"], "persisted": persisted, "preferences_dirty": bool(bpy.context.preferences.is_dirty)}
+        if outcome["unset"]:
+            reply["unset"] = outcome["unset"]
+        if perr:
+            reply["persist_error"] = perr
+        return reply
+
+    def _path_op(self, op, label, **kwargs):
+        if not bpy.data.filepath and label.startswith("make_paths"):
+            return {"error": f"{label} needs a saved file (relative paths are relative to it)"}
+        try:
+            result = op(**kwargs)
+            if 'FINISHED' not in result:
+                return {"error": f"{label} returned {set(result)}"}
+        except Exception as e:
+            return {"error": f"{label} failed: {e}"}
+        return None
+
+    def _path_report(self):
+        rel = [i.name for i in bpy.data.images if i.filepath.startswith("//")]
+        rel += [l.name for l in bpy.data.libraries if l.filepath.startswith("//")]
+        absolute = [i.name for i in bpy.data.images if i.filepath and not i.filepath.startswith("//")]
+        absolute += [l.name for l in bpy.data.libraries if l.filepath and not l.filepath.startswith("//")]
+        return {"relative": rel, "absolute": absolute, "missing": self._missing_files()}
+
+    def make_paths_relative(self):
+        err = self._path_op(bpy.ops.file.make_paths_relative, "make_paths_relative")
+        return err or {"success": True, **self._path_report()}
+
+    def make_paths_absolute(self):
+        err = self._path_op(bpy.ops.file.make_paths_absolute, "make_paths_absolute")
+        return err or {"success": True, **self._path_report()}
+
+    def find_missing_files(self, directory, find_all=False):
+        """bpy.ops.file.find_missing_files(directory, find_all); reply lists what is still missing."""
+        if not directory or not os.path.isdir(directory):
+            return {"error": f"directory not found: {directory}"}
+        before = self._missing_files()
+        err = self._path_op(bpy.ops.file.find_missing_files, "find_missing_files",
+                            directory=directory, find_all=bool(find_all))
+        if err:
+            return err
+        after = self._missing_files()
+        return {"success": True, "directory": directory, "missing_before": len(before),
+                "found": len(before) - len(after), "still_missing": after}
+
+    def pack_all(self):
+        err = self._path_op(bpy.ops.file.pack_all, "pack_all")
+        return err or {"success": True, "packed_images": [i.name for i in bpy.data.images if i.packed_file]}
+
+    def unpack_all(self, unpack_method="USE_LOCAL"):
+        method = str(unpack_method or "").upper()
+        valid = [e.identifier for e in bpy.ops.file.unpack_all.get_rna_type().properties["method"].enum_items]
+        if method not in valid:
+            return {"error": f"unpack_method '{unpack_method}' not valid; valid: {valid}"}
+        err = self._path_op(bpy.ops.file.unpack_all, "unpack_all", method=method)
+        return err or {"success": True, "method": method,
+                       "packed_images": [i.name for i in bpy.data.images if i.packed_file]}
+
+    # ── Settings, generic ──
+
+    @staticmethod
+    def _prop_default(prop):
+        try:
+            if getattr(prop, "is_array", False) and getattr(prop, "array_length", 0) > 0:
+                return list(prop.default_array)
+            if prop.type == 'ENUM' and prop.is_enum_flag:
+                return sorted(prop.default_flag)
+            return prop.default
+        except Exception:
+            return None
+
+    def describe_settings(self, scope):
+        """Every property of a scope from bl_rna: type, value, default, enum items, range, description, read-only."""
+        try:
+            owners = self._scope_owner(scope)
+        except ValueError as e:
+            return {"error": str(e)}
+        if not owners:
+            return {"error": f"scope {scope} has no owner in this session (no VIEW_3D / add-on without preferences)"}
+        props = {}
+        for owner in owners:
+            for prop in owner.bl_rna.properties:
+                if prop.identifier == "rna_type" or prop.identifier in props:
+                    continue
+                entry = {"type": prop.type, "description": prop.description, "readonly": bool(prop.is_readonly),
+                         "owner": owner.bl_rna.identifier}
+                if prop.type in ('POINTER', 'COLLECTION'):
+                    try:
+                        v = getattr(owner, prop.identifier)
+                        entry["value"] = getattr(v, "name", None) if prop.type == 'POINTER' else len(v)
+                    except Exception:
+                        entry["value"] = None
+                    entry["readonly"] = True
+                    props[prop.identifier] = entry
+                    continue
+                try:
+                    entry["value"] = self._rna_get(owner, prop.identifier)
+                except Exception as e:
+                    entry["value"] = None
+                    entry["read_error"] = str(e)
+                entry["default"] = self._prop_default(prop)
+                if prop.type == 'ENUM':
+                    entry["enum_items"] = [i.identifier for i in prop.enum_items]
+                    if not entry["enum_items"]:
+                        entry["note"] = "dynamic enum: empty headless, validated by assignment"
+                if prop.type in ('INT', 'FLOAT'):
+                    entry["min"], entry["max"] = prop.hard_min, prop.hard_max
+                    entry["soft_min"], entry["soft_max"] = prop.soft_min, prop.soft_max
+                    if getattr(prop, "subtype", "NONE") != 'NONE':
+                        entry["subtype"] = prop.subtype
+                if getattr(prop, "is_array", False) and getattr(prop, "array_length", 0) > 0:
+                    entry["array_length"] = prop.array_length
+                props[prop.identifier] = entry
+        return {"success": True, "scope": str(scope).upper(), "count": len(props), "properties": props}
+
+    def get_settings(self, scope, keys=None):
+        """Values only (enums as strings, vectors as lists, pointers as names)."""
+        try:
+            owners = self._scope_owner(scope)
+        except ValueError as e:
+            return {"error": str(e)}
+        if not owners:
+            return {"error": f"scope {scope} has no owner in this session"}
+        if isinstance(keys, str):
+            keys = [k.strip() for k in keys.split(",") if k.strip()]
+        values, missing = {}, []
+        for owner in owners:
+            for prop in owner.bl_rna.properties:
+                ident = prop.identifier
+                if ident == "rna_type" or ident in values or (keys and ident not in keys):
+                    continue
+                try:
+                    if prop.type == 'POINTER':
+                        v = getattr(owner, ident)
+                        values[ident] = getattr(v, "name", None)
+                    elif prop.type == 'COLLECTION':
+                        continue
+                    else:
+                        values[ident] = self._rna_get(owner, ident)
+                except Exception:
+                    pass
+        if str(scope).upper() == "OUTPUT" and (not keys or "ffmpeg" in keys):
+            ff = bpy.context.scene.render.ffmpeg
+            values["ffmpeg"] = {}
+            for ident in self._rna_simple_props(ff):
+                with suppress(Exception):
+                    values["ffmpeg"][ident] = self._rna_get(ff, ident)
+        if keys:
+            missing = [k for k in keys if k not in values]
+        reply = {"success": True, "scope": str(scope).upper(), "values": values}
+        if missing:
+            reply["missing"] = missing
+        return reply
+
+    def set_settings(self, scope, values, persist=False):
+        """Validated bulk set (see _apply_settings); persist=True saves preferences for PREFS_* / ADDON: / MCP scopes."""
+        values, err = self._json_arg(values, "values")
+        if err:
+            return err
+        if not isinstance(values, dict):
+            return {"error": "values must be a JSON object {key: value}"}
+        try:
+            outcome = self._apply_settings(scope, values)
+        except ValueError as e:
+            return {"error": str(e)}
+        reply = {"success": True, "scope": str(scope).upper(), **outcome}
+        name = str(scope).upper()
+        if persist and (name.startswith("PREFS_") or name.startswith("ADDON:") or name == "MCP"):
+            persisted, perr = self._persist_prefs(True)
+            reply["persisted"] = persisted
+            if perr:
+                reply["persist_error"] = perr
+        else:
+            reply["persisted"] = False
+        return reply
+
+    @staticmethod
+    def _snapshots():
+        """Named settings snapshots, kept in driver_namespace so an add-on reload does not drop them."""
+        return bpy.app.driver_namespace.setdefault("blendermcp_settings_snapshots", {})
+
+    def _capture_scopes(self, scopes):
+        data = {}
+        for scope in scopes:
+            owners = self._scope_owner(scope)
+            values = {}
+            for owner in owners:
+                for ident in self._rna_simple_props(owner):
+                    if ident in values:
+                        continue
+                    try:
+                        values[ident] = self._rna_get(owner, ident)
+                    except Exception:
+                        pass
+            data[scope] = values
+        return data
+
+    def _restore_scopes(self, data, scopes=None):
+        restored, failed, missing = {}, {}, []
+        for scope, values in data.items():
+            if scopes and scope not in scopes:
+                continue
+            try:
+                owners = self._scope_owner(scope)
+            except ValueError as e:
+                failed[scope] = str(e)
+                continue
+            first = self._SCOPE_RESTORE_FIRST.get(scope, ())
+            order = [k for k in first if k in values] + [k for k in values if k not in first]
+            count = 0
+            for key in order:
+                owner = next((o for o in owners if o.bl_rna.properties.get(key) is not None), None)
+                if owner is None:
+                    missing.append(f"{scope}.{key}")
+                    continue
+                try:
+                    if self._rna_get(owner, key) == values[key]:
+                        count += 1
+                        continue
+                except Exception:
+                    pass
+                reason = self._rna_set_validated(owner, key, values[key])
+                if reason is None:
+                    count += 1
+                else:
+                    failed[f"{scope}.{key}"] = reason
+            restored[scope] = count
+        return restored, failed, missing
+
+    def settings_snapshot(self, name, scopes=None, filepath=None):
+        """Capture the named scopes into a session snapshot (and a JSON file when filepath is given)."""
+        if not name:
+            return {"error": "name is required"}
+        scopes = self._scope_list(scopes, self._SNAPSHOT_SCOPES)
+        try:
+            data = self._capture_scopes(scopes)
+        except ValueError as e:
+            return {"error": str(e)}
+        self._snapshots()[name] = data
+        reply = {"success": True, "name": name, "keys_per_scope": {s: len(v) for s, v in data.items()}}
+        if filepath:
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, default=str)
+                reply["filepath"] = filepath
+            except Exception as e:
+                reply["file_error"] = str(e)
+        return reply
+
+    def settings_restore(self, name=None, filepath=None, scopes=None):
+        """Restore a snapshot by name or from a JSON file; reports failed and missing keys."""
+        if filepath:
+            if not os.path.exists(filepath):
+                return {"error": f"File not found: {filepath}"}
+            try:
+                data = json.load(open(filepath, encoding="utf-8"))
+            except Exception as e:
+                return {"error": f"could not read {filepath}: {e}"}
+        elif name:
+            data = self._snapshots().get(name)
+            if data is None:
+                return {"error": f"no snapshot named '{name}'; have: {sorted(self._snapshots().keys())}"}
+        else:
+            return {"error": "pass name or filepath"}
+        scopes = self._scope_list(scopes, list(data.keys())) if scopes else None
+        restored, failed, missing = self._restore_scopes(data, scopes)
+        reply = {"success": True, "restored": restored}
+        if failed:
+            reply["failed"] = failed
+        if missing:
+            reply["missing"] = missing
+        return reply
+
+    def list_settings_snapshots(self):
+        return {"success": True, "snapshots": {n: {s: len(v) for s, v in d.items()} for n, d in self._snapshots().items()}}
+
+    def delete_settings_snapshot(self, name):
+        if name not in self._snapshots():
+            return {"error": f"no snapshot named '{name}'; have: {sorted(self._snapshots().keys())}"}
+        del self._snapshots()[name]
+        return {"success": True, "deleted": name}
+
+    # ── Settings, typed conveniences ──
+
+    def _outcome_reply(self, outcomes, **extra):
+        done, unset = [], {}
+        for o in outcomes:
+            done += o["set"]
+            unset.update(o["unset"])
+        reply = {"success": True, "set": done, **extra}
+        if unset:
+            reply["unset"] = unset
+        return reply
+
+    def set_output_settings(self, filepath=None, file_format=None, color_mode=None, color_depth=None,
+                            compression=None, quality=None, film_transparent=None, use_stamp=None,
+                            use_overwrite=None, use_placeholder=None, ffmpeg=None):
+        """Output path, format and video settings in one call (ffmpeg: JSON {format, codec, constant_rate_factor, ...})."""
+        scene = bpy.context.scene
+        outcomes = []
+        done_extra = []
+        if file_format is not None:
+            err = self._set_file_format(scene.render.image_settings, file_format)
+            if err:
+                return err
+            done_extra.append("file_format")
+        outcomes.append(self._apply_settings("RENDER", {k: v for k, v in {
+            "filepath": filepath, "film_transparent": film_transparent, "use_stamp": use_stamp,
+            "use_overwrite": use_overwrite, "use_placeholder": use_placeholder}.items() if v is not None}))
+        outcomes.append(self._apply_settings("OUTPUT", {k: v for k, v in {
+            "color_mode": color_mode, "color_depth": color_depth, "compression": compression,
+            "quality": quality}.items() if v is not None}))
+        ffmpeg, err = self._json_arg(ffmpeg, "ffmpeg")
+        if err:
+            return err
+        if ffmpeg:
+            ff = scene.render.ffmpeg
+            o = {"set": [], "unset": {}}
+            for k, v in ffmpeg.items():
+                reason = self._rna_set_validated(ff, k, v)
+                (o["set"].append(f"ffmpeg.{k}") if reason is None else o["unset"].__setitem__(f"ffmpeg.{k}", reason))
+            outcomes.append(o)
+        reply = self._outcome_reply(outcomes, filepath=scene.render.filepath,
+                                    file_format=scene.render.image_settings.file_format,
+                                    color_mode=scene.render.image_settings.color_mode)
+        reply["set"] = done_extra + reply["set"]
+        return reply
+
+    def set_color_management(self, view_transform=None, look=None, exposure=None, gamma=None,
+                             display_device=None, sequencer_colorspace=None):
+        """Scene colour management; enum items read empty headless, so every value is validated by assignment."""
+        scene = bpy.context.scene
+        outcomes = [self._apply_settings("COLOR", {k: v for k, v in {
+            "view_transform": view_transform, "look": look, "exposure": exposure, "gamma": gamma,
+            "display_device": display_device}.items() if v is not None})]
+        if sequencer_colorspace is not None:
+            o = {"set": [], "unset": {}}
+            reason = self._rna_set_validated(scene.sequencer_colorspace_settings, "name", sequencer_colorspace)
+            (o["set"].append("sequencer_colorspace") if reason is None else o["unset"].__setitem__("sequencer_colorspace", reason))
+            outcomes.append(o)
+        vs = scene.view_settings
+        return self._outcome_reply(outcomes, view_transform=vs.view_transform, look=vs.look,
+                                   exposure=vs.exposure, gamma=vs.gamma,
+                                   display_device=scene.display_settings.display_device)
+
+    _QUALITY_PRESETS = {
+        "PREVIEW": {"resolution_percentage": 25, "samples": 16, "denoise": True, "simplify": True, "persistent": False},
+        "DRAFT": {"resolution_percentage": 50, "samples": 64, "denoise": True, "simplify": False, "persistent": False},
+        "FINAL": {"resolution_percentage": 100, "samples": None, "denoise": True, "simplify": False, "persistent": True},
+    }
+
+    def set_render_quality(self, preset="PREVIEW", engine=None):
+        """PREVIEW / DRAFT / FINAL; the previous values are kept in snapshot '_before_quality' for settings_restore."""
+        name = str(preset or "").upper()
+        if name not in self._QUALITY_PRESETS:
+            return {"error": f"preset '{preset}' not valid; valid: {list(self._QUALITY_PRESETS)}"}
+        scene = bpy.context.scene
+        self._snapshots()["_before_quality"] = self._capture_scopes(("RENDER", "CYCLES", "EEVEE"))
+        if engine is not None:
+            err = self._set_render_engine(scene.render, engine)
+            if err:
+                return err
+        p = self._QUALITY_PRESETS[name]
+        samples = p["samples"]
+        if samples is None:
+            samples = 256 if scene.render.engine == 'CYCLES' else 64
+        outcomes = [self._apply_settings("RENDER", {"resolution_percentage": p["resolution_percentage"],
+                                                    "use_simplify": p["simplify"],
+                                                    "use_persistent_data": p["persistent"]})]
+        if hasattr(scene, "cycles"):
+            outcomes.append(self._apply_settings("CYCLES", {"samples": samples, "use_denoising": p["denoise"]}))
+        if hasattr(scene, "eevee"):
+            outcomes.append(self._apply_settings("EEVEE", {"taa_render_samples": samples}))
+        return self._outcome_reply(outcomes, preset=name, engine=scene.render.engine, samples=samples,
+                                   resolution_percentage=scene.render.resolution_percentage,
+                                   snapshot="_before_quality")
+
+    @staticmethod
+    def _cycles_prefs():
+        entry = bpy.context.preferences.addons.get("cycles")
+        return entry.preferences if entry is not None else None
+
+    def _devices_report(self, prefs):
+        devices = []
+        with suppress(Exception):
+            prefs.get_devices()
+        for d in getattr(prefs, "devices", []):
+            devices.append({"name": d.name, "type": d.type, "use": bool(d.use)})
+        return devices
+
+    def list_render_devices(self):
+        """Cycles compute backend, its devices with their use flags, and scene.cycles.device."""
+        prefs = self._cycles_prefs()
+        if prefs is None:
+            return {"error": "Cycles add-on preferences unavailable (add-on disabled?)"}
+        scene = bpy.context.scene
+        return {"success": True, "backend": prefs.compute_device_type, "devices": self._devices_report(prefs),
+                "scene_device": scene.cycles.device if hasattr(scene, "cycles") else None}
+
+    def set_render_device(self, device="GPU", backend=None, persist=False):
+        """
+        Cycles device: backend (OPTIX / CUDA / HIP / ONEAPI / METAL / NONE, try-assigned: the enum is
+        empty headless), then per-device use flags (GPU: every device of that backend on, CPU off;
+        CPU: CPU on), then scene.cycles.device. persist=True saves preferences (consent rule).
+        """
+        prefs = self._cycles_prefs()
+        if prefs is None:
+            return {"error": "Cycles add-on preferences unavailable (add-on disabled?)"}
+        scene = bpy.context.scene
+        if not hasattr(scene, "cycles"):
+            return {"error": "scene.cycles unavailable"}
+        dev = str(device or "").upper()
+        if dev not in ("GPU", "CPU"):
+            return {"error": f"device '{device}' not valid; valid: ['GPU', 'CPU']"}
+        if backend is not None:
+            reason = self._rna_set_validated(prefs, "compute_device_type", str(backend).upper())
+            if reason:
+                return {"error": f"backend '{backend}' not valid: {reason}"}
+        with suppress(Exception):
+            prefs.get_devices()
+        backend_now = prefs.compute_device_type
+        for d in getattr(prefs, "devices", []):
+            if dev == "GPU":
+                d.use = (d.type == backend_now and d.type != 'CPU')
+            else:
+                d.use = (d.type == 'CPU')
+        scene.cycles.device = dev
+        persisted, perr = self._persist_prefs(persist)
+        reply = {"success": True, "device": dev, "backend": backend_now, "devices": self._devices_report(prefs),
+                 "persisted": persisted}
+        if dev == "GPU" and not any(x["use"] for x in reply["devices"]):
+            reply["warning"] = f"no {backend_now} device enabled; pick a backend that lists devices (list_render_devices)"
+        if perr:
+            reply["persist_error"] = perr
+        return reply
+
+    def set_simplify(self, enabled, subdivision=None, child_particles=None, texture_limit=None, volume_resolution=None):
+        scene = bpy.context.scene
+        outcomes = [self._apply_settings("RENDER", {k: v for k, v in {
+            "use_simplify": bool(enabled), "simplify_subdivision": subdivision,
+            "simplify_child_particles": child_particles, "simplify_volumes": volume_resolution}.items() if v is not None})]
+        if texture_limit is not None and hasattr(scene, "cycles"):
+            outcomes.append(self._apply_settings("CYCLES", {"texture_limit_render": texture_limit,
+                                                            "texture_limit": texture_limit}))
+        return self._outcome_reply(outcomes, use_simplify=scene.render.use_simplify,
+                                   simplify_subdivision=scene.render.simplify_subdivision)
+
+    def set_frame_range(self, start=None, end=None, fps=None, fps_base=None, current=None,
+                        frame_start=None, frame_end=None, frame_step=None, current_frame=None):
+        """
+        Shared with the rigging request (set_scene_frame_range): only sets what was passed.
+        start / frame_start, end / frame_end and current / current_frame are synonyms (wire uses
+        the long names, the rigging doc the short ones).
+        """
+        scene = bpy.context.scene
+        start = frame_start if start is None else start
+        end = frame_end if end is None else end
+        current = current_frame if current is None else current
+        if start is not None and end is not None and int(start) > int(end):
+            return {"error": f"start ({start}) must not exceed end ({end})"}
+        outcomes = [self._apply_settings("SCENE", {k: v for k, v in {"frame_start": start, "frame_end": end,
+                                                                      "frame_step": frame_step}.items() if v is not None}),
+                    self._apply_settings("RENDER", {k: v for k, v in {"fps": fps, "fps_base": fps_base}.items() if v is not None})]
+        if current is not None:
+            scene.frame_set(int(current))
+            outcomes.append({"set": ["frame_current"], "unset": {}})
+        return self._outcome_reply(outcomes, frame_start=scene.frame_start, frame_end=scene.frame_end,
+                                   frame_step=scene.frame_step, frame_current=scene.frame_current,
+                                   fps=scene.render.fps, fps_base=scene.render.fps_base)
+
+    def set_scene_units(self, preset=None, system=None, scale_length=None, length_unit=None, rescale_objects=False,
+                        mass_unit=None, time_unit=None, rotation_unit=None):
+        """
+        Shared with the engine-readiness request. preset UNREAL = METRIC, 0.01, CENTIMETERS;
+        UNITY / GODOT / BEVY / TIMBERMESH = METRIC, 1.0, METERS; or explicit system / scale_length /
+        length_unit / mass_unit / time_unit / rotation_unit (DEGREES / RADIANS). Reports the rescale
+        factor existing objects would need (old / new scale_length) and applies it to root objects
+        when rescale_objects=True.
+        """
+        scene = bpy.context.scene
+        units = scene.unit_settings
+        if preset is not None:
+            name = str(preset).upper()
+            if name not in self._UNIT_PRESETS:
+                return {"error": f"preset '{preset}' not valid; valid: {list(self._UNIT_PRESETS)}"}
+            chosen = self._UNIT_PRESETS[name]
+            if chosen is not None:
+                system, scale_length, length_unit = chosen
+        old_scale = float(units.scale_length)
+        outcomes = [self._apply_settings("UNITS", {k: v for k, v in {
+            "system": system, "scale_length": scale_length, "length_unit": length_unit,
+            "mass_unit": mass_unit, "time_unit": time_unit, "system_rotation": rotation_unit}.items() if v is not None})]
+        new_scale = float(units.scale_length)
+        factor = old_scale / new_scale if new_scale else 1.0
+        roots = [o for o in scene.objects if o.parent is None]
+        rescaled = []
+        if rescale_objects and abs(factor - 1.0) > 1e-9:
+            for o in roots:
+                o.scale = [s * factor for s in o.scale]
+                o.location = [c * factor for c in o.location]
+                rescaled.append(o.name)
+        return self._outcome_reply(outcomes, preset=preset, system=units.system, scale_length=units.scale_length,
+                                   length_unit=units.length_unit, mass_unit=units.mass_unit,
+                                   time_unit=units.time_unit, rotation_unit=units.system_rotation,
+                                   rescale_factor=factor,
+                                   objects_needing_rescale=[] if abs(factor - 1.0) < 1e-9 else [o.name for o in roots],
+                                   rescaled=rescaled)
+
+    def set_viewport_defaults(self, shading=None, light=None, color_type=None, show_overlays=None,
+                              show_floor=None, show_stats=None, clip_end=None, lens=None):
+        """Apply to every VIEW_3D area in every window (0 areas headless is reported, not an error)."""
+        wm = bpy.context.window_manager
+        areas = 0
+        unset = {}
+        for win in (wm.windows if wm else []):
+            for area in win.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                space = area.spaces.active
+                areas += 1
+                for owner, key, value in ((space.shading, "type", shading), (space.shading, "light", light),
+                                          (space.shading, "color_type", color_type),
+                                          (space.overlay, "show_overlays", show_overlays),
+                                          (space.overlay, "show_floor", show_floor),
+                                          (space.overlay, "show_stats", show_stats),
+                                          (space, "clip_end", clip_end), (space, "lens", lens)):
+                    if value is None:
+                        continue
+                    reason = self._rna_set_validated(owner, key, value)
+                    if reason:
+                        unset[key] = reason
+        reply = {"success": True, "areas": areas}
+        if unset:
+            reply["unset"] = unset
+        return reply
+
+    # ── Presets and profiles ──
+
+    def list_blender_presets(self, category="render"):
+        """Blender's own .py presets under bpy.utils.preset_paths(category)."""
+        paths = bpy.utils.preset_paths(str(category))
+        presets = []
+        for folder in paths:
+            with suppress(Exception):
+                for entry in sorted(os.scandir(folder), key=lambda e: e.name):
+                    if entry.is_file() and entry.name.lower().endswith(".py"):
+                        presets.append({"name": entry.name[:-3], "path": entry.path})
+        if not paths:
+            return {"error": f"no preset directory for category '{category}' (try render, cycles/sampling, cycles/viewport)"}
+        return {"success": True, "category": category, "paths": list(paths), "presets": presets}
+
+    def apply_blender_preset(self, category, name):
+        """Run a Blender .py preset (what script.execute_preset does: the file assigns bpy.context.* values)."""
+        listing = self.list_blender_presets(category)
+        if "error" in listing:
+            return listing
+        match = next((p for p in listing["presets"] if p["name"].lower() == str(name).lower()), None)
+        if match is None:
+            return {"error": f"preset '{name}' not found in {category}; valid: {[p['name'] for p in listing['presets']]}"}
+        try:
+            bpy.utils.execfile(match["path"])
+        except Exception as e:
+            return {"error": f"preset {match['path']} failed: {e}"}
+        return {"success": True, "category": category, "name": match["name"], "path": match["path"]}
+
+    def set_project_profile(self, engine_target="NONE", export_dir=None, texture_dir=None, render_dir=None,
+                            kit_unit=None, naming=None, max_triangles=None, texture_size=None, notes=None,
+                            apply_units=False):
+        """scene['blendermcp_profile'] (travels with the file) mirrored to <file>.mcp-profile.json when saved."""
+        target = str(engine_target or "NONE").upper()
+        if target not in self._UNIT_PRESETS:
+            return {"error": f"engine_target '{engine_target}' not valid; valid: {list(self._UNIT_PRESETS)}"}
+        scene = bpy.context.scene
+        profile = {"engine_target": target}
+        for key, value in (("export_dir", export_dir), ("texture_dir", texture_dir), ("render_dir", render_dir),
+                           ("kit_unit", kit_unit), ("naming", naming), ("max_triangles", max_triangles),
+                           ("texture_size", texture_size), ("notes", notes)):
+            if value is not None:
+                profile[key] = value
+        scene[self._PROFILE_KEY] = profile
+        reply = {"success": True, "profile": profile}
+        if apply_units and self._UNIT_PRESETS.get(target):
+            reply["units"] = self.set_scene_units(preset=target)
+        if bpy.data.filepath:
+            sidecar = self._sidecar_path(os.path.abspath(bpy.data.filepath), ".mcp-profile.json")
+            try:
+                with open(sidecar, "w", encoding="utf-8") as f:
+                    json.dump(profile, f, indent=2)
+                reply["sidecar"] = sidecar
+            except Exception as e:
+                reply["sidecar_error"] = str(e)
+        return reply
+
+    def get_project_profile(self, apply_units=False):
+        scene = bpy.context.scene
+        raw = scene.get(self._PROFILE_KEY)
+        if raw is None:
+            return {"success": True, "profile": None}
+        profile = raw.to_dict() if hasattr(raw, "to_dict") else dict(raw)
+        reply = {"success": True, "profile": profile}
+        target = str(profile.get("engine_target", "NONE")).upper()
+        if apply_units and self._UNIT_PRESETS.get(target):
+            reply["units"] = self.set_scene_units(preset=target)
+        return reply
+
+    # ── Add-ons, workspaces, preferences ──
+
+    def list_addons(self, enabled_only=False, filter=None):
+        import addon_utils
+        enabled = set(bpy.context.preferences.addons.keys())
+        out = []
+        needle = str(filter).lower() if filter else None
+        for mod in addon_utils.modules(refresh=False):
+            info = addon_utils.module_bl_info(mod)
+            name = mod.__name__
+            if enabled_only and name not in enabled:
+                continue
+            if needle and needle not in name.lower() and needle not in str(info.get("name", "")).lower():
+                continue
+            entry = bpy.context.preferences.addons.get(name)
+            out.append({"module": name, "name": info.get("name"), "version": list(info.get("version", ()) or ()),
+                        "category": info.get("category"), "enabled": name in enabled,
+                        "has_preferences": bool(entry is not None and entry.preferences is not None),
+                        "path": getattr(mod, "__file__", None)})
+        return {"success": True, "count": len(out), "addons": out}
+
+    def enable_addon(self, module, persist=False):
+        """addon_utils.enable(module, default_set=True) (C13); a failed enable is unwound so a retry works."""
+        import addon_utils
+        errors = []
+        try:
+            mod = addon_utils.enable(module, default_set=True, handle_error=lambda ex: errors.append(str(ex)))
+        except Exception as e:
+            mod = None
+            errors.append(str(e))
+        if mod is None:
+            with suppress(Exception):
+                addon_utils.disable(module, default_set=True)
+            return {"error": f"could not enable '{module}': {'; '.join(errors) or 'unknown module'}"}
+        info = addon_utils.module_bl_info(mod)
+        persisted, perr = self._persist_prefs(persist)
+        reply = {"success": True, "module": module, "bl_info": {k: (list(v) if isinstance(v, tuple) else v) for k, v in info.items()},
+                 "enabled": module in bpy.context.preferences.addons, "preferences_dirty": bool(bpy.context.preferences.is_dirty),
+                 "persisted": persisted}
+        if perr:
+            reply["persist_error"] = perr
+        return reply
+
+    def disable_addon(self, module, persist=False):
+        import addon_utils
+        if module not in bpy.context.preferences.addons:
+            return {"error": f"'{module}' is not enabled; enabled: {sorted(bpy.context.preferences.addons.keys())}"}
+        errors = []
+        try:
+            addon_utils.disable(module, default_set=True, handle_error=lambda ex: errors.append(str(ex)))
+        except Exception as e:
+            errors.append(str(e))
+        persisted, perr = self._persist_prefs(persist)
+        reply = {"success": True, "module": module, "enabled": module in bpy.context.preferences.addons,
+                 "preferences_dirty": bool(bpy.context.preferences.is_dirty), "persisted": persisted}
+        if errors:
+            reply["warnings"] = errors
+        if perr:
+            reply["persist_error"] = perr
+        return reply
+
+    def get_addon_preferences(self, module):
+        return self.get_settings(f"ADDON:{module}")
+
+    def set_addon_preferences(self, module, values, persist=False):
+        return self.set_settings(f"ADDON:{module}", values, persist=persist)
+
+    def save_preferences(self, confirm=False):
+        """wm.save_userpref; refuses without confirm=True (consent rule)."""
+        prefs = bpy.context.preferences
+        if not confirm:
+            return {"error": "save_preferences writes userpref.blend; pass confirm=True to do it",
+                    "preferences_dirty": bool(prefs.is_dirty), "use_preferences_save": bool(prefs.use_preferences_save)}
+        persisted, perr = self._persist_prefs(True)
+        if perr:
+            return {"error": f"save_userpref failed: {perr}"}
+        return {"success": True, "persisted": persisted, "preferences_dirty": bool(prefs.is_dirty),
+                "use_preferences_save": bool(prefs.use_preferences_save)}
+
+    @staticmethod
+    def _gui_window():
+        """The GUI window; bpy.context.window is None in a timer right after wm.open_mainfile
+        (session restore at launch reported a GUI session as headless, 2026-09-11)."""
+        win = bpy.context.window
+        if win is None and not bpy.app.background:
+            wins = bpy.context.window_manager.windows
+            win = wins[0] if len(wins) else None
+        return win
+
+    def list_workspaces(self):
+        win = self._gui_window()
+        current = win.workspace.name if win and win.workspace else None
+        out = [{"name": ws.name, "areas": sorted({a.type for s in ws.screens for a in s.areas})}
+               for ws in bpy.data.workspaces]
+        return {"success": True, "current": current, "workspaces": out}
+
+    def set_workspace(self, name):
+        ws = bpy.data.workspaces.get(name)
+        if ws is None:
+            return {"error": f"workspace '{name}' not found; valid: {[w.name for w in bpy.data.workspaces]}"}
+        win = self._gui_window()
+        if win is None:
+            return {"error": "no window in this session (headless); workspaces need a GUI session"}
+        try:
+            win.workspace = ws
+        except Exception as e:
+            return {"error": f"could not switch workspace: {e}"}
+        return {"success": True, "workspace": win.workspace.name,
+                "areas": sorted({a.type for a in win.screen.areas})}
+
+    def get_addon_settings(self):
+        """The MCP add-on's own preferences; keys are reported as set/unset, never echoed."""
+        prefs = _prefs()
+        if prefs is None:
+            return {"success": True, "available": False, "port": _port(), "autostart_server": None,
+                    "keys": {n: bool(_secret(n)) for n in _SECRET_NAMES},
+                    "note": "add-on preferences unavailable (not in preferences.addons: headless import); defaults reported"}
+        return {"success": True, "available": True, "port": int(prefs.port),
+                "autostart_server": bool(prefs.autostart_server),
+                "keys": {n: bool(getattr(prefs, n, "")) for n in _SECRET_NAMES},
+                "server_running": _server_running()}
+
+    def set_addon_settings(self, values, persist=False):
+        values, err = self._json_arg(values, "values")
+        if err:
+            return err
+        if not isinstance(values, dict):
+            return {"error": "values must be a JSON object"}
+        prefs = _prefs()
+        if prefs is None:
+            return {"error": "add-on preferences unavailable in this session (module not in preferences.addons)"}
+        allowed = ("port", "autostart_server") + _SECRET_NAMES
+        unknown = [k for k in values if k not in allowed]
+        if unknown:
+            return {"error": f"unknown keys {unknown}; valid: {list(allowed)}"}
+        outcome = self._apply_settings("MCP", values)
+        persisted, perr = self._persist_prefs(persist)
+        reply = {"success": True, "set": outcome["set"], "port": int(prefs.port),
+                 "autostart_server": bool(prefs.autostart_server),
+                 "keys": {n: bool(getattr(prefs, n, "")) for n in _SECRET_NAMES}, "persisted": persisted}
+        if outcome["unset"]:
+            reply["unset"] = outcome["unset"]
+        if perr:
+            reply["persist_error"] = perr
+        if "port" in outcome["set"] and _server_running():
+            reply["note"] = "port changes apply when the server is restarted (Disconnect / Connect)"
+        return reply
+
+    # ── Session state ──
+
+    _SESSION_PARTS = ("FILE", "FRAME", "CAMERA", "SELECTION", "ACTIVE", "MODE", "VIEWPORT", "WORKSPACE", "SETTINGS_SNAPSHOTS")
+
+    @staticmethod
+    def _session_states():
+        return bpy.app.driver_namespace.setdefault("blendermcp_session_states", {})
+
+    def save_session_state(self, name="last", include=None):
+        """Capture the session as a dict (the server persists it); also kept in this session under name."""
+        parts = self._scope_list(include, self._SESSION_PARTS)
+        bad = [p for p in parts if p not in self._SESSION_PARTS]
+        if bad:
+            return {"error": f"unknown include parts {bad}; valid: {list(self._SESSION_PARTS)}"}
+        scene = bpy.context.scene
+        vl = bpy.context.view_layer
+        state = {"name": name, "saved_at": datetime.now().isoformat(timespec="seconds"),
+                 "blender": bpy.app.version_string}
+        if "FILE" in parts:
+            state["file"] = {"filepath": bpy.data.filepath, "is_dirty": bool(bpy.data.is_dirty)}
+        if "FRAME" in parts:
+            state["frame"] = {"current": scene.frame_current, "start": scene.frame_start, "end": scene.frame_end}
+        if "CAMERA" in parts:
+            state["camera"] = scene.camera.name if scene.camera else None
+        if "SELECTION" in parts:
+            state["selection"] = [o.name for o in vl.objects if o.select_get()]
+        if "ACTIVE" in parts:
+            state["active"] = vl.objects.active.name if vl.objects.active else None
+        if "MODE" in parts:
+            state["mode"] = bpy.context.mode
+        if "VIEWPORT" in parts:
+            views = []
+            wm = bpy.context.window_manager
+            for win in (wm.windows if wm else []):
+                for area in win.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        sp = area.spaces.active
+                        r3d = sp.region_3d
+                        views.append({"view_matrix": [list(row) for row in r3d.view_matrix],
+                                      "view_distance": r3d.view_distance, "view_perspective": r3d.view_perspective,
+                                      "shading": sp.shading.type, "show_overlays": sp.overlay.show_overlays})
+            state["viewports"] = views
+        if "WORKSPACE" in parts:
+            win = bpy.context.window
+            state["workspace"] = win.workspace.name if win and win.workspace else None
+        if "SETTINGS_SNAPSHOTS" in parts:
+            state["settings_snapshots"] = {n: d for n, d in self._snapshots().items() if not n.startswith("_")}
+        self._session_states()[name] = state
+        return {"success": True, "name": name, "state": state}
+
+    def get_session_state(self, include=None, name="last"):
+        """Server-facing alias of save_session_state: the reply's "state" dict is what the server persists."""
+        return self.save_session_state(name=name, include=include)
+
+    def apply_session_state(self, state, load_file=False, force=False):
+        """Server-facing alias of restore_session_state for a state dict the server persisted (file already reopened by the server)."""
+        if state is None:
+            return {"error": "state (the persisted session dict) is required"}
+        return self.restore_session_state(state=state, load_file=load_file, force=force)
+
+    def restore_session_state(self, name="last", state=None, load_file=True, force=False):
+        """Apply a session state (dict from the server, or the one saved under name); reports what could not be restored."""
+        state, err = self._json_arg(state, "state")
+        if err:
+            return err
+        if state is None:
+            state = self._session_states().get(name)
+            if state is None:
+                return {"error": f"no session state named '{name}' in this session; pass state= from the server file"}
+        not_restored = []
+        loaded = False
+        fp = (state.get("file") or {}).get("filepath")
+        if load_file and fp:
+            if not os.path.exists(fp):
+                not_restored.append(f"file: {fp} not found")
+            elif os.path.abspath(fp) != os.path.abspath(bpy.data.filepath or ""):
+                r = self.load_blend(fp, force=force)
+                if "error" in r:
+                    return r
+                loaded = True
+        scene = bpy.context.scene
+        vl = bpy.context.view_layer
+        if "frame" in state:
+            fr = state["frame"]
+            with suppress(Exception):
+                scene.frame_start, scene.frame_end = int(fr["start"]), int(fr["end"])
+            with suppress(Exception):
+                scene.frame_set(int(fr["current"]))
+        if "camera" in state:
+            cam = bpy.data.objects.get(state["camera"]) if state["camera"] else None
+            if state["camera"] and cam is None:
+                not_restored.append(f"camera: {state['camera']} missing")
+            else:
+                scene.camera = cam
+        if "selection" in state:
+            with suppress(Exception):
+                if bpy.context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            names = set(state["selection"])
+            for o in vl.objects:
+                with suppress(Exception):
+                    o.select_set(o.name in names)
+            for n in names - set(vl.objects.keys()):
+                not_restored.append(f"selection: {n} missing")
+        if "active" in state:
+            a = bpy.data.objects.get(state["active"]) if state["active"] else None
+            if state["active"] and (a is None or a.name not in vl.objects):
+                not_restored.append(f"active: {state['active']} missing")
+            else:
+                vl.objects.active = a
+        if "mode" in state and state["mode"] and state["mode"] != bpy.context.mode:
+            target = {"EDIT_MESH": "EDIT", "EDIT_ARMATURE": "EDIT", "POSE": "POSE", "SCULPT": "SCULPT",
+                      "OBJECT": "OBJECT"}.get(state["mode"], "OBJECT")
+            try:
+                if vl.objects.active is not None:
+                    bpy.ops.object.mode_set(mode=target)
+            except Exception as e:
+                not_restored.append(f"mode: {e}")
+        if "viewports" in state and state["viewports"]:
+            wm = bpy.context.window_manager
+            areas = [a for win in (wm.windows if wm else []) for a in win.screen.areas if a.type == 'VIEW_3D']
+            if not areas:
+                not_restored.append("viewports: no VIEW_3D in this session")
+            for area, saved in zip(areas, state["viewports"]):
+                sp = area.spaces.active
+                with suppress(Exception):
+                    sp.region_3d.view_matrix = mathutils.Matrix(saved["view_matrix"])
+                    sp.region_3d.view_distance = saved["view_distance"]
+                    sp.region_3d.view_perspective = saved["view_perspective"]
+                    sp.shading.type = saved["shading"]
+                    sp.overlay.show_overlays = saved["show_overlays"]
+        if "workspace" in state and state["workspace"]:
+            r = self.set_workspace(state["workspace"])
+            if "error" in r:
+                not_restored.append(f"workspace: {r['error']}")
+        if "settings_snapshots" in state:
+            self._snapshots().update(state["settings_snapshots"] or {})
+        reply = {"success": True, "name": state.get("name", name), "file_loaded": loaded,
+                 "frame_current": scene.frame_current, "active": vl.objects.active.name if vl.objects.active else None,
+                 "selection": [o.name for o in vl.objects if o.select_get()]}
+        if not_restored:
+            reply["not_restored"] = not_restored
+        return reply
+
+    # ─── Rigging (B1 Tier 1): armatures, skinning, pose, constraints ─────────
+
+    _BIND_METHODS = {"AUTO": "ARMATURE_AUTO", "ENVELOPE": "ARMATURE_ENVELOPE",
+                     "EMPTY_GROUPS": "ARMATURE_NAME", "NAME": "ARMATURE"}
+
+    @staticmethod
+    def _names_arg(value):
+        """Comma string / list / None -> list of names or None."""
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return [n.strip() for n in value.split(",") if n.strip()]
+        return [str(n) for n in value]
+
+    @staticmethod
+    def _glob_names(pattern_list, names):
+        """Expand globs (fnmatch) in pattern_list against names; returns (matched, unmatched_patterns)."""
+        import fnmatch
+        matched, unmatched = [], []
+        for pat in pattern_list:
+            hits = [n for n in names if fnmatch.fnmatchcase(n, pat)]
+            if hits:
+                matched += [h for h in hits if h not in matched]
+            else:
+                unmatched.append(pat)
+        return matched, unmatched
+
+    @staticmethod
+    def _vec3(value, label):
+        try:
+            v = [float(x) for x in value]
+            if len(v) != 3:
+                raise ValueError
+            return v, None
+        except Exception:
+            return None, f"{label} must be 3 numbers, got {value!r}"
+
+    def _apply_bone_spec(self, edit_bones, spec, created, snapped, warnings):
+        """One bone from an add_bones JSON entry; returns the created name or an error string."""
+        import math
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            return None, "every bone needs a name"
+        head, err = self._vec3(spec.get("head", (0, 0, 0)), f"{name}.head")
+        if err:
+            return None, err
+        tail, err = self._vec3(spec.get("tail", (0, 0, 1)), f"{name}.tail")
+        if err:
+            return None, err
+        eb = edit_bones.new(name)
+        if eb.name != name:
+            warnings.append(f"bone '{name}' already existed; created '{eb.name}'")
+        eb.head, eb.tail = head, tail
+        parent = spec.get("parent")
+        if parent:
+            pb = edit_bones.get(created.get(parent, parent))
+            if pb is None:
+                edit_bones.remove(eb)
+                return None, f"bone '{name}': parent '{parent}' not found (parents must exist or come earlier in the list)"
+            eb.parent = pb
+            if spec.get("connected"):
+                if (mathutils.Vector(head) - pb.tail).length > 1e-6:
+                    snapped.append(eb.name)
+                eb.head = pb.tail.copy()
+                eb.use_connect = True
+        elif spec.get("connected"):
+            warnings.append(f"bone '{name}': connected=True ignored (no parent)")
+        if "roll" in spec and spec["roll"] is not None:
+            eb.roll = math.radians(float(spec["roll"]))
+        if "deform" in spec and spec["deform"] is not None:
+            eb.use_deform = bool(spec["deform"])
+        if "inherit_rotation" in spec and spec["inherit_rotation"] is not None:
+            eb.use_inherit_rotation = bool(spec["inherit_rotation"])
+        if (eb.tail - eb.head).length < 1e-6:
+            edit_bones.remove(eb)
+            return None, f"bone '{name}': head and tail coincide (zero-length bones are not allowed)"
+        created[name] = eb.name
+        return eb.name, None
+
+    def add_bones(self, armature, bones):
+        """
+        Batch-create bones in one EDIT session. bones: JSON list of
+        {name, head:[x,y,z], tail:[x,y,z], parent?, connected?, roll? (deg), deform?, inherit_rotation?}.
+        A parent may be earlier in the same list. connected=True snaps head to the parent's tail
+        (reported under "snapped"). Name collisions get Blender's .001 suffix (reported).
+        Reply: created names (in order), snapped, warnings. EditBone refs never leave this call.
+        """
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        specs, jerr = self._json_arg(bones, "bones")
+        if jerr:
+            return jerr
+        if isinstance(specs, dict):
+            specs = [specs]
+        if not isinstance(specs, list) or not specs:
+            return {"error": "bones must be a non-empty JSON list of {name, head, tail, ...}"}
+        created, snapped, warnings, names = {}, [], [], []
+        with self._armature_edit(arm) as edit_bones:
+            for spec in specs:
+                if not isinstance(spec, dict):
+                    return {"error": f"bone entries must be objects, got {spec!r}"}
+                new_name, berr = self._apply_bone_spec(edit_bones, spec, created, snapped, warnings)
+                if berr:
+                    return {"error": berr, "created_before_error": names}
+                names.append(new_name)
+        reply = {"success": True, "armature": arm.name, "created": names, "bone_count": len(arm.data.bones),
+                 "snapped": snapped}
+        if warnings:
+            reply["warnings"] = warnings
+        return reply
+
+    def create_armature(self, name="Armature", location=None, display_type="OCTAHEDRAL", show_in_front=True, bones=None):
+        """Create armature data + object in the active collection; optional bones JSON as in add_bones."""
+        dtype = str(display_type or "OCTAHEDRAL").upper()
+        valid = [e.identifier for e in bpy.types.Armature.bl_rna.properties["display_type"].enum_items]
+        if dtype not in valid:
+            return {"error": f"display_type '{display_type}' not valid; valid: {valid}"}
+        loc = None
+        if location is not None:
+            if isinstance(location, str):
+                location = [p for p in location.split(",") if p.strip()]
+            loc, err = self._vec3(location, "location")
+            if err:
+                return {"error": err}
+        data = bpy.data.armatures.new(name)
+        data.display_type = dtype
+        obj = bpy.data.objects.new(name, data)
+        obj.show_in_front = bool(show_in_front)
+        if loc:
+            obj.location = loc
+        target = bpy.context.collection or bpy.context.scene.collection
+        target.objects.link(obj)
+        reply = {"success": True, "name": obj.name, "data": data.name, "bone_count": 0,
+                 "collection": target.name, "display_type": dtype}
+        if bones is not None:
+            r = self.add_bones(obj.name, bones)
+            if "error" in r:
+                return {"error": f"armature '{obj.name}' created but bones failed: {r['error']}", "name": obj.name}
+            reply.update({"bone_count": r["bone_count"], "created": r["created"], "snapped": r["snapped"]})
+            if r.get("warnings"):
+                reply["warnings"] = r["warnings"]
+        return reply
+
+    @staticmethod
+    def _constraint_summary(con):
+        d = {"name": con.name, "type": con.type, "influence": round(con.influence, 4), "mute": bool(con.mute)}
+        for key in ("target", "pole_target"):
+            if hasattr(con, key):
+                v = getattr(con, key)
+                d[key] = v.name if v is not None else None
+        for key in ("subtarget", "pole_subtarget", "chain_count", "use_tail", "iterations", "use_stretch",
+                    "track_axis", "up_axis", "mix_mode", "owner_space", "target_space"):
+            if hasattr(con, key):
+                d[key] = getattr(con, key)
+        if hasattr(con, "pole_angle"):
+            import math
+            d["pole_angle_deg"] = round(math.degrees(con.pole_angle), 4)
+        return d
+
+    def get_armature_info(self, armature, include_pose=False, space="WORLD", bone_filter=None):
+        """
+        THE perceive tool for rigs. Bones in hierarchy order with parent, children, head, tail,
+        length, roll (deg), connected, deform, bone_collections, constraints; plus pose_position,
+        display_type, action and the bone-collection summary. include_pose adds the pose transform
+        per bone. space WORLD (matrix_world applied) or ARMATURE (rest-space).
+        """
+        import math
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        sp = str(space or "WORLD").upper()
+        if sp not in ("WORLD", "ARMATURE"):
+            return {"error": f"space '{space}' not valid; valid: ['WORLD', 'ARMATURE']"}
+        mw = arm.matrix_world
+        conv = (lambda v: list(mw @ v)) if sp == "WORLD" else (lambda v: list(v))
+        names = [b.name for b in arm.data.bones]
+        if bone_filter:
+            names, _ = self._glob_names(self._names_arg(bone_filter), names)
+        wanted = set(names)
+        ordered = []
+
+        def walk(bone):
+            if bone.name in wanted:
+                ordered.append(bone)
+            for child in bone.children:
+                walk(child)
+        for root in (b for b in arm.data.bones if b.parent is None):
+            walk(root)
+        bones = []
+        for b in ordered:
+            pb = arm.pose.bones.get(b.name)
+            entry = {"name": b.name, "parent": b.parent.name if b.parent else None,
+                     "children": [c.name for c in b.children],
+                     "head": [round(x, 5) for x in conv(b.head_local)], "tail": [round(x, 5) for x in conv(b.tail_local)],
+                     "length": round(b.length, 5), "roll": None, "connected": bool(b.use_connect),
+                     "deform": bool(b.use_deform), "bone_collections": [c.name for c in b.collections],
+                     "constraints": [self._constraint_summary(c) for c in pb.constraints] if pb else []}
+            with suppress(Exception):
+                # Bone.roll is only exposed on EditBone; recover it from the rest matrix along the bone axis
+                axis = (b.tail_local - b.head_local).normalized()
+                _m, roll = bpy.types.Bone.AxisRollFromMatrix(b.matrix_local.to_3x3(), axis=axis)
+                entry["roll"] = round(math.degrees(roll), 4)
+            if include_pose and pb is not None:
+                rot = list(pb.rotation_quaternion) if pb.rotation_mode == 'QUATERNION' else \
+                    ([math.degrees(a) for a in pb.rotation_euler] if pb.rotation_mode != 'AXIS_ANGLE' else list(pb.rotation_axis_angle))
+                entry["pose"] = {"location": list(pb.location), "rotation_mode": pb.rotation_mode,
+                                 "rotation": [round(x, 5) for x in rot], "scale": list(pb.scale),
+                                 "matrix_world_head": [round(x, 5) for x in (mw @ pb.head)],
+                                 "matrix_world_tail": [round(x, 5) for x in (mw @ pb.tail)]}
+            bones.append(entry)
+        ad = arm.animation_data
+        return {"success": True, "armature": arm.name, "bone_count": len(arm.data.bones), "bones": bones,
+                "space": sp, "pose_position": arm.data.pose_position, "display_type": arm.data.display_type,
+                "show_in_front": arm.show_in_front, "action": ad.action.name if ad and ad.action else None,
+                "bone_collections": self._bone_collections(arm.data)}
+
+    def set_bone_properties(self, armature, bone, head=None, tail=None, roll=None, parent=None, connected=None,
+                            deform=None, inherit_rotation=None, inherit_scale=None, new_name=None,
+                            envelope_distance=None, bbone_segments=None):
+        """Only sets what was passed (EDIT mode). Reply: set list, unset {prop: reason}, name (after rename)."""
+        import math
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        if bone not in arm.data.bones:
+            return {"error": f"Bone not found: {bone}; bones: {[b.name for b in arm.data.bones][:50]}"}
+        done, unset = [], {}
+        final_name = bone
+        with self._armature_edit(arm) as edit_bones:
+            eb = edit_bones.get(bone)
+            if eb is None:
+                return {"error": f"Bone not found in edit mode: {bone}"}
+            for key, value in (("head", head), ("tail", tail)):
+                if value is not None:
+                    v, e = self._vec3(value, key)
+                    if e:
+                        unset[key] = e
+                    else:
+                        setattr(eb, key, v)
+                        done.append(key)
+            if roll is not None:
+                eb.roll = math.radians(float(roll)); done.append("roll")
+            if parent is not None:
+                if parent == "":
+                    eb.parent = None; done.append("parent")
+                else:
+                    p = edit_bones.get(parent)
+                    if p is None:
+                        unset["parent"] = f"'{parent}' not found"
+                    elif p == eb:
+                        unset["parent"] = "a bone cannot parent itself"
+                    else:
+                        eb.parent = p; done.append("parent")
+            if connected is not None:
+                if eb.parent is None and connected:
+                    unset["connected"] = "no parent to connect to"
+                else:
+                    eb.use_connect = bool(connected); done.append("connected")
+            for key, attr, value in (("deform", "use_deform", deform), ("inherit_rotation", "use_inherit_rotation", inherit_rotation),
+                                     ("inherit_scale", "inherit_scale", inherit_scale),
+                                     ("envelope_distance", "envelope_distance", envelope_distance),
+                                     ("bbone_segments", "bbone_segments", bbone_segments)):
+                if value is None:
+                    continue
+                reason = self._rna_set_validated(eb, attr, value)
+                if reason is None:
+                    done.append(key)
+                else:
+                    unset[key] = reason
+            if (eb.tail - eb.head).length < 1e-6:
+                unset["tail"] = "head and tail coincide; tail moved back"; eb.tail = eb.head + mathutils.Vector((0, 0, 0.1))
+            if new_name:
+                eb.name = str(new_name)
+                final_name = eb.name
+                done.append("new_name")
+        reply = {"success": True, "armature": arm.name, "bone": final_name, "set": done}
+        if unset:
+            reply["unset"] = unset
+        return reply
+
+    def delete_bones(self, armature, bones, reparent_children=True):
+        """Delete bones by name or glob in one EDIT session; children are re-parented to the deleted bone's parent by default."""
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        patterns = self._names_arg(bones) or []
+        if not patterns:
+            return {"error": "bones is required (comma list or glob)"}
+        names = [b.name for b in arm.data.bones]
+        targets, unmatched = self._glob_names(patterns, names)
+        if not targets:
+            return {"error": f"no bone matches {patterns}; bones: {names[:50]}"}
+        deleted, reparented = [], []
+        with self._armature_edit(arm) as edit_bones:
+            for name in targets:
+                eb = edit_bones.get(name)
+                if eb is None:
+                    continue
+                grand = eb.parent
+                for child in list(eb.children):
+                    if reparent_children:
+                        child.parent = grand
+                        child.use_connect = False
+                        reparented.append(child.name)
+                    else:
+                        child.parent = None
+                edit_bones.remove(eb)
+                deleted.append(name)
+        reply = {"success": True, "armature": arm.name, "deleted": deleted, "reparented": reparented,
+                 "bone_count": len(arm.data.bones)}
+        if unmatched:
+            reply["unmatched"] = unmatched
+        return reply
+
+    def bind_armature(self, mesh, armature, method="AUTO", keep_transform=True):
+        """
+        parent_set with the mesh selected and the armature ACTIVE (OBJECT mode). method AUTO ->
+        ARMATURE_AUTO, ENVELOPE -> ARMATURE_ENVELOPE, EMPTY_GROUPS -> ARMATURE_NAME, NAME -> ARMATURE
+        (modifier only, keeps existing groups). The previous active object and selection are restored.
+        """
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        meth = str(method or "AUTO").upper()
+        if meth not in self._BIND_METHODS:
+            return {"error": f"method '{method}' not valid; valid: {list(self._BIND_METHODS)}"}
+        with self._selection_scope(), self._mode_restore():
+            self._ensure_object_mode(m_obj)
+            self._ensure_object_mode(arm)
+            for o in bpy.context.view_layer.objects:
+                o.select_set(False)
+            m_obj.select_set(True)
+            arm.select_set(True)
+            bpy.context.view_layer.objects.active = arm
+            try:
+                result = bpy.ops.object.parent_set(type=self._BIND_METHODS[meth], keep_transform=bool(keep_transform))
+            except Exception as e:
+                return {"error": f"parent_set({self._BIND_METHODS[meth]}) failed: {e}"}
+            if 'FINISHED' not in result:
+                return {"error": f"parent_set returned {set(result)}"}
+        mod = next((m for m in m_obj.modifiers if m.type == 'ARMATURE' and m.object == arm), None)
+        empty = []
+        counts = {}
+        for vg in m_obj.vertex_groups:
+            n = 0
+            for v in m_obj.data.vertices:
+                if any(g.group == vg.index and g.weight > 0.0 for g in v.groups):
+                    n += 1
+            counts[vg.name] = n
+            if n == 0:
+                empty.append(vg.name)
+        return {"success": True, "mesh": m_obj.name, "armature": arm.name, "method": meth,
+                "parent_type": self._BIND_METHODS[meth], "modifier": mod.name if mod else None,
+                "group_count": len(m_obj.vertex_groups), "groups": counts, "empty_groups": empty,
+                "parent": m_obj.parent.name if m_obj.parent else None}
+
+    def _bound_armature(self, m_obj):
+        mod = next((m for m in m_obj.modifiers if m.type == 'ARMATURE' and m.object), None)
+        return mod.object if mod else None
+
+    def get_vertex_groups(self, mesh, include_stats=True):
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        arm = self._bound_armature(m_obj)
+        bone_names = {b.name for b in arm.data.bones} if arm else set()
+        groups = []
+        per_group = {vg.index: [] for vg in m_obj.vertex_groups}
+        if include_stats:
+            for v in m_obj.data.vertices:
+                for g in v.groups:
+                    if g.group in per_group:
+                        per_group[g.group].append(g.weight)
+        for vg in m_obj.vertex_groups:
+            entry = {"name": vg.name, "index": vg.index, "lock": bool(vg.lock_weight), "has_bone": vg.name in bone_names}
+            if include_stats:
+                w = per_group[vg.index]
+                entry.update({"vertex_count": len(w), "weight_min": round(min(w), 5) if w else None,
+                              "weight_max": round(max(w), 5) if w else None,
+                              "weight_mean": round(sum(w) / len(w), 5) if w else None})
+            groups.append(entry)
+        return {"success": True, "mesh": m_obj.name, "armature": arm.name if arm else None,
+                "group_count": len(groups), "groups": groups}
+
+    def get_vertex_weights(self, mesh, indices=None, group=None, max_verts=2000):
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        idx_list = self._names_arg(indices)
+        if idx_list is not None:
+            try:
+                idx_list = [int(i) for i in idx_list]
+            except ValueError:
+                return {"error": f"indices must be integers, got {indices!r}"}
+            ierr = self._check_indices(idx_list, len(m_obj.data.vertices), "Vertex")
+            if ierr:
+                return ierr
+        vg_filter = None
+        if group is not None:
+            vg = m_obj.vertex_groups.get(group)
+            if vg is None:
+                return {"error": f"vertex group '{group}' not found; groups: {[g.name for g in m_obj.vertex_groups]}"}
+            vg_filter = vg.index
+        names = {vg.index: vg.name for vg in m_obj.vertex_groups}
+        verts = m_obj.data.vertices if idx_list is None else [m_obj.data.vertices[i] for i in idx_list]
+        out, truncated = {}, False
+        for v in verts:
+            entry = {names[g.group]: round(g.weight, 5) for g in v.groups
+                     if g.group in names and (vg_filter is None or g.group == vg_filter)}
+            if vg_filter is not None and not entry:
+                continue
+            if len(out) >= int(max_verts):
+                truncated = True
+                break
+            out[v.index] = entry
+        return {"success": True, "mesh": m_obj.name, "weights": out, "count": len(out), "truncated": truncated}
+
+    def set_vertex_weights(self, mesh, group, weights, mode="REPLACE", create_group=True):
+        """weights: JSON {index: weight} or [[index, weight], ...]; mode REPLACE / ADD / SUBTRACT (VertexGroup.add)."""
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        md = str(mode or "REPLACE").upper()
+        if md not in ("REPLACE", "ADD", "SUBTRACT"):
+            return {"error": f"mode '{mode}' not valid; valid: ['REPLACE', 'ADD', 'SUBTRACT']"}
+        data, jerr = self._json_arg(weights, "weights")
+        if jerr:
+            return jerr
+        pairs = []
+        try:
+            if isinstance(data, dict):
+                pairs = [(int(k), float(v)) for k, v in data.items()]
+            else:
+                pairs = [(int(p[0]), float(p[1])) for p in data]
+        except Exception:
+            return {"error": "weights must be {index: weight} or [[index, weight], ...]"}
+        if not pairs:
+            return {"error": "weights is empty"}
+        ierr = self._check_indices([i for i, _ in pairs], len(m_obj.data.vertices), "Vertex")
+        if ierr:
+            return ierr
+        vg = m_obj.vertex_groups.get(group)
+        created = False
+        if vg is None:
+            if not create_group:
+                return {"error": f"vertex group '{group}' not found and create_group=False; groups: {[g.name for g in m_obj.vertex_groups]}"}
+            vg = m_obj.vertex_groups.new(name=group)
+            created = True
+        self._ensure_object_mode(m_obj)
+        for i, w in pairs:
+            vg.add([i], w, md)
+        return {"success": True, "mesh": m_obj.name, "group": vg.name, "written": len(pairs), "mode": md,
+                "group_created": created}
+
+    def find_unweighted_vertices(self, mesh, tolerance=0.001, render=False, angle="front"):
+        """Verts whose total DEFORM weight is below tolerance, plus any weight > 1 or < 0. render=True highlights them in a capture."""
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        arm = self._bound_armature(m_obj)
+        deform = {vg.index for vg in m_obj.vertex_groups
+                  if arm is None or (vg.name in arm.data.bones and arm.data.bones[vg.name].use_deform)}
+        unweighted, out_of_range = [], []
+        for v in m_obj.data.vertices:
+            total = sum(g.weight for g in v.groups if g.group in deform)
+            if total < float(tolerance):
+                unweighted.append(v.index)
+            if any(g.weight > 1.0 + 1e-6 or g.weight < 0.0 for g in v.groups):
+                out_of_range.append(v.index)
+        reply = {"success": True, "mesh": m_obj.name, "armature": arm.name if arm else None,
+                 "vertex_count": len(m_obj.data.vertices), "unweighted_count": len(unweighted),
+                 "unweighted": unweighted[:500], "out_of_range_count": len(out_of_range),
+                 "out_of_range": out_of_range[:500], "deform_groups": sorted(m_obj.vertex_groups[i].name for i in deform)}
+        if render:
+            # The user's mesh element selection is restored after the mode is back (A1.3)
+            with self._selection_scope(), self._mesh_select_scope(m_obj.data), self._mode_restore():
+                self._select_only(m_obj)
+                # Edge and face flags are separate from vertex flags: a stale face selection
+                # would draw the faces highlighted in the capture (seen live 2026-09-11)
+                for e in m_obj.data.edges:
+                    e.select = False
+                for p in m_obj.data.polygons:
+                    p.select = False
+                wanted = set(unweighted)
+                for v in m_obj.data.vertices:
+                    v.select = v.index in wanted
+                bpy.ops.object.mode_set(mode='EDIT')
+                cap = self.capture_viewport_angle(angle=angle)
+                with suppress(Exception):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            reply["image"] = cap
+        return reply
+
+    def render_weight_map(self, mesh, group, angle="front", max_size=800, show_zero_weights=True):
+        """WEIGHT_PAINT capture of one vertex group (viewport tool: needs a GUI session; headless returns the capture error)."""
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        vg = m_obj.vertex_groups.get(group)
+        if vg is None:
+            return {"error": f"vertex group '{group}' not found; groups: {[g.name for g in m_obj.vertex_groups]}"}
+        prefs_view = bpy.context.preferences.view
+        saved_zero = getattr(prefs_view, "show_zero_weights", None) if hasattr(prefs_view, "show_zero_weights") else None
+        with self._selection_scope(), self._mode_restore():
+            self._select_only(m_obj)
+            m_obj.vertex_groups.active_index = vg.index
+            try:
+                if hasattr(prefs_view, "show_zero_weights"):
+                    prefs_view.show_zero_weights = 'ALL' if show_zero_weights else 'NONE'
+                cap = self.capture_viewport_angle(angle=angle, max_size=max_size, overlay="weight_paint")
+            finally:
+                if saved_zero is not None:
+                    with suppress(Exception):
+                        prefs_view.show_zero_weights = saved_zero
+        if "error" in cap:
+            return {"error": cap["error"], "mesh": m_obj.name, "group": vg.name}
+        cap.update({"mesh": m_obj.name, "group": vg.name})
+        return cap
+
+    # ── Pose ──
+
+    def _pose_rotation(self, pb):
+        import math
+        if pb.rotation_mode == 'QUATERNION':
+            return list(pb.rotation_quaternion)
+        if pb.rotation_mode == 'AXIS_ANGLE':
+            return list(pb.rotation_axis_angle)
+        return [round(math.degrees(a), 5) for a in pb.rotation_euler]
+
+    def set_pose(self, armature, bones, rotation_mode="XYZ", space="POSE", keyframe=False, frame=None):
+        """
+        bones: JSON {bone: {location?:[x,y,z], rotation?:[deg,deg,deg] or [w,x,y,z], scale?:[x,y,z]}}.
+        rotation_mode XYZ (Euler degrees) or QUATERNION is set per bone before writing.
+        keyframe=True keys the channels written (at frame when given). K20: a pose value on an
+        ANIMATED bone is overwritten by the action unless keyframed (warning in the reply).
+        """
+        import math
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        spec, jerr = self._json_arg(bones, "bones")
+        if jerr:
+            return jerr
+        if not isinstance(spec, dict) or not spec:
+            return {"error": "bones must be a JSON object {bone: {location, rotation, scale}}"}
+        rmode = str(rotation_mode or "XYZ").upper()
+        if rmode not in ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX", "QUATERNION"):
+            return {"error": f"rotation_mode '{rotation_mode}' not valid; valid: ['XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'QUATERNION']"}
+        if str(space or "POSE").upper() != "POSE":
+            return {"error": "only space='POSE' is supported in this version"}
+        scene = bpy.context.scene
+        if keyframe and frame is not None:
+            scene.frame_set(int(frame))
+        animated = arm.animation_data is not None and arm.animation_data.action is not None
+        written, mode_changes, unset = [], {}, {}
+        for name, values in spec.items():
+            pb = arm.pose.bones.get(name)
+            if pb is None:
+                unset[name] = f"bone not found; bones: {[b.name for b in arm.pose.bones][:30]}"
+                continue
+            if not isinstance(values, dict):
+                unset[name] = "expected an object {location, rotation, scale}"
+                continue
+            if pb.rotation_mode != rmode and "rotation" in values:
+                mode_changes[name] = {"from": pb.rotation_mode, "to": rmode}
+                pb.rotation_mode = rmode
+            keyed = []
+            if "location" in values:
+                v, e = self._vec3(values["location"], f"{name}.location")
+                if e:
+                    unset[name] = e; continue
+                pb.location = v; keyed.append("location")
+            if "rotation" in values:
+                rot = values["rotation"]
+                try:
+                    if rmode == "QUATERNION":
+                        if len(rot) != 4:
+                            raise ValueError
+                        pb.rotation_quaternion = [float(x) for x in rot]; keyed.append("rotation_quaternion")
+                    else:
+                        if len(rot) != 3:
+                            raise ValueError
+                        pb.rotation_euler = [math.radians(float(x)) for x in rot]; keyed.append("rotation_euler")
+                except Exception:
+                    unset[name] = f"rotation must be {'4 numbers (quaternion)' if rmode == 'QUATERNION' else '3 degrees'}"
+                    continue
+            if "scale" in values:
+                v, e = self._vec3(values["scale"], f"{name}.scale")
+                if e:
+                    unset[name] = e; continue
+                pb.scale = v; keyed.append("scale")
+            if keyframe:
+                for path in keyed:
+                    pb.keyframe_insert(data_path=path, frame=scene.frame_current)
+            written.append(name)
+        reply = {"success": True, "armature": arm.name, "written": written, "keyframe": bool(keyframe),
+                 "frame": scene.frame_current if keyframe else None}
+        if mode_changes:
+            reply["rotation_mode_changed"] = mode_changes
+        if unset:
+            reply["unset"] = unset
+        if animated and not keyframe and written:
+            reply["warning"] = "armature is animated: the pose will be overwritten by its action on the next update unless keyframe=True"
+        return reply
+
+    def get_pose(self, armature, bones=None, space="WORLD"):
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        sp = str(space or "WORLD").upper()
+        if sp not in ("WORLD", "POSE"):
+            return {"error": f"space '{space}' not valid; valid: ['WORLD', 'POSE']"}
+        names = self._names_arg(bones)
+        mw = arm.matrix_world
+        out, missing = {}, []
+        for name in (names if names is not None else [pb.name for pb in arm.pose.bones]):
+            pb = arm.pose.bones.get(name)
+            if pb is None:
+                missing.append(name)
+                continue
+            head = mw @ pb.head if sp == "WORLD" else pb.head
+            tail = mw @ pb.tail if sp == "WORLD" else pb.tail
+            out[name] = {"location": [round(x, 5) for x in pb.location], "rotation_mode": pb.rotation_mode,
+                         "rotation": self._pose_rotation(pb), "scale": [round(x, 5) for x in pb.scale],
+                         "head_world" if sp == "WORLD" else "head": [round(x, 5) for x in head],
+                         "tail_world" if sp == "WORLD" else "tail": [round(x, 5) for x in tail]}
+        reply = {"success": True, "armature": arm.name, "space": sp, "bones": out}
+        if missing:
+            reply["missing"] = missing
+        return reply
+
+    def reset_pose(self, armature, bones=None, transforms="ALL"):
+        """Clear pose transforms by writing identity directly (no POSE-mode ops)."""
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        t = str(transforms or "ALL").upper()
+        if t not in ("ALL", "LOCATION", "ROTATION", "SCALE"):
+            return {"error": f"transforms '{transforms}' not valid; valid: ['ALL', 'LOCATION', 'ROTATION', 'SCALE']"}
+        names = self._names_arg(bones)
+        done, missing = [], []
+        for name in (names if names is not None else [pb.name for pb in arm.pose.bones]):
+            pb = arm.pose.bones.get(name)
+            if pb is None:
+                missing.append(name)
+                continue
+            if t in ("ALL", "LOCATION"):
+                pb.location = (0.0, 0.0, 0.0)
+            if t in ("ALL", "ROTATION"):
+                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+                pb.rotation_euler = (0.0, 0.0, 0.0)
+                pb.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+            if t in ("ALL", "SCALE"):
+                pb.scale = (1.0, 1.0, 1.0)
+            done.append(name)
+        reply = {"success": True, "armature": arm.name, "reset": done, "transforms": t}
+        if missing:
+            reply["missing"] = missing
+        return reply
+
+    # ── Constraints ──
+
+    def _constraint_owner(self, owner, bone):
+        obj = bpy.data.objects.get(owner)
+        if obj is None:
+            return None, {"error": f"Object not found: {owner}"}
+        if bone is None:
+            return obj, None
+        if obj.type != 'ARMATURE':
+            return None, {"error": f"bone={bone!r} needs an ARMATURE owner; {owner} is a {obj.type}"}
+        pb = obj.pose.bones.get(bone)
+        if pb is None:
+            return None, {"error": f"Bone not found: {bone}; bones: {[b.name for b in obj.pose.bones][:50]}"}
+        return pb, None
+
+    def add_constraint(self, owner, constraint_type, bone=None, name=None, params=None):
+        """
+        Object or pose-bone constraint. params: JSON of constraint properties; object-pointer props
+        (target, pole_target, ...) take object names, subtarget / pole_subtarget take bone names,
+        pole_angle is DEGREES. Reply set / unset {key: reason} like add_modifier.
+        """
+        import math
+        holder, err = self._constraint_owner(owner, bone)
+        if err:
+            return err
+        ctype = str(constraint_type or "").upper()
+        valid = [e.identifier for e in bpy.types.Constraint.bl_rna.properties["type"].enum_items]
+        if ctype not in valid:
+            return {"error": f"constraint_type '{constraint_type}' not valid; valid: {valid}"}
+        values, jerr = self._json_arg(params, "params")
+        if jerr:
+            return jerr
+        values = dict(values or {})
+        try:
+            con = holder.constraints.new(type=ctype)
+        except Exception as e:
+            return {"error": f"could not add {ctype}: {e}"}
+        if name:
+            con.name = str(name)
+        done, unset = [], {}
+        for key, value in values.items():
+            prop = con.bl_rna.properties.get(key)
+            if prop is None:
+                unset[key] = "no such property"
+                continue
+            try:
+                if prop.type == 'POINTER':
+                    target = bpy.data.objects.get(value) if isinstance(value, str) else value
+                    if target is None:
+                        unset[key] = f"object '{value}' not found"
+                        continue
+                    setattr(con, key, target)
+                    done.append(key)
+                    continue
+                if key in ("pole_angle",) and prop.type == 'FLOAT':
+                    value = math.radians(float(value))
+                reason = self._rna_set_validated(con, key, value)
+                if reason is None:
+                    done.append(key)
+                else:
+                    unset[key] = reason
+            except Exception as e:
+                unset[key] = str(e)
+        reply = {"success": True, "owner": owner, "bone": bone, "constraint": con.name, "type": ctype, "set": done,
+                 "summary": self._constraint_summary(con)}
+        if unset:
+            reply["unset"] = unset
+        return reply
+
+    def get_constraints(self, owner, bone=None):
+        holder, err = self._constraint_owner(owner, bone)
+        if err:
+            return err
+        return {"success": True, "owner": owner, "bone": bone,
+                "constraints": [self._constraint_summary(c) for c in holder.constraints]}
+
+    def remove_constraint(self, owner, name, bone=None):
+        holder, err = self._constraint_owner(owner, bone)
+        if err:
+            return err
+        con = holder.constraints.get(name)
+        if con is None:
+            return {"error": f"constraint '{name}' not found; have: {[c.name for c in holder.constraints]}"}
+        holder.constraints.remove(con)
+        return {"success": True, "owner": owner, "bone": bone, "removed": name,
+                "remaining": [c.name for c in holder.constraints]}
+
+    # ─── Animation (B1 Tier 1): keyframes, animation info, playblast, bake ───
+
+    _KEY_INTERPOLATION = ("CONSTANT", "LINEAR", "BEZIER", "SINE", "QUAD", "CUBIC", "QUART", "QUINT",
+                          "EXPO", "CIRC", "BACK", "BOUNCE", "ELASTIC")
+    _KEY_EASING = ("AUTO", "EASE_IN", "EASE_OUT", "EASE_IN_OUT")
+
+    def _resolve_anim_target(self, name, bone, data_path):
+        """(root, owner, attr, id_owner, key_path) or (None, error_dict)."""
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return None, {"error": f"Object not found: {name}"}
+        root = obj
+        if bone is not None:
+            if obj.type != 'ARMATURE':
+                return None, {"error": f"bone={bone!r} needs an ARMATURE object; {name} is a {obj.type}"}
+            pb = obj.pose.bones.get(bone)
+            if pb is None:
+                return None, {"error": f"Bone not found: {bone}; bones: {[b.name for b in obj.pose.bones][:50]}"}
+            root = pb
+        depth, split_at = 0, -1
+        for i, ch in enumerate(data_path):
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+            elif ch == '.' and depth == 0:
+                split_at = i
+        try:
+            if split_at >= 0:
+                owner = root.path_resolve(data_path[:split_at])
+                attr = data_path[split_at + 1:]
+            else:
+                owner, attr = root, data_path
+            getattr(owner, attr)
+        except Exception as e:
+            return None, {"error": f"Cannot resolve '{data_path}' on {name}{'.' + bone if bone else ''}: {e}"}
+        id_owner = owner if isinstance(owner, bpy.types.ID) else owner.id_data
+        key_path = attr if id_owner is owner else owner.path_from_id(attr)
+        return (root, owner, attr, id_owner, key_path), None
+
+    def set_keyframes(self, target, data_path, keys, bone=None, replace=True):
+        """
+        Batch keys in one call. keys: JSON list of [frame, value] or {frame, value, interpolation?, easing?}.
+        Value rules as add_keyframe (vectors as lists, rotation_euler in DEGREES; QUATERNION/AXIS_ANGLE
+        owners switch to XYZ for rotation_euler). interpolation: CONSTANT/LINEAR/BEZIER/...; easing:
+        AUTO/EASE_IN/EASE_OUT/EASE_IN_OUT. replace=False skips frames that already carry a key.
+        Reply: keyed, skipped, action, fcurves (paths), rotation_mode_changed?.
+        """
+        import math
+        resolved, err = self._resolve_anim_target(target, bone, data_path)
+        if err:
+            return err
+        root, owner, attr, id_owner, key_path = resolved
+        entries, jerr = self._json_arg(keys, "keys")
+        if jerr:
+            return jerr
+        if not isinstance(entries, list) or not entries:
+            return {"error": "keys must be a non-empty JSON list of [frame, value] or {frame, value, ...}"}
+        rotation_mode_changed = None
+        if attr in ("rotation_euler", "delta_rotation_euler") and hasattr(owner, "rotation_mode"):
+            if owner.rotation_mode in ('QUATERNION', 'AXIS_ANGLE'):
+                rotation_mode_changed = {"from": owner.rotation_mode, "to": "XYZ"}
+                owner.rotation_mode = 'XYZ'
+        current = getattr(owner, attr)
+        is_vector = hasattr(current, "__len__") and not isinstance(current, str)
+        existing = set()
+        if not replace:
+            fcurves, _g, _n = self._action_channels(id_owner)
+            if fcurves is not None:
+                for fc in fcurves:
+                    if fc.data_path == key_path:
+                        existing.update(int(round(kp.co.x)) for kp in fc.keyframe_points)
+        keyed, skipped, styles = [], [], {}
+        for entry in entries:
+            try:
+                if isinstance(entry, dict):
+                    frame, value = int(entry["frame"]), entry["value"]
+                    interp = str(entry.get("interpolation", "") or "").upper() or None
+                    easing = str(entry.get("easing", "") or "").upper() or None
+                else:
+                    frame, value = int(entry[0]), entry[1]
+                    interp, easing = None, None
+            except Exception:
+                return {"error": f"bad key entry {entry!r}; use [frame, value] or {{frame, value, interpolation, easing}}"}
+            if interp and interp not in self._KEY_INTERPOLATION:
+                return {"error": f"interpolation '{interp}' not valid; valid: {list(self._KEY_INTERPOLATION)}"}
+            if easing and easing not in self._KEY_EASING:
+                return {"error": f"easing '{easing}' not valid; valid: {list(self._KEY_EASING)}"}
+            if frame in existing:
+                skipped.append(frame)
+                continue
+            if attr in ("rotation_euler", "delta_rotation_euler") and isinstance(value, (list, tuple)):
+                value = [math.radians(float(v)) for v in value]
+            if is_vector:
+                if not isinstance(value, (list, tuple)) or len(value) != len(current):
+                    return {"error": f"{data_path} expects {len(current)} values per key, got {value!r}"}
+            elif isinstance(value, (list, tuple)):
+                if len(value) != 1:
+                    return {"error": f"{data_path} expects a single value per key, got {value!r}"}
+                value = value[0]
+            try:
+                setattr(owner, attr, value)
+                id_owner.keyframe_insert(data_path=key_path, frame=frame)
+            except Exception as e:
+                return {"error": f"Could not key {data_path} at frame {frame}: {e}", "keyed_before_error": keyed}
+            keyed.append(frame)
+            if interp or easing:
+                styles[frame] = (interp, easing)
+        fcurves, _g, _n = self._action_channels(id_owner)
+        paths = []
+        if fcurves is not None:
+            for fc in fcurves:
+                if fc.data_path != key_path:
+                    continue
+                paths.append(f"{fc.data_path}[{fc.array_index}]")
+                if styles:
+                    for kp in fc.keyframe_points:
+                        style = styles.get(int(round(kp.co.x)))
+                        if style:
+                            if style[0]:
+                                kp.interpolation = style[0]
+                            if style[1]:
+                                kp.easing = style[1]
+        ad = getattr(id_owner, "animation_data", None)
+        reply = {"success": True, "target": target, "bone": bone, "data_path": data_path, "keyed": keyed,
+                 "keyed_count": len(keyed), "skipped": skipped,
+                 "action": ad.action.name if ad is not None and ad.action else None, "fcurves": paths}
+        if rotation_mode_changed:
+            reply["rotation_mode_changed"] = rotation_mode_changed
+        return reply
+
+    def _fcurve_entries(self, fcurves, include_keys, max_keys):
+        out = []
+        for fc in fcurves:
+            entry = {"data_path": fc.data_path, "index": fc.array_index, "keyframe_count": len(fc.keyframe_points),
+                     "frame_range": [round(x, 3) for x in fc.range()] if len(fc.keyframe_points) else None,
+                     "group": fc.group.name if fc.group else None}
+            if include_keys:
+                pts = fc.keyframe_points
+                entry["keys"] = [[round(kp.co.x, 3), round(kp.co.y, 6), kp.interpolation] for kp in pts[:int(max_keys)]]
+                entry["keys_truncated"] = len(pts) > int(max_keys)
+            out.append(entry)
+        return out
+
+    @staticmethod
+    def _action_fcurve_count(action):
+        """F-curve count of an action without an owner: legacy fcurves or the sum over slot channelbags."""
+        if hasattr(action, "fcurves"):
+            return len(action.fcurves)
+        total = 0
+        with suppress(Exception):
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for bag in strip.channelbags:
+                        total += len(bag.fcurves)
+        return total
+
+    def get_animation_info(self, target=None, include_keys=False, max_keys=200):
+        """Scene summary (target=None) or per-object action / fcurves / NLA / shape-key action (K2 helper)."""
+        scene = bpy.context.scene
+        if target is None:
+            actions = [{"name": a.name, "users": a.users, "frame_range": [round(x, 3) for x in a.frame_range],
+                        "fcurves": self._action_fcurve_count(a), "fake_user": a.use_fake_user} for a in bpy.data.actions]
+            return {"success": True, "scene": scene.name, "fps": scene.render.fps, "fps_base": scene.render.fps_base,
+                    "frame_start": scene.frame_start, "frame_end": scene.frame_end, "frame_current": scene.frame_current,
+                    "actions": actions}
+        obj = bpy.data.objects.get(target)
+        if obj is None:
+            return {"error": f"Object not found: {target}"}
+        ad = obj.animation_data
+        fcurves, groups, _n = self._action_channels(obj)
+        info = {"success": True, "target": obj.name, "type": obj.type,
+                "action": ad.action.name if ad is not None and ad.action else None,
+                "fcurves": self._fcurve_entries(fcurves, include_keys, max_keys) if fcurves is not None else [],
+                "groups": [g.name for g in groups] if groups is not None else [],
+                "nla_tracks": [], "shape_key_action": None}
+        if ad is not None:
+            slot = getattr(ad, "action_slot", None)
+            if slot is not None:
+                info["action_slot"] = getattr(slot, "identifier", str(slot))
+            for track in ad.nla_tracks:
+                info["nla_tracks"].append({"name": track.name, "mute": track.mute, "strips": [
+                    {"name": s.name, "action": s.action.name if s.action else None,
+                     "frame_start": round(s.frame_start, 3), "frame_end": round(s.frame_end, 3)} for s in track.strips]})
+        sk = getattr(obj.data, "shape_keys", None) if obj.data else None
+        if sk is not None and sk.animation_data is not None and sk.animation_data.action is not None:
+            info["shape_key_action"] = sk.animation_data.action.name
+        if obj.type == 'ARMATURE' and fcurves is not None:
+            bones = set()
+            for fc in fcurves:
+                if fc.data_path.startswith('pose.bones["'):
+                    bones.add(fc.data_path.split('"')[1])
+            info["animated_bones"] = sorted(bones)
+        return info
+
+    def set_scene_frame_range(self, start=None, end=None, fps=None, fps_base=None, current=None):
+        """Rigging-doc name for B0's set_frame_range (one implementation)."""
+        return self.set_frame_range(start=start, end=end, fps=fps, fps_base=fps_base, current=current)
+
+    def playblast(self, start=None, end=None, step=None, frames=None, camera=None, max_size=640, columns=4,
+                  video_path=None, overlay=None):
+        """
+        Perceive motion: one image per frame. Path "opengl" (render.opengl under the VIEW_3D
+        override; GUI sessions only, K9) or "camera" (an engine render of the active camera per
+        frame through _render_settings; the headless path). Auto step keeps <= 16 tiles unless
+        step / frames are given. video_path writes FFMPEG (MPEG4 / H264) over the same frame range
+        (media_type VIDEO on 5.x). frame_current and every render setting are restored. The server
+        composes the contact sheet from "images".
+        """
+        scene = bpy.context.scene
+        if frames is not None:
+            try:
+                frame_list = [int(f) for f in self._names_arg(frames)]
+            except (TypeError, ValueError):
+                return {"error": f"frames must be integers, got {frames!r}"}
+            if not frame_list:
+                return {"error": "frames is empty"}
+        else:
+            f0 = scene.frame_start if start is None else int(start)
+            f1 = scene.frame_end if end is None else int(end)
+            if f1 < f0:
+                return {"error": f"end ({f1}) is before start ({f0})"}
+            if step is None:
+                step_v = max(1, -(-(f1 - f0 + 1) // 16))
+            else:
+                step_v = int(step)
+                if step_v < 1:
+                    return {"error": "step must be >= 1"}
+            frame_list = list(range(f0, f1 + 1, step_v))
+            if frame_list[-1] != f1:
+                frame_list.append(f1)
+        cam_obj = scene.camera
+        if camera is not None:
+            cam_obj = bpy.data.objects.get(camera)
+            if cam_obj is None or cam_obj.type != 'CAMERA':
+                return {"error": f"Camera not found: {camera}; cameras: {[o.name for o in bpy.data.objects if o.type == 'CAMERA']}"}
+        if overlay is not None and str(overlay).lower() not in self._CAPTURE_OVERLAYS:
+            return {"error": f"overlay '{overlay}' not valid; valid: {list(self._CAPTURE_OVERLAYS)}"}
+
+        area = None if bpy.app.background else next((a for a in bpy.context.screen.areas if a.type == 'VIEW_3D'), None) if bpy.context.screen else None
+        use_opengl = area is not None and self._op_exists(bpy.ops.render.opengl)
+        if not use_opengl and cam_obj is None:
+            return {"error": "No VIEW_3D for an OpenGL playblast and no camera for the render fallback: create_camera / set_active_camera first"}
+
+        r = scene.render
+        aspect = r.resolution_y / max(1, r.resolution_x)
+        width = max(2, int(max_size) // 2 * 2)                    # H.264 needs even dimensions
+        height = max(2, int(round(width * aspect)) // 2 * 2)
+        outdir = tempfile.mkdtemp(prefix="blender_playblast_")
+        images, warnings = [], []
+        path_used = "opengl" if use_opengl else "camera"
+        if overlay and not use_opengl:
+            warnings.append("overlay ignored: the camera fallback has no viewport overlays")
+        frame_before = scene.frame_current
+        video_written = None
+        try:
+            # SCENE is in the scope because the video branch rewrites frame_start / frame_end / frame_step
+            with self._settings_scope(("SCENE", "RENDER", "OUTPUT", "CYCLES", "EEVEE"), scene=scene):
+                r.resolution_x, r.resolution_y, r.resolution_percentage = width, height, 100
+                err = self._set_file_format(r.image_settings, "PNG")
+                if err:
+                    return err
+                if cam_obj is not None:
+                    scene.camera = cam_obj
+                with suppress(Exception):
+                    scene.cycles.samples = 1
+                with suppress(Exception):
+                    scene.eevee.taa_render_samples = 1
+                overlay_cm = self._capture_overlay(area.spaces.active, overlay) if (use_opengl and overlay) else None
+                if overlay_cm:
+                    overlay_cm.__enter__()
+                view_saved = None
+                if use_opengl and camera is not None:
+                    # render.opengl(view_context=True) draws the viewport's own view; look through
+                    # the requested camera and put the view back afterwards
+                    r3d = area.spaces.active.region_3d
+                    view_saved = (r3d.view_perspective, r3d.view_matrix.copy(), r3d.view_distance)
+                    with suppress(Exception):
+                        r3d.view_perspective = 'CAMERA'
+                try:
+                    for f in frame_list:
+                        scene.frame_set(int(f))
+                        fp = os.path.join(outdir, f"frame_{int(f):05d}.png")
+                        if os.path.exists(fp):
+                            os.remove(fp)
+                        r.filepath = fp
+                        if use_opengl:
+                            try:
+                                region = next((rg for rg in area.regions if rg.type == 'WINDOW'), None)
+                                with bpy.context.temp_override(area=area, region=region):
+                                    result = bpy.ops.render.opengl(write_still=True, view_context=True)
+                            except Exception as e:
+                                # K9: poll() lies in --background; fall back to the camera render for the rest
+                                if cam_obj is None:
+                                    return {"error": f"OpenGL playblast failed and no camera for the fallback: {e}"}
+                                use_opengl, path_used = False, "camera"
+                                warnings.append(f"opengl path failed ({e}); camera fallback used")
+                                result = bpy.ops.render.render(write_still=True)
+                        else:
+                            result = bpy.ops.render.render(write_still=True)
+                        if 'FINISHED' not in result or not os.path.exists(fp):
+                            return {"error": f"frame {f} did not render (operator returned {set(result)})", "images": images}
+                        images.append({"frame": int(f), "filepath": fp, "width": width, "height": height})
+                    if video_path:
+                        stem, ext = os.path.splitext(video_path)
+                        verr = self._set_file_format(r.image_settings, "FFMPEG")
+                        if verr:
+                            return verr
+                        with suppress(Exception):
+                            r.ffmpeg.format = 'MPEG4'
+                        with suppress(Exception):
+                            r.ffmpeg.codec = 'H264'
+                        r.filepath = stem
+                        r.use_file_extension = True
+                        scene.frame_start, scene.frame_end = int(frame_list[0]), int(frame_list[-1])
+                        scene.frame_step = 1
+                        if use_opengl:
+                            region = next((rg for rg in area.regions if rg.type == 'WINDOW'), None)
+                            with bpy.context.temp_override(area=area, region=region):
+                                vres = bpy.ops.render.opengl(animation=True, view_context=True)
+                        else:
+                            vres = bpy.ops.render.render(animation=True)
+                        folder, prefix = os.path.split(stem)
+                        folder = folder or os.getcwd()
+                        candidates = [os.path.join(folder, n) for n in os.listdir(folder)
+                                      if n.startswith(prefix) and n.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm"))]
+                        if 'FINISHED' not in vres or not candidates:
+                            warnings.append(f"video not written (operator returned {set(vres)})")
+                        else:
+                            video_written = max(candidates, key=os.path.getmtime)
+                finally:
+                    if view_saved is not None:
+                        with suppress(Exception):
+                            r3d.view_perspective = view_saved[0]
+                            r3d.view_matrix = view_saved[1]
+                            r3d.view_distance = view_saved[2]
+                    if overlay_cm:
+                        with suppress(Exception):
+                            overlay_cm.__exit__(None, None, None)
+        finally:
+            with suppress(Exception):
+                scene.frame_set(frame_before)
+        reply = {"success": True, "path": path_used, "frames": [int(f) for f in frame_list], "images": images,
+                 "columns": int(columns), "output_dir": outdir, "camera": cam_obj.name if cam_obj else None,
+                 "frame_current_restored": scene.frame_current == frame_before}
+        if video_path:
+            reply["video"] = video_written
+        if warnings:
+            reply["warnings"] = warnings
+        return reply
+
+    def bake_action(self, armature, start=None, end=None, step=1, bones=None, visual_keying=True,
+                    clear_constraints=False, clear_parents=False, only_selected=True, bake_types="POSE",
+                    use_current_action=False):
+        """
+        bpy.ops.nla.bake in POSE mode with the listed bones selected (all when None), armature
+        active (K12). Falls back to bpy_extras.anim_utils.bake_action when the operator's poll
+        fails (K23). Mode, active object and bone selection are restored. Reply: action, frame_range,
+        fcurve_count, animated_bones.
+        """
+        arm, err = self._get_armature(armature)
+        if err:
+            return err
+        scene = bpy.context.scene
+        f0 = scene.frame_start if start is None else int(start)
+        f1 = scene.frame_end if end is None else int(end)
+        if f1 < f0:
+            return {"error": f"end ({f1}) is before start ({f0})"}
+        types = self._names_arg(bake_types) or ["POSE"]
+        types = {t.strip().upper() for t in types}
+        if "BOTH" in types:
+            types = {"POSE", "OBJECT"}
+        valid = {"POSE", "OBJECT"}
+        if not types <= valid:
+            return {"error": f"bake_types {sorted(types)} not valid; valid: POSE, OBJECT, both"}
+        names = self._names_arg(bones)
+        if names is not None:
+            missing = [n for n in names if n not in arm.pose.bones]
+            if missing:
+                return {"error": f"bones not found: {missing}; bones: {[b.name for b in arm.pose.bones][:50]}"}
+        prev_sel = {pb.name: (pb.select if hasattr(pb, "select") else pb.bone.select) for pb in arm.pose.bones}
+        frame_before = scene.frame_current
+        method = "nla.bake"
+        try:
+            with self._selection_scope(), self._pose_mode(arm):
+                self._select_bones(arm, None, False)
+                self._select_bones(arm, names, True)
+                try:
+                    result = bpy.ops.nla.bake(frame_start=f0, frame_end=f1, step=int(step), only_selected=bool(only_selected),
+                                              visual_keying=bool(visual_keying), clear_constraints=bool(clear_constraints),
+                                              clear_parents=bool(clear_parents), use_current_action=bool(use_current_action),
+                                              bake_types=types)
+                    if 'FINISHED' not in result:
+                        raise RuntimeError(f"nla.bake returned {set(result)}")
+                except Exception as op_err:
+                    from bpy_extras import anim_utils
+                    method = f"anim_utils.bake_action (nla.bake: {op_err})"
+                    opts = anim_utils.BakeOptions(only_selected=bool(only_selected), do_pose="POSE" in types,
+                                                  do_object="OBJECT" in types, do_visual_keying=bool(visual_keying),
+                                                  do_constraint_clear=bool(clear_constraints),
+                                                  do_parents_clear=bool(clear_parents), do_clean=False,
+                                                  do_location=True, do_rotation=True, do_scale=True, do_bbone=True,
+                                                  do_custom_props=True)
+                    action = arm.animation_data.action if (use_current_action and arm.animation_data) else None
+                    anim_utils.bake_action(arm, action=action, frames=range(f0, f1 + 1, int(step)), bake_options=opts)
+        finally:
+            for pb in arm.pose.bones:
+                with suppress(Exception):
+                    if hasattr(pb, "select"):
+                        pb.select = prev_sel.get(pb.name, False)
+                    else:
+                        pb.bone.select = prev_sel.get(pb.name, False)
+            with suppress(Exception):
+                scene.frame_set(frame_before)
+        ad = arm.animation_data
+        action = ad.action if ad is not None else None
+        fcurves, _g, _n = self._action_channels(arm)
+        animated = sorted({fc.data_path.split('"')[1] for fc in fcurves if fc.data_path.startswith('pose.bones["')}) if fcurves is not None else []
+        return {"success": True, "armature": arm.name, "method": method,
+                "action": action.name if action else None,
+                "frame_range": [round(x, 3) for x in action.frame_range] if action else None,
+                "baked_range": [f0, f1], "step": int(step), "bake_types": sorted(types),
+                "fcurve_count": len(fcurves) if fcurves is not None else 0, "animated_bones": animated,
+                "bones": names if names is not None else "all"}
 
     # ─── PolyHaven handlers (begin) ──────────────────────────────────────────
 
@@ -2682,22 +6327,14 @@ class BlenderMCPServer:
                         env_tex.location = (-400, 0)
                         env_tex.image = bpy.data.images.load(tmp_path)
 
-                        # Use a color space that exists in all Blender versions
-                        if file_format.lower() == 'exr':
-                            # Try to use Linear color space for EXR files
+                        # Scene-linear colour space for HDR and EXR alike, by try-assign: 'Linear Rec.709'
+                        # exists on 4.3 and 5.x, 'Linear' only on older OCIO configs, 'Non-Color' everywhere
+                        for color_space in ['Linear Rec.709', 'Linear', 'Non-Color']:
                             try:
-                                env_tex.image.colorspace_settings.name = 'Linear'
-                            except:
-                                # Fallback to Non-Color if Linear isn't available
-                                env_tex.image.colorspace_settings.name = 'Non-Color'
-                        else:  # hdr
-                            # For HDR files, try these options in order
-                            for color_space in ['Linear', 'Linear Rec.709', 'Non-Color']:
-                                try:
-                                    env_tex.image.colorspace_settings.name = color_space
-                                    break  # Stop if we successfully set a color space
-                                except:
-                                    continue
+                                env_tex.image.colorspace_settings.name = color_space
+                                break
+                            except Exception:
+                                continue
 
                         background = node_tree.nodes.new(type='ShaderNodeBackground')
                         background.location = (-200, 0)
@@ -2714,10 +6351,11 @@ class BlenderMCPServer:
                         # Set as active world
                         bpy.context.scene.world = world
 
-                        # Clean up temporary file
+                        # Clean up the downloaded HDRI file (the old private tempfile helper never existed;
+                        # the image data block already holds the pixels in memory)
                         try:
-                            tempfile._cleanup()  # This will clean up all temporary files
-                        except:
+                            os.unlink(tmp_path)
+                        except OSError:
                             pass
 
                         return {
@@ -2893,7 +6531,6 @@ class BlenderMCPServer:
                         # Check for included files and download them
                         if "include" in file_info and file_info["include"]:
                             for include_path, include_info in file_info["include"].items():
-                                # Get the URL for the included file - this is the fix
                                 include_url = include_info["url"]
 
                                 # Create the directory structure for the included file
@@ -2914,7 +6551,10 @@ class BlenderMCPServer:
                         elif file_format == "fbx":
                             bpy.ops.import_scene.fbx(filepath=main_file_path)
                         elif file_format == "obj":
-                            bpy.ops.import_scene.obj(filepath=main_file_path)
+                            if self._op_exists(bpy.ops.wm.obj_import):
+                                bpy.ops.wm.obj_import(filepath=main_file_path)
+                            else:
+                                bpy.ops.import_scene.obj(filepath=main_file_path)
                         elif file_format == "blend":
                             # For blend files, we need to append or link
                             with bpy.data.libraries.load(main_file_path, link=False) as (data_from, data_to):
@@ -2990,12 +6630,6 @@ class BlenderMCPServer:
 
                     texture_images[map_type] = img
                     print(f"Loaded texture map: {map_type} - {img.name}")
-
-                    # Debug info
-                    print(f"Image size: {img.size[0]}x{img.size[1]}")
-                    print(f"Color space: {img.colorspace_settings.name}")
-                    print(f"File format: {img.file_format}")
-                    print(f"Is packed: {bool(img.packed_file)}")
 
             if not texture_images:
                 return {"error": f"No texture images found for: {texture_id}. Please download the texture first."}
@@ -3083,10 +6717,10 @@ class BlenderMCPServer:
 
                 y_pos -= 250
 
-            # Second pass: Connect nodes with proper handling for special cases
+            # Index the texture nodes by map type for the ARM wiring below. Base colour, roughness,
+            # metallic, normal and displacement are already linked by the loop above (a second
+            # linking pass used to duplicate the NormalMap / Displacement nodes on every call).
             texture_nodes = {}
-
-            # First find all texture nodes and store them by map type
             for node in nodes:
                 if node.type == 'TEX_IMAGE' and node.image:
                     for map_type, image in texture_images.items():
@@ -3094,63 +6728,26 @@ class BlenderMCPServer:
                             texture_nodes[map_type] = node
                             break
 
-            # Now connect everything using the nodes instead of images
-            # Handle base color (diffuse)
-            for map_name in ['color', 'diffuse', 'albedo']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Base Color'])
-                    print(f"Connected {map_name} to Base Color")
-                    break
-
-            # Handle roughness
-            for map_name in ['roughness', 'rough']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Roughness'])
-                    print(f"Connected {map_name} to Roughness")
-                    break
-
-            # Handle metallic
-            for map_name in ['metallic', 'metalness', 'metal']:
-                if map_name in texture_nodes:
-                    links.new(texture_nodes[map_name].outputs['Color'], principled.inputs['Metallic'])
-                    print(f"Connected {map_name} to Metallic")
-                    break
-
-            # Handle normal maps
-            for map_name in ['gl', 'dx', 'nor']:
-                if map_name in texture_nodes:
-                    normal_map_node = nodes.new(type='ShaderNodeNormalMap')
-                    normal_map_node.location = (100, 100)
-                    links.new(texture_nodes[map_name].outputs['Color'], normal_map_node.inputs['Color'])
-                    links.new(normal_map_node.outputs['Normal'], principled.inputs['Normal'])
-                    print(f"Connected {map_name} to Normal")
-                    break
-
-            # Handle displacement
-            for map_name in ['displacement', 'disp', 'height']:
-                if map_name in texture_nodes:
-                    disp_node = nodes.new(type='ShaderNodeDisplacement')
-                    disp_node.location = (300, -200)
-                    disp_node.inputs['Scale'].default_value = 0.1  # Reduce displacement strength
-                    links.new(texture_nodes[map_name].outputs['Color'], disp_node.inputs['Height'])
-                    links.new(disp_node.outputs['Displacement'], output.inputs['Displacement'])
-                    print(f"Connected {map_name} to Displacement")
-                    break
-
             # Handle ARM texture (Ambient Occlusion, Roughness, Metallic)
             if 'arm' in texture_nodes:
-                separate_rgb = nodes.new(type='ShaderNodeSeparateRGB')
+                # ShaderNodeSeparateRGB is gone on 5.x; SeparateColor (mode RGB) is its twin with
+                # input "Color" and outputs "Red"/"Green"/"Blue" instead of "Image" and "R"/"G"/"B"
+                separate_rgb = self._new_node(new_mat.node_tree, 'ShaderNodeSeparateRGB', 'ShaderNodeSeparateColor')
                 separate_rgb.location = (-200, -100)
-                links.new(texture_nodes['arm'].outputs['Color'], separate_rgb.inputs['Image'])
+                sep_in = separate_rgb.inputs.get('Image') or separate_rgb.inputs.get('Color')
+                links.new(texture_nodes['arm'].outputs['Color'], sep_in)
+
+                def _sep_out(short, long):
+                    return separate_rgb.outputs.get(short) or separate_rgb.outputs.get(long)
 
                 # Connect Roughness (G) if no dedicated roughness map
                 if not any(map_name in texture_nodes for map_name in ['roughness', 'rough']):
-                    links.new(separate_rgb.outputs['G'], principled.inputs['Roughness'])
+                    links.new(_sep_out('G', 'Green'), principled.inputs['Roughness'])
                     print("Connected ARM.G to Roughness")
 
                 # Connect Metallic (B) if no dedicated metallic map
                 if not any(map_name in texture_nodes for map_name in ['metallic', 'metalness', 'metal']):
-                    links.new(separate_rgb.outputs['B'], principled.inputs['Metallic'])
+                    links.new(_sep_out('B', 'Blue'), principled.inputs['Metallic'])
                     print("Connected ARM.B to Metallic")
 
                 # For AO (R channel), multiply with base color if we have one
@@ -3173,7 +6770,7 @@ class BlenderMCPServer:
 
                     # Connect through the mix node
                     links.new(base_color_node.outputs['Color'], mix_node.inputs[1])
-                    links.new(separate_rgb.outputs['R'], mix_node.inputs[2])
+                    links.new(_sep_out('R', 'Red'), mix_node.inputs[2])
                     links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
                     print("Connected ARM.R to AO mix with Base Color")
 
@@ -3202,18 +6799,16 @@ class BlenderMCPServer:
                     links.new(mix_node.outputs['Color'], principled.inputs['Base Color'])
                     print("Connected AO to mix with Base Color")
 
-            # CRITICAL: Make sure to clear all existing materials from the object
+            # Replace every existing material slot with the new material
             while len(obj.data.materials) > 0:
                 obj.data.materials.pop(index=0)
-
-            # Assign the new material to the object
             obj.data.materials.append(new_mat)
 
-            # CRITICAL: Make the object active and select it
+            # Make the object active and selected so the material shows in the UI
             bpy.context.view_layer.objects.active = obj
             obj.select_set(True)
 
-            # CRITICAL: Force Blender to update the material
+            # Depsgraph update so the evaluated object carries the new material
             bpy.context.view_layer.update()
 
             # Get the list of texture maps
@@ -3232,7 +6827,7 @@ class BlenderMCPServer:
                     connections = []
                     for output in node.outputs:
                         for link in output.links:
-                            connections.append(f"{output.name} → {link.to_node.name}.{link.to_socket.name}")
+                            connections.append(f"{output.name} -> {link.to_node.name}.{link.to_socket.name}")
 
                     material_info["texture_nodes"].append({
                         "name": node.name,
@@ -3273,7 +6868,7 @@ class BlenderMCPServer:
         """Get the current status of Hyper3D Rodin integration"""
         enabled = bpy.context.scene.blendermcp_use_hyper3d
         if enabled:
-            if not bpy.context.scene.blendermcp_hyper3d_api_key:
+            if not _secret('hyper3d_api_key'):
                 return {
                     "enabled": False,
                     "message": """Hyper3D Rodin integration is currently enabled, but API key is not given. To enable it:
@@ -3284,7 +6879,7 @@ class BlenderMCPServer:
                 }
             mode = bpy.context.scene.blendermcp_hyper3d_mode
             message = f"Hyper3D Rodin integration is enabled and ready to use. Mode: {mode}. " + \
-                f"Key type: {'private' if bpy.context.scene.blendermcp_hyper3d_api_key != RODIN_FREE_TRIAL_KEY else 'free_trial'}"
+                f"Key type: {'private' if _secret('hyper3d_api_key') != RODIN_FREE_TRIAL_KEY else 'free_trial'}"
             return {
                 "enabled": True,
                 "message": message
@@ -3329,7 +6924,7 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://hyperhuman.deemos.com/api/v2/rodin",
                 headers={
-                    "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Bearer {_secret('hyper3d_api_key')}",
                 },
                 files=files
             )
@@ -3357,7 +6952,7 @@ class BlenderMCPServer:
             response = requests.post(
                 "https://queue.fal.run/fal-ai/hyper3d/rodin",
                 headers={
-                    "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                    "Authorization": f"Key {_secret('hyper3d_api_key')}",
                     "Content-Type": "application/json",
                 },
                 json=req_data
@@ -3381,7 +6976,7 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/status",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {_secret('hyper3d_api_key')}",
             },
             json={
                 "subscription_key": subscription_key,
@@ -3397,7 +6992,7 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}/status",
             headers={
-                "Authorization": f"KEY {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"KEY {_secret('hyper3d_api_key')}",
             },
         )
         data = response.json()
@@ -3416,7 +7011,6 @@ class BlenderMCPServer:
 
         # Get all imported objects
         imported_objects = list(set(bpy.data.objects) - existing_objects)
-        # imported_objects = [obj for obj in bpy.context.view_layer.objects if obj.select_get()]
 
         if not imported_objects:
             print("Error: No objects were imported.")
@@ -3484,7 +7078,7 @@ class BlenderMCPServer:
         response = requests.post(
             "https://hyperhuman.deemos.com/api/v2/download",
             headers={
-                "Authorization": f"Bearer {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Bearer {_secret('hyper3d_api_key')}",
             },
             json={
                 'task_uuid': task_uuid
@@ -3550,7 +7144,7 @@ class BlenderMCPServer:
         response = requests.get(
             f"https://queue.fal.run/fal-ai/hyper3d/requests/{request_id}",
             headers={
-                "Authorization": f"Key {bpy.context.scene.blendermcp_hyper3d_api_key}",
+                "Authorization": f"Key {_secret('hyper3d_api_key')}",
             }
         )
         data_ = response.json()
@@ -3608,7 +7202,7 @@ class BlenderMCPServer:
     def get_sketchfab_status(self):
         """Get the current status of Sketchfab integration"""
         enabled = bpy.context.scene.blendermcp_use_sketchfab
-        api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+        api_key = _secret('sketchfab_api_key')
 
         # Test the API key if present
         if api_key:
@@ -3670,7 +7264,7 @@ class BlenderMCPServer:
     def search_sketchfab_models(self, query, categories=None, count=20, downloadable=True):
         """Search for models on Sketchfab based on query and optional filters"""
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = _secret('sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -3734,7 +7328,7 @@ class BlenderMCPServer:
         try:
             import base64
             
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = _secret('sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -3824,7 +7418,7 @@ class BlenderMCPServer:
         - target_size: The target size in Blender units (meters) for the largest dimension
         """
         try:
-            api_key = bpy.context.scene.blendermcp_sketchfab_api_key
+            api_key = _secret('sketchfab_api_key')
             if not api_key:
                 return {"error": "Sketchfab API key is not configured"}
 
@@ -3975,7 +7569,7 @@ class BlenderMCPServer:
                     scale_factor = target_size / max_dimension
                     scale_applied = scale_factor
                     
-                    # ✅ Only apply scale to ROOT objects (not children!)
+                    # Only apply scale to ROOT objects (not children!)
                     # Child objects inherit parent's scale through matrix_world
                     for root in root_objects:
                         root.scale = (
@@ -4047,7 +7641,7 @@ class BlenderMCPServer:
         if enabled:
             match hunyuan3d_mode:
                 case "OFFICIAL_API":
-                    if not bpy.context.scene.blendermcp_hunyuan3d_secret_id or not bpy.context.scene.blendermcp_hunyuan3d_secret_key:
+                    if not _secret('hunyuan3d_secret_id') or not _secret('hunyuan3d_secret_key'):
                         return {
                             "enabled": False, 
                             "mode": hunyuan3d_mode, 
@@ -4127,7 +7721,7 @@ class BlenderMCPServer:
                             signed_headers + "\n" +
                             hashed_request_payload)
 
-        # ************* Step 2: Construct the reception signature string *************
+        # ************* Step 2: Build the string to sign (TC3-HMAC-SHA256) *************
         credential_scope = f"{date}/{service}/tc3_request"
         hashed_canonical_request = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
         string_to_sign = ("TC3-HMAC-SHA256" + "\n" +
@@ -4182,8 +7776,8 @@ class BlenderMCPServer:
         image: str = None
     ):
         try:
-            secret_id = bpy.context.scene.blendermcp_hunyuan3d_secret_id
-            secret_key = bpy.context.scene.blendermcp_hunyuan3d_secret_key
+            secret_id = _secret('hunyuan3d_secret_id')
+            secret_key = _secret('hunyuan3d_secret_key')
 
             if not secret_id or not secret_key:
                 return {"error": "SecretId or SecretKey is not given"}
@@ -4333,8 +7927,8 @@ class BlenderMCPServer:
         """Call the job status API to get the job status"""
         print(job_id)
         try:
-            secret_id = bpy.context.scene.blendermcp_hunyuan3d_secret_id
-            secret_key = bpy.context.scene.blendermcp_hunyuan3d_secret_key
+            secret_id = _secret('hunyuan3d_secret_id')
+            secret_key = _secret('hunyuan3d_secret_key')
 
             if not secret_id or not secret_key:
                 return {"error": "SecretId or SecretKey is not given"}
@@ -4411,7 +8005,7 @@ class BlenderMCPServer:
                 return {"succeed": False, "error": "OBJ file not found after extraction"}
 
             # Import obj file
-            if bpy.app.version>=(4, 0, 0):
+            if self._op_exists(bpy.ops.wm.obj_import):
                 bpy.ops.wm.obj_import(filepath=obj_file_path)
             else:
                 bpy.ops.import_scene.obj(filepath=obj_file_path)
@@ -4452,12 +8046,37 @@ class BlenderMCPServer:
 
 # Blender Addon Preferences (no settings; everything lives in the sidebar panel)
 class BLENDERMCP_AddonPreferences(bpy.types.AddonPreferences):
+    """Port, autostart and API keys: user preferences, never written into .blend files."""
     bl_idname = __name__
+
+    port: bpy.props.IntProperty(
+        name="Port", description="TCP port the BlenderMCP server listens on (127.0.0.1)",
+        default=_DEFAULT_PORT, min=1024, max=65535)
+    autostart_server: bpy.props.BoolProperty(
+        name="Start server automatically",
+        description="Start the MCP socket server when Blender starts (never in --background)",
+        default=True)
+    hyper3d_api_key: bpy.props.StringProperty(
+        name="Hyper3D API Key", subtype='PASSWORD', description="API Key provided by Hyper3D", default="")
+    sketchfab_api_key: bpy.props.StringProperty(
+        name="Sketchfab API Key", subtype='PASSWORD', description="API Key provided by Sketchfab", default="")
+    hunyuan3d_secret_id: bpy.props.StringProperty(
+        name="Hunyuan 3D SecretId", subtype='PASSWORD', description="SecretId provided by Hunyuan 3D", default="")
+    hunyuan3d_secret_key: bpy.props.StringProperty(
+        name="Hunyuan 3D SecretKey", subtype='PASSWORD', description="SecretKey provided by Hunyuan 3D", default="")
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Configure the server port and integrations in the 3D Viewport sidebar (N) > BlenderMCP.",
-                     icon='INFO')
+        layout.prop(self, "port")
+        layout.prop(self, "autostart_server")
+        box = layout.box()
+        box.label(text="API keys (stored in your preferences, never in .blend files)", icon='LOCKED')
+        box.prop(self, "hyper3d_api_key")
+        box.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Use the Hyper3D free trial key")
+        box.prop(self, "sketchfab_api_key")
+        box.prop(self, "hunyuan3d_secret_id")
+        box.prop(self, "hunyuan3d_secret_key")
+        layout.label(text="Per-file integration toggles: 3D Viewport sidebar (N) > BlenderMCP.", icon='INFO')
         layout.label(text="This fork sends no telemetry.", icon='CHECKMARK')
 
 # Blender UI Panel
@@ -4472,37 +8091,37 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        layout.prop(scene, "blendermcp_port")
         layout.prop(scene, "blendermcp_use_polyhaven", text="Use assets from Poly Haven")
 
         layout.prop(scene, "blendermcp_use_hyper3d", text="Use Hyper3D Rodin 3D model generation")
         if scene.blendermcp_use_hyper3d:
             layout.prop(scene, "blendermcp_hyper3d_mode", text="Rodin Mode")
-            layout.prop(scene, "blendermcp_hyper3d_api_key", text="API Key")
-            layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Set Free Trial API Key")
+            layout.label(text="API key: Preferences > Add-ons > Blender MCP", icon='LOCKED')
+            layout.operator("blendermcp.set_hyper3d_free_trial_api_key", text="Use the free trial key")
 
         layout.prop(scene, "blendermcp_use_sketchfab", text="Use assets from Sketchfab")
         if scene.blendermcp_use_sketchfab:
-            layout.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
+            layout.label(text="API key: Preferences > Add-ons > Blender MCP", icon='LOCKED')
 
         layout.prop(scene, "blendermcp_use_hunyuan3d", text="Use Tencent Hunyuan 3D model generation")
         if scene.blendermcp_use_hunyuan3d:
             layout.prop(scene, "blendermcp_hunyuan3d_mode", text="Hunyuan3D Mode")
             if scene.blendermcp_hunyuan3d_mode == 'OFFICIAL_API':
-                layout.prop(scene, "blendermcp_hunyuan3d_secret_id", text="SecretId")
-                layout.prop(scene, "blendermcp_hunyuan3d_secret_key", text="SecretKey")
+                layout.label(text="SecretId / SecretKey: Preferences > Add-ons > Blender MCP", icon='LOCKED')
             if scene.blendermcp_hunyuan3d_mode == 'LOCAL_API':
                 layout.prop(scene, "blendermcp_hunyuan3d_api_url", text="API URL")
                 layout.prop(scene, "blendermcp_hunyuan3d_octree_resolution", text="Octree Resolution")
                 layout.prop(scene, "blendermcp_hunyuan3d_num_inference_steps", text="Number of Inference Steps")
                 layout.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
                 layout.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
-        
-        if not scene.blendermcp_server_running:
-            layout.operator("blendermcp.start_server", text="Connect to MCP server")
+
+        # Runtime truth, never a saved Scene flag
+        if not _server_running():
+            layout.operator("blendermcp.start_server", text=f"Connect to MCP server (port {_port()})")
         else:
             layout.operator("blendermcp.stop_server", text="Disconnect from MCP server")
-            layout.label(text=f"Running on port {scene.blendermcp_port}")
+            srv = bpy.types.blendermcp_server
+            layout.label(text=f"Running on {srv.host}:{srv.port}")
 
 # Operator to set Hyper3D API Key
 class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
@@ -4510,7 +8129,11 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
     bl_label = "Set Free Trial API Key"
 
     def execute(self, context):
-        context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        prefs = _prefs()
+        if prefs is not None:
+            prefs.hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        else:
+            context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
         context.scene.blendermcp_hyper3d_mode = 'MAIN_SITE'
         self.report({'INFO'}, "API Key set successfully!")
         return {'FINISHED'}
@@ -4522,17 +8145,12 @@ class BLENDERMCP_OT_StartServer(bpy.types.Operator):
     bl_description = "Start the BlenderMCP server to connect with Claude"
 
     def execute(self, context):
-        scene = context.scene
-
-        # Create a new server instance
-        if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-            bpy.types.blendermcp_server = BlenderMCPServer(port=scene.blendermcp_port)
-
-        # Start the server
-        bpy.types.blendermcp_server.start()
-        scene.blendermcp_server_running = True
-
-        return {'FINISHED'}
+        info = ensure_server()
+        if info.get("running"):
+            self.report({'INFO'}, f"BlenderMCP server running on {info['host']}:{info['port']}")
+            return {'FINISHED'}
+        self.report({'ERROR'}, f"BlenderMCP server could not start: {info.get('error')}")
+        return {'CANCELLED'}
 
 # Operator to stop the server
 class BLENDERMCP_OT_StopServer(bpy.types.Operator):
@@ -4541,31 +8159,18 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
     bl_description = "Stop the connection to Claude"
 
     def execute(self, context):
-        scene = context.scene
-
         # Stop the server if it exists
         if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
             bpy.types.blendermcp_server.stop()
             del bpy.types.blendermcp_server
-
-        scene.blendermcp_server_running = False
-
         return {'FINISHED'}
 
 # Registration functions
 def register():
-    bpy.types.Scene.blendermcp_port = IntProperty(
-        name="Port",
-        description="Port for the BlenderMCP server",
-        default=9876,
-        min=1024,
-        max=65535
-    )
-
-    bpy.types.Scene.blendermcp_server_running = bpy.props.BoolProperty(
-        name="Server Running",
-        default=False
-    )
+    # Port, autostart and API keys are add-on preferences (BLENDERMCP_AddonPreferences).
+    # The four legacy Scene secret properties below stay registered but undrawn through
+    # 2.1.x so pre-2.1 files load and migrate silently; they are removed in 2.2.0.
+    _LEGACY = "Legacy pre-2.1 storage; migrated to the add-on preferences, removed in 2.2.0"
 
     bpy.types.Scene.blendermcp_use_polyhaven = bpy.props.BoolProperty(
         name="Use Poly Haven",
@@ -4590,10 +8195,11 @@ def register():
     )
 
     bpy.types.Scene.blendermcp_hyper3d_api_key = bpy.props.StringProperty(
-        name="Hyper3D API Key",
+        name="Hyper3D API Key (legacy)",
         subtype="PASSWORD",
-        description="API Key provided by Hyper3D",
-        default=""
+        description=_LEGACY,
+        default="",
+        options={'HIDDEN'}
     )
 
     bpy.types.Scene.blendermcp_use_hunyuan3d = bpy.props.BoolProperty(
@@ -4613,16 +8219,19 @@ def register():
     )
 
     bpy.types.Scene.blendermcp_hunyuan3d_secret_id = bpy.props.StringProperty(
-        name="Hunyuan 3D SecretId",
-        description="SecretId provided by Hunyuan 3D",
-        default=""
+        name="Hunyuan 3D SecretId (legacy)",
+        subtype="PASSWORD",
+        description=_LEGACY,
+        default="",
+        options={'HIDDEN'}
     )
 
     bpy.types.Scene.blendermcp_hunyuan3d_secret_key = bpy.props.StringProperty(
-        name="Hunyuan 3D SecretKey",
+        name="Hunyuan 3D SecretKey (legacy)",
         subtype="PASSWORD",
-        description="SecretKey provided by Hunyuan 3D",
-        default=""
+        description=_LEGACY,
+        default="",
+        options={'HIDDEN'}
     )
 
     bpy.types.Scene.blendermcp_hunyuan3d_api_url = bpy.props.StringProperty(
@@ -4668,10 +8277,11 @@ def register():
     )
 
     bpy.types.Scene.blendermcp_sketchfab_api_key = bpy.props.StringProperty(
-        name="Sketchfab API Key",
+        name="Sketchfab API Key (legacy)",
         subtype="PASSWORD",
-        description="API Key provided by Sketchfab",
-        default=""
+        description=_LEGACY,
+        default="",
+        options={'HIDDEN'}
     )
 
     # Register preferences class
@@ -4682,34 +8292,52 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
 
-    # Auto-restart the server if it was running before the reload.
-    if _restart_flag_get():
-        _restart_flag_set(False)
+    # Launch hook for `blender --python-expr` (start_blender) and the load / exit handlers
+    bpy.app.driver_namespace[_ENSURE_SERVER_HOOK] = ensure_server
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
+    if hasattr(bpy.app.handlers, "exit_pre") and _on_exit_pre not in bpy.app.handlers.exit_pre:
+        bpy.app.handlers.exit_pre.append(_on_exit_pre)
+
+    # Autostart: on a cold start when the preference says so, or after an add-on reload when the
+    # server was running. Deferred through a timer because bpy.context.scene is not available
+    # inside register() at startup. Never in --background (no port opens during headless work;
+    # ensure_server() still works there when called explicitly).
+    restart = _restart_flag_get()
+    _restart_flag_set(False)
+    prefs = _prefs()
+    autostart = prefs is not None and bool(prefs.autostart_server)
+    if (restart or autostart) and not bpy.app.background:
         def _deferred_start():
             try:
-                port = bpy.context.scene.blendermcp_port
-                if not hasattr(bpy.types, "blendermcp_server") or not bpy.types.blendermcp_server:
-                    bpy.types.blendermcp_server = BlenderMCPServer(port=port)
-                bpy.types.blendermcp_server.start()
-                bpy.context.scene.blendermcp_server_running = True
-                print(f"BlenderMCP server auto-restarted on port {port}")
+                _migrate_legacy_secrets(_prefs())
+                info = ensure_server()
+                if info.get("running"):
+                    state = "started" if info.get("started_now") else "already running"
+                    print(f"BlenderMCP server {state} on {info['host']}:{info['port']}")
+                else:
+                    print(f"BlenderMCP autostart failed: {info.get('error')}")
             except Exception as e:
-                print(f"BlenderMCP auto-restart failed: {e}")
+                print(f"BlenderMCP autostart failed: {e}")
+            return None
         bpy.app.timers.register(_deferred_start, first_interval=0.5)
 
     print("BlenderMCP addon registered")
 
 def unregister():
-    # Remember whether the server was running so register() can restart it.
-    _restart_flag_set(
-        hasattr(bpy.types, "blendermcp_server")
-        and bpy.types.blendermcp_server is not None
-        and getattr(bpy.context.scene, "blendermcp_server_running", False)
-    )
+    # Remember whether the server was running so register() can restart it after a reload.
+    _restart_flag_set(_server_running())
     # Stop the server if it's running
     if hasattr(bpy.types, "blendermcp_server") and bpy.types.blendermcp_server:
         bpy.types.blendermcp_server.stop()
         del bpy.types.blendermcp_server
+
+    bpy.app.driver_namespace.pop(_ENSURE_SERVER_HOOK, None)
+    with suppress(ValueError):
+        bpy.app.handlers.load_post.remove(_on_load_post)
+    if hasattr(bpy.app.handlers, "exit_pre"):
+        with suppress(ValueError):
+            bpy.app.handlers.exit_pre.remove(_on_exit_pre)
 
     bpy.utils.unregister_class(BLENDERMCP_PT_Panel)
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
@@ -4717,8 +8345,6 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
-    del bpy.types.Scene.blendermcp_port
-    del bpy.types.Scene.blendermcp_server_running
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode

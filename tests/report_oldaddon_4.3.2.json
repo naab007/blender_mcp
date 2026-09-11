@@ -1,0 +1,1536 @@
+{
+ "summary": {
+  "blender": "4.3.2",
+  "addon": "C:/Users/Naabin/AppData/Local/Temp/claude/D--App-Dev-blender-mcp/e6a3fa82-cab1-42f8-81bb-8b22d90db78f/scratchpad/old/addon.py",
+  "addon_sha256": "37ccc659f70cb2c79054fc570f6dea3b0e2e39b81867034b24c6d158504447a7",
+  "addon_git_hash_object": "f4dc37b10ee09f1d3277a0922da396c6b3b3e129",
+  "bl_info_version": [
+   2,
+   2,
+   0
+  ],
+  "handlers": 158,
+  "steps": 186,
+  "passed": 185,
+  "failed": 1,
+  "failed_steps": [
+   {
+    "step": 171,
+    "name": "B1-4b find_unweighted render=True restores select flags (A1.3)",
+    "tag": "B1",
+    "detail": "AssertionError: select flags not restored after find_unweighted_vertices(render=True): vertices: 160 of 480 flags changed (first [0, 3, 6, 9, 12]); edges: 220 of 880 flags changed (first [1, 5, 9, 13, 17]); polygons: 201 of 402 flags changed (first [0, 2, 4, 6, 8]) |   File \"D:\\App Dev\\blender_mcp\\tests\\b1_steps.py\", line 229, in r4b /     assert not diffs, \"select flags not restored after find_unweighted_vertices(render=True): \" + \"; \".join(diffs) /            ^^^^^^^^^"
+   }
+  ],
+  "live_pass_required": [
+   "get_viewport_screenshot",
+   "capture_viewport_angle",
+   "capture_contact_sheet"
+  ],
+  "network_not_run": [
+   "create_hunyuan_job",
+   "create_rodin_job",
+   "download_polyhaven_asset",
+   "download_sketchfab_model",
+   "get_polyhaven_categories",
+   "get_sketchfab_model_preview",
+   "import_generated_asset",
+   "import_generated_asset_hunyuan",
+   "poll_hunyuan_job_status",
+   "poll_rodin_job_status",
+   "search_polyhaven_assets",
+   "search_sketchfab_models",
+   "set_texture"
+  ],
+  "workdir": "C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_w5mgyhbh"
+ },
+ "results": [
+  {
+   "step": 1,
+   "name": "M1 import + register()",
+   "status": "PASS",
+   "tag": "M1",
+   "detail": "bl_info.version=(2, 2, 0) requests=2.27.1 handlers=158",
+   "seconds": 0
+  },
+  {
+   "step": 2,
+   "name": "handler table complete",
+   "status": "PASS",
+   "detail": "158 handlers (85 in 2.0.0), 13 gated",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 3,
+   "name": "M7 no bpy.app.version comparisons",
+   "status": "PASS",
+   "detail": "0 version comparisons in addon.py (3 plain bpy.app.version/version_string reads, allowed)",
+   "tag": "M7",
+   "seconds": 0.0
+  },
+  {
+   "step": 4,
+   "name": "M12 numpy.array sites carry dtype",
+   "status": "PASS",
+   "detail": "1 numpy.array sites, all carry dtype (float64 required only where the source is mathutils): ['server.py:2150 dtype=float32']",
+   "tag": "M12",
+   "seconds": 0.01
+  },
+  {
+   "step": 5,
+   "name": "M7b legacy obj/stl operators guarded by _op_exists",
+   "status": "PASS",
+   "detail": "6 legacy obj/stl operator sites, all under an _op_exists guard",
+   "tag": "M7",
+   "seconds": 0.0
+  },
+  {
+   "step": 6,
+   "name": "F8 no tempfile._cleanup in addon.py",
+   "status": "PASS",
+   "detail": "0 hits",
+   "tag": "F8",
+   "seconds": 0.0
+  },
+  {
+   "step": 7,
+   "name": "F7 static: SeparateRGB only as _new_node fallback of SeparateColor",
+   "status": "PASS",
+   "detail": "1 code mention(s) all inside a _new_node try-list with ShaderNodeSeparateColor (comment-only lines: [6711])",
+   "tag": "F7",
+   "seconds": 0.0
+  },
+  {
+   "step": 8,
+   "name": "scene props registered",
+   "status": "PASS",
+   "detail": "enabled=False",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 9,
+   "name": "unknown command -> error",
+   "status": "PASS",
+   "detail": "Unknown command type: no_such_tool",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 10,
+   "name": "bad kwargs -> error not crash",
+   "status": "PASS",
+   "detail": "BlenderMCPServer.move_object() got an unexpected keyword argument 'bogus'",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 11,
+   "name": "integration gates closed by default",
+   "status": "PASS",
+   "detail": "13 gated commands refuse while toggles are off",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 12,
+   "name": "get_scene_info empty scene",
+   "status": "PASS",
+   "detail": "objects=0 materials=0",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 13,
+   "name": "get_object_info mesh + light",
+   "status": "PASS",
+   "detail": "cube 8/12/6 bbox ok, light has no mesh key",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 14,
+   "name": "find_objects_by_type",
+   "status": "PASS",
+   "detail": "mesh=1 light=1 armature=0",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 15,
+   "name": "measure_distance",
+   "status": "PASS",
+   "detail": "3-4-5 triangle -> 5.0; missing object rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 16,
+   "name": "get_object_info missing -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 17,
+   "name": "get_scene_info caps list at 10",
+   "status": "PASS",
+   "detail": "object_count=14 listed=10 (cap honoured)",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 18,
+   "name": "move/scale/rotate",
+   "status": "PASS",
+   "detail": "move/scale/rotate applied and reset",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 19,
+   "name": "move_object missing -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 20,
+   "name": "move_object wrong type -> error",
+   "status": "PASS",
+   "detail": "bpy_struct: item.attr = val: expected sequence items of type float, not str",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 21,
+   "name": "rotate_object bad mode -> error",
+   "status": "PASS",
+   "detail": "bpy_struct: item.attr = val: enum \"NOPE\" not found in ('QUATERNION', 'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX', 'AXIS_ANGLE')",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 22,
+   "name": "get_vertex_positions world/local/subset",
+   "status": "PASS",
+   "detail": "world = local + offset for 8 verts; subset order kept",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 23,
+   "name": "get_vertex_positions index 99 -> error",
+   "status": "PASS",
+   "detail": "Vertex indices out of range: [99] (mesh has 8 vertices)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 24,
+   "name": "get_vertex_positions index -1 -> error",
+   "status": "PASS",
+   "detail": "Vertex indices out of range: [-1] (mesh has 8 vertices)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 25,
+   "name": "get_vertex_positions non-int index -> error",
+   "status": "PASS",
+   "detail": "Vertex indices must be integers, got ['a']",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 26,
+   "name": "get_vertex_positions max_verts cap -> error",
+   "status": "PASS",
+   "detail": "Mesh has 8 vertices - exceeds max_verts=4. Pass specific indices or increase max_verts.",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 27,
+   "name": "get_vertex_positions on light -> error",
+   "status": "PASS",
+   "detail": "Lamp is not a mesh",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 28,
+   "name": "set_vertex_position world->local",
+   "status": "PASS",
+   "detail": "world (5.5,0,0) stored as local (0.5,0,0)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 29,
+   "name": "set_vertex_position index 8 -> error",
+   "status": "PASS",
+   "detail": "Vertex indices out of range: [8] (mesh has 8 vertices)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 30,
+   "name": "set_vertex_positions batch with bad entries",
+   "status": "PASS",
+   "detail": "1 updated, 2 rejected (index 42, missing index)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 31,
+   "name": "get_control_points bezier + poly",
+   "status": "PASS",
+   "detail": "bezier 3 pts with handles; poly spline index 1",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 32,
+   "name": "get_control_points spline 5 -> error",
+   "status": "PASS",
+   "detail": "Spline index 5 out of range (2 splines)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 33,
+   "name": "get_control_points on mesh -> error",
+   "status": "PASS",
+   "detail": "Cube is not a curve object (type=MESH)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 34,
+   "name": "set_control_point bezier + poly",
+   "status": "PASS",
+   "detail": "bezier co/handles/types and poly co written",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 35,
+   "name": "set_control_point index 3 -> error",
+   "status": "PASS",
+   "detail": "Point index 3 out of range (3 points)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 36,
+   "name": "set_control_point bad handle type -> error",
+   "status": "PASS",
+   "detail": "bpy_struct: item.attr = val: enum \"WOBBLY\" not found in ('FREE', 'VECTOR', 'ALIGNED', 'AUTO')",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 37,
+   "name": "edge sharp/crease/bevel round trip",
+   "status": "PASS",
+   "detail": "sharp [0,5], crease 0.7/clamped 1.0, bevel 0.25 all read back",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 38,
+   "name": "get_edges index 12 -> error",
+   "status": "PASS",
+   "detail": "Edge indices out of range: [12] (mesh has 12 edges)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 39,
+   "name": "mark_sharp_edges index -3 -> error",
+   "status": "PASS",
+   "detail": "Edge indices out of range: [-3] (mesh has 12 edges)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 40,
+   "name": "set_edge_crease on curve -> error",
+   "status": "PASS",
+   "detail": "Bez is not a mesh",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 41,
+   "name": "get_faces world/local",
+   "status": "PASS",
+   "detail": "6 quads, unit normals, world/local centers differ by offset",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 42,
+   "name": "get_faces index 6 -> error",
+   "status": "PASS",
+   "detail": "Face indices out of range: [6] (mesh has 6 faces)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 43,
+   "name": "set_face_material_index without slots -> error",
+   "status": "PASS",
+   "detail": "Material slot 0 does not exist (object has 0 slots)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 44,
+   "name": "set_face_material_index",
+   "status": "PASS",
+   "detail": "faces 0,2 -> slot 1; all -> 0; index 9 rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 45,
+   "name": "flip_normals discriminating (hand-flipped face)",
+   "status": "PASS",
+   "detail": "face 0 normal negated then restored by flip-all; others negated",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 46,
+   "name": "extrude_faces",
+   "status": "PASS",
+   "detail": "8->12 verts, 6->10 faces, top moved to z=1.5, no interior face",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 47,
+   "name": "extrude_faces empty list -> error",
+   "status": "PASS",
+   "detail": "No face indices provided",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 48,
+   "name": "inset_faces individual + region",
+   "status": "PASS",
+   "detail": "individual inset +4 faces; region inset adds faces",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 49,
+   "name": "inset_faces index 999 -> error",
+   "status": "PASS",
+   "detail": "Face indices out of range: [999] (mesh has 20 faces)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 50,
+   "name": "merge_vertices removes duplicates",
+   "status": "PASS",
+   "detail": "6 verts with 2 duplicates -> 4",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 51,
+   "name": "triangulate_mesh",
+   "status": "PASS",
+   "detail": "6 quads -> 12 tris; bad method rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 52,
+   "name": "subdivide_mesh",
+   "status": "PASS",
+   "detail": "cube cuts=1 -> 26 verts 24 faces",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 53,
+   "name": "apply_modifier",
+   "status": "PASS",
+   "detail": "SUBSURF applied -> 24 faces, modifier list empty",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 54,
+   "name": "get_mesh_stats",
+   "status": "PASS",
+   "detail": "12 tris, bbox (0..2), modifier listed",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 55,
+   "name": "handlers leave edit mode",
+   "status": "PASS",
+   "detail": "handlers left EDIT_MESH -> OBJECT twice",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 56,
+   "name": "create_camera + set_active_camera",
+   "status": "PASS",
+   "detail": "camera aims at look_at, lens 35, active",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 57,
+   "name": "set_active_camera on mesh -> error",
+   "status": "PASS",
+   "detail": "Cube is not a camera",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 58,
+   "name": "create_camera bad type -> error",
+   "status": "PASS",
+   "detail": "bpy_struct: item.attr = val: enum \"FISHEYE\" not found in ('PERSP', 'ORTHO', 'PANO')",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 59,
+   "name": "set_render_settings workbench/JPEG",
+   "status": "PASS",
+   "detail": "workbench 64x48 JPEG transparent",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 60,
+   "name": "M3 set_render_settings engine=BLENDER_EEVEE resolves on this build",
+   "status": "PASS",
+   "detail": "'BLENDER_EEVEE' -> engine=BLENDER_EEVEE_NEXT reply=BLENDER_EEVEE_NEXT taa_render_samples=3 (enum: BLENDER_EEVEE_NEXT)",
+   "tag": "M3",
+   "seconds": 0.0
+  },
+  {
+   "step": 61,
+   "name": "M3 set_render_settings engine=blender_eevee lower-case",
+   "status": "PASS",
+   "detail": "'blender_eevee' -> engine=BLENDER_EEVEE_NEXT reply=BLENDER_EEVEE_NEXT taa_render_samples=3 (enum: BLENDER_EEVEE_NEXT)",
+   "tag": "M3",
+   "seconds": 0.0
+  },
+  {
+   "step": 62,
+   "name": "M3 set_render_settings engine=eevee short alias",
+   "status": "PASS",
+   "detail": "'eevee' -> engine=BLENDER_EEVEE_NEXT reply=BLENDER_EEVEE_NEXT taa_render_samples=3 (enum: BLENDER_EEVEE_NEXT)",
+   "tag": "M3",
+   "seconds": 0.0
+  },
+  {
+   "step": 63,
+   "name": "M13 set_render_settings engine='' -> error",
+   "status": "PASS",
+   "detail": "engine must be a non-empty string; valid: ['BLENDER_EEVEE_NEXT', 'BLENDER_WORKBENCH', 'CYCLES']",
+   "tag": "M13",
+   "seconds": 0.0
+  },
+  {
+   "step": 64,
+   "name": "M3 set_render_settings lowercase cycles + workbench alias, reply engine key",
+   "status": "PASS",
+   "detail": "'cycles' -> CYCLES samples=4 reply engine=CYCLES; 'workbench' -> BLENDER_WORKBENCH",
+   "tag": "M3",
+   "seconds": 0.0
+  },
+  {
+   "step": 65,
+   "name": "M3 set_render_settings bogus engine -> error listing enum",
+   "status": "PASS",
+   "detail": "error lists live enum: engine 'BLENDER_BOGUS' not valid (tried ['BLENDER_BOGUS', 'BLENDER_BLENDER_BOGUS']); valid: ['BLENDER_EEVEE_NEXT', 'BLENDER_WORKBENCH', 'CYCLES']. Add-on engine",
+   "tag": "M3",
+   "seconds": 0.0
+  },
+  {
+   "step": 66,
+   "name": "M6 set_render_settings still formats",
+   "status": "PASS",
+   "detail": "still formats PNG,JPEG,OPEN_EXR,TIFF",
+   "tag": "M6",
+   "seconds": 0.0
+  },
+  {
+   "step": 67,
+   "name": "M6 set_render_settings FFMPEG video format",
+   "status": "PASS",
+   "detail": "FFMPEG accepted (media_type=None) then PNG (media_type=None)",
+   "tag": "M6",
+   "seconds": 0.0
+  },
+  {
+   "step": 68,
+   "name": "M6 render_from_camera 48x32 PNG + settings restored",
+   "status": "PASS",
+   "detail": "48x32 std=0.216 clusters=14 alpha_cov=1.00; settings restored (file_format=JPEG media_type=None)",
+   "tag": "M6",
+   "seconds": 2.61
+  },
+  {
+   "step": 69,
+   "name": "render_from_camera missing camera -> error",
+   "status": "PASS",
+   "detail": "Camera not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 70,
+   "name": "render_from_camera mesh as camera -> error",
+   "status": "PASS",
+   "detail": "Cube is not a camera",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 71,
+   "name": "render_from_camera no active camera -> error",
+   "status": "PASS",
+   "detail": "Scene has no active camera. Create one with create_camera / set_active_camera.",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 72,
+   "name": "render_all_cameras 2 cams",
+   "status": "PASS",
+   "detail": "2 cameras: 40x30 std=0.208 clusters=12 alpha_cov=1.00 | 40x30 std=0.262 clusters=16 alpha_cov=1.00",
+   "tag": "PLAN4",
+   "seconds": 0.02
+  },
+  {
+   "step": 73,
+   "name": "render_all_cameras bad output_dir -> error",
+   "status": "PASS",
+   "detail": "output_dir does not exist: C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_w5mgyhbh\\nope_dir",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 74,
+   "name": "M4 render_depth_map near>far, no leaks",
+   "status": "PASS",
+   "detail": "16x16 center=0.667 corner=0.004, no leaks, user scene + use_pass_z untouched",
+   "tag": "M4",
+   "seconds": 0.38
+  },
+  {
+   "step": 75,
+   "name": "M13 render_depth_map no camera -> error",
+   "status": "PASS",
+   "detail": "Scene has no active camera. Create one with create_camera / set_active_camera.",
+   "tag": "M13",
+   "seconds": 0.0
+  },
+  {
+   "step": 76,
+   "name": "add_light four types",
+   "status": "PASS",
+   "detail": "POINT/SUN/SPOT/AREA with energy, colour, radius",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 77,
+   "name": "add_light bad type -> error",
+   "status": "PASS",
+   "detail": "BlendDataLights.new(): error with keyword argument \"type\" -  enum \"LASER\" not found in ('POINT', 'SUN', 'SPOT', 'AREA')",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 78,
+   "name": "set_world_background colour + hdri",
+   "status": "PASS",
+   "detail": "solid colour node wired; missing HDRI rejected; EXR env wired",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 79,
+   "name": "add_3point_lighting",
+   "status": "PASS",
+   "detail": "3 lights with energies 10/20/30",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 80,
+   "name": "export_object/import_file 6 formats round trip",
+   "status": "PASS",
+   "detail": "round trip ok, imported dims 2.0: glb:1392B gltf:1063B fbx:11276B obj:596B stl:684B ply:409B",
+   "tag": "PLAN4",
+   "seconds": 0.11
+  },
+  {
+   "step": 81,
+   "name": "export_object bad format -> error",
+   "status": "PASS",
+   "detail": "Unsupported format: dae. Choose from: ['glb', 'gltf', 'fbx', 'obj', 'stl', 'ply']",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 82,
+   "name": "export_object missing object -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 83,
+   "name": "import_file missing -> error",
+   "status": "PASS",
+   "detail": "File not found: C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_w5mgyhbh\\nope.glb",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 84,
+   "name": "import_file .txt -> error",
+   "status": "PASS",
+   "detail": "Unsupported file extension: .txt. Choose from: ['.glb', '.gltf', '.fbx', '.obj', '.stl', '.ply', '.blend', '.bvh']",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 85,
+   "name": "import_file .blend append",
+   "status": "PASS",
+   "detail": "appended RT.001 from lib.blend",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 86,
+   "name": "save_blend adds .blend",
+   "status": "PASS",
+   "detail": "saved to saved.blend (465784 bytes)",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 87,
+   "name": "load_blend missing -> error",
+   "status": "PASS",
+   "detail": "File not found: C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_harness_w5mgyhbh\\nope.blend",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 88,
+   "name": "load_blend non-blend -> error",
+   "status": "PASS",
+   "detail": "load_blend only accepts .blend files. Use import_file for 3D model formats.",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 89,
+   "name": "load_blend restores saved state",
+   "status": "PASS",
+   "detail": "reloaded: 14 objects, Extra gone, props alive (guard: refused while dirty)",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 90,
+   "name": "add_primitive 9 types",
+   "status": "PASS",
+   "detail": "cube:8v plane:4v circle:32v sphere:482v ico_sphere:42v cylinder:64v cone:33v torus:576v monkey:507v",
+   "tag": "PLAN4",
+   "seconds": 0.03
+  },
+  {
+   "step": 91,
+   "name": "add_primitive unknown -> error",
+   "status": "PASS",
+   "detail": "Unknown primitive 'dodecahedron'. Choose from: ['cube', 'plane', 'circle', 'sphere', 'ico_sphere', 'cylinder', 'cone', 'torus', 'monkey']",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 92,
+   "name": "delete_object purges",
+   "status": "PASS",
+   "detail": "object and orphan mesh gone",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 93,
+   "name": "delete_object missing -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 94,
+   "name": "duplicate_object full + linked",
+   "status": "PASS",
+   "detail": "full copy at +2 with own mesh; linked copy shares mesh",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 95,
+   "name": "join_objects",
+   "status": "PASS",
+   "detail": "16 verts in Joined",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 96,
+   "name": "join_objects missing -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 97,
+   "name": "separate_mesh LOOSE",
+   "status": "PASS",
+   "detail": "LOOSE split into 2 x 8 verts",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 98,
+   "name": "rename_object dotted + clash",
+   "status": "PASS",
+   "detail": "dotted name kept; clash reported as actual name Ground.002",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 99,
+   "name": "set_origin",
+   "status": "PASS",
+   "detail": "origin moved to geometry centre (5,0,0); bad type rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 100,
+   "name": "snap_to_ground",
+   "status": "PASS",
+   "detail": "lowest bbox point at z=0.5",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 101,
+   "name": "set_smooth_shading",
+   "status": "PASS",
+   "detail": "smooth via smooth_by_angle, then flat",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 102,
+   "name": "parent_object keep transform",
+   "status": "PASS",
+   "detail": "parented, world matrix kept",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 103,
+   "name": "select_objects",
+   "status": "PASS",
+   "detail": "deselect/select/toggle/by-type",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 104,
+   "name": "align_objects",
+   "status": "PASS",
+   "detail": "AVERAGE=4, MAX=9, bad mode rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 105,
+   "name": "M8 active object + mode kept after every mutating handler",
+   "status": "PASS",
+   "detail": "47 handlers: active restored (or = result object for the 4 creators) and OBJECT mode",
+   "tag": "M8",
+   "seconds": 0.15
+  },
+  {
+   "step": 106,
+   "name": "create_material full PBR",
+   "status": "PASS",
+   "detail": "PBR inputs set, BLENDED alpha, assigned to P_cube",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 107,
+   "name": "assign_material slot padding",
+   "status": "PASS",
+   "detail": "slot 2 padded with 2 empty slots",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 108,
+   "name": "set_object_material_color creates material",
+   "status": "PASS",
+   "detail": "material created and coloured",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 109,
+   "name": "load_texture base + normal",
+   "status": "PASS",
+   "detail": "Base Color linked, Normal via NormalMap Non-Color, bad slot/path rejected",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 110,
+   "name": "F7 runtime: set_texture ARM branch builds a 3-output separate node",
+   "status": "PASS",
+   "detail": "separate node ShaderNodeSeparateRGB (SEPRGB) with 3 outputs; G->Roughness, B->Metallic, Base Color via ShaderNodeMixRGB",
+   "tag": "F7",
+   "seconds": 0.01
+  },
+  {
+   "step": 111,
+   "name": "add_modifier props/unset/pointer",
+   "status": "PASS",
+   "detail": "bevel props set + unset reported; boolean object by name; bad type lists enum",
+   "tag": "PLAN4",
+   "seconds": 0.08
+  },
+  {
+   "step": 112,
+   "name": "boolean_operation EXACT apply",
+   "status": "PASS",
+   "detail": "EXACT -> reply solver=EXACT (enum FAST/EXACT), notch wall verts=4 total verts=16",
+   "tag": "M5",
+   "seconds": 0.01
+  },
+  {
+   "step": 113,
+   "name": "boolean_operation FAST accepted, reply names live solver",
+   "status": "PASS",
+   "detail": "FAST -> reply solver=FAST (enum FAST/EXACT), notch wall verts=4 total verts=16",
+   "tag": "M5",
+   "seconds": 0.01
+  },
+  {
+   "step": 114,
+   "name": "boolean_operation FLOAT accepted, reply names live solver",
+   "status": "PASS",
+   "detail": "FLOAT -> reply solver=FAST (enum FAST/EXACT), notch wall verts=4 total verts=16",
+   "tag": "M5",
+   "seconds": 0.01
+  },
+  {
+   "step": 115,
+   "name": "boolean_operation lowercase 'fast' accepted",
+   "status": "PASS",
+   "detail": "fast -> reply solver=FAST (enum FAST/EXACT), notch wall verts=4 total verts=16",
+   "tag": "M13",
+   "seconds": 0.01
+  },
+  {
+   "step": 116,
+   "name": "boolean_operation MANIFOLD per ruling",
+   "status": "PASS",
+   "detail": "MANIFOLD absent on this build, error lists enum",
+   "tag": "M5",
+   "seconds": 0.0
+  },
+  {
+   "step": 117,
+   "name": "boolean_operation bogus solver -> error listing enum",
+   "status": "PASS",
+   "detail": "error lists live enum, no modifier left, cutter kept: solver 'BOGUS' not valid; valid: ['FAST', 'EXACT'] (FAST and FLOAT are accepted as aliases of each o",
+   "tag": "M5",
+   "seconds": 0.0
+  },
+  {
+   "step": 118,
+   "name": "boolean_operation apply=False",
+   "status": "PASS",
+   "detail": "modifier kept with solver=FAST (== reply), cutter kept",
+   "tag": "BREAK3",
+   "seconds": 0.0
+  },
+  {
+   "step": 119,
+   "name": "boolean_operation missing target -> error",
+   "status": "PASS",
+   "detail": "Target not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 120,
+   "name": "add_keyframe vector/scalar/dotted",
+   "status": "PASS",
+   "detail": "location interpolates to (2,2,2) at 15; rotation degrees; data.energy keyed on light data",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 121,
+   "name": "add_keyframe wrong arity -> error",
+   "status": "PASS",
+   "detail": "location expects 3 values, got a single number",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 122,
+   "name": "add_keyframe bad path -> error",
+   "status": "PASS",
+   "detail": "Cannot resolve 'no.such.path' on Anim: Object.path_resolve(\"no.such\") could not be resolved",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 123,
+   "name": "add_keyframe missing object -> error",
+   "status": "PASS",
+   "detail": "Object not found: Nope",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 124,
+   "name": "set_frame",
+   "status": "PASS",
+   "detail": "frame 33",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 125,
+   "name": "create_collection + move_to_collection",
+   "status": "PASS",
+   "detail": "nested collections; objects moved exclusively; string name accepted",
+   "tag": "PLAN4",
+   "seconds": 0.01
+  },
+  {
+   "step": 126,
+   "name": "execute_code",
+   "status": "PASS",
+   "detail": "stdout captured; exception surfaced",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 127,
+   "name": "store/get_reference_image",
+   "status": "PASS",
+   "detail": "store/get round trip, misses rejected",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 128,
+   "name": "integration status handlers",
+   "status": "PASS",
+   "detail": "status handlers follow toggles/keys; polyhaven bad asset_type rejected without network",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 129,
+   "name": "get_viewport_screenshot headless graceful",
+   "status": "PASS",
+   "detail": "graceful headless error: Operator bpy.ops.screen.screenshot_area.poll() failed, context is incorrect",
+   "tag": "LIVE",
+   "seconds": 0.0
+  },
+  {
+   "step": 130,
+   "name": "get_viewport_screenshot no filepath -> error",
+   "status": "PASS",
+   "detail": "No filepath provided",
+   "tag": "LIVE",
+   "seconds": 0.0
+  },
+  {
+   "step": 131,
+   "name": "capture_viewport_angle/contact_sheet headless graceful",
+   "status": "PASS",
+   "detail": "front: Viewport capture needs a GUI session: screen.scree | bad angle: Unknown angle: sideways. Choose from: ['front', 'b | sheet (success envelope with per-angle errors (B1-A L1 shape)): Viewport capture needs a GUI session: screen.scree",
+   "tag": "LIVE",
+   "seconds": 0.0
+  },
+  {
+   "step": 132,
+   "name": "quit_blender defers via timer",
+   "status": "PASS",
+   "detail": "quit deferred via timer (intercepted), prefs toggled and restored",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 133,
+   "name": "final invariants",
+   "status": "PASS",
+   "detail": "1 scene, OBJECT mode, no mcp node groups",
+   "tag": "PLAN4",
+   "seconds": 0.0
+  },
+  {
+   "step": 134,
+   "name": "B0-1 get_file_state unsaved default",
+   "status": "PASS",
+   "detail": "is_saved=False filepath='' is_dirty=True (recorded, C3) file_version=[3, 6, 10]",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 135,
+   "name": "B0-2 save_blend compress=True vs save_copy compress=False",
+   "status": "PASS",
+   "detail": "a.blend 83859B compressed < a_raw.blend 403412B; is_dirty after save=True (S21 recorded)",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 136,
+   "name": "B0-3 load_blend dirty guard + force",
+   "status": "PASS",
+   "detail": "is_dirty=True -> refused without force (Unsaved changes in C:\\Users\\Naabin\\AppData\\Local\\Temp\\mcp_ha); force=True reloaded (discarded=True), file version [4, 3, 34]",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 137,
+   "name": "B0-4 save_version x2 + sidecar + list_versions",
+   "status": "PASS",
+   "detail": "a_v001/a_v002 + sidecar with 2 entries, working path unchanged, list_versions=2",
+   "tag": "B0",
+   "seconds": 0.02
+  },
+  {
+   "step": 138,
+   "name": "B0-5 save_blend incremental -> a1.blend (C14)",
+   "status": "PASS",
+   "detail": "a.blend -> a1.blend (Blender's own naming), reloaded a.blend",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 139,
+   "name": "B0-6 new_file(empty) + revert_file refusal + load back",
+   "status": "PASS",
+   "detail": "empty file 0 objects; revert refused (revert_file needs a saved file; this file has neve); a.blend back with B0Cube",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 140,
+   "name": "B0-7 append_from_blend list_only + append",
+   "status": "PASS",
+   "detail": "open-file refusal surfaced; list_only(a_raw) shows B0Cube; appended into empty file -> 1 object; unknown name reported under missing, nothing added",
+   "tag": "B0",
+   "seconds": 0.03
+  },
+  {
+   "step": 141,
+   "name": "B0-7b link_from_blend",
+   "status": "PASS",
+   "detail": "link_from_blend linked B0Cube from a_raw.blend (library present), reloaded a.blend",
+   "tag": "B0",
+   "seconds": 0.02
+  },
+  {
+   "step": 142,
+   "name": "B0-8 describe/get/set_settings RENDER",
+   "status": "PASS",
+   "detail": "resolution_x INT with range; set 1280 + engine BOGUS unset listing engines; read-only refused (none found); get_settings keys filter",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 143,
+   "name": "B0-9 settings_snapshot + set_render_quality + settings_restore",
+   "status": "PASS",
+   "detail": "snapshot/preview(25%%)/restore -> 77%% and 123 samples; _before_quality listed; delete ok",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 144,
+   "name": "B0-10 list/apply_blender_preset",
+   "status": "PASS",
+   "detail": "render preset 'HDTV_1080p' applied -> 1920x1080; unknown preset rejected (server-side save/load/list_preset in test_b0_server.py)",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 145,
+   "name": "B0-11 set_color_management try-assign",
+   "status": "PASS",
+   "detail": "Standard by assignment, read back via get_settings(COLOR); bogus lists live tuple; AgX+exposure+gamma",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 146,
+   "name": "B0-12 set/get_project_profile",
+   "status": "PASS",
+   "detail": "UNREAL profile stored, scale_length 0.01, sidecar written, read back after save+load; bad target rejected",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 147,
+   "name": "B0-13 enable/disable_addon rigify without persisting (C13)",
+   "status": "PASS",
+   "detail": "rigify enabled (is_dirty True -> reported True), listed, disabled; userpref.blend untouched; unknown module: could not enable 'no_such_addon_xyz': Add-on not l",
+   "tag": "B0",
+   "seconds": 0.09
+  },
+  {
+   "step": 148,
+   "name": "B0-14 save_preferences refuses without confirm",
+   "status": "PASS",
+   "detail": "refused: save_preferences writes userpref.blend; pass confirm=True to; preferences_dirty=True use_preferences_save=True",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 149,
+   "name": "B0-15a addon settings, no Scene secrets",
+   "status": "PASS",
+   "detail": "no Scene port/running props (legacy secret props registered, values {'blendermcp_hyper3d_api_key': '', 'blendermcp_sketchfab_api_key': '', 'blendermcp_hunyuan3d_secret_id': '', 'blendermcp_hunyuan3d_secret_key': ''}); prefs real via addons entry: port 9877 set+read, secret set but never echoed, _secret reads prefs first",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 150,
+   "name": "B0-15b secrets migration headless skip + fallback read",
+   "status": "PASS",
+   "detail": "helper(None) skipped ([]); helper(prefs) moved legacy123 into prefs and blanked the scene prop (['hyper3d_api_key'])",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 151,
+   "name": "B0-16 get/apply_session_state",
+   "status": "PASS",
+   "detail": "C17 names: frame/selection/active captured and re-applied; missing object reported by name",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 152,
+   "name": "B0-16b session dict round trip on Ton's landed names (naming seam open)",
+   "status": "PASS",
+   "detail": "landed names: state captured (frame 7, B0Cube selected), re-applied, missing object reported",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 153,
+   "name": "B0-16c get/set_addon_preferences (cycles)",
+   "status": "PASS",
+   "detail": "cycles prefs read; compute_device_type set, unknown key unset, not persisted; unknown module rejected",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 154,
+   "name": "B0-16d restore_session_state reopens the file with the dirty guard (C31)",
+   "status": "PASS",
+   "detail": "refused while dirty without force (Unsaved changes in <never-saved file> would be los); force=True reopened a.blend (file_loaded=True, DirtyC31 gone, frame 9 restored); load_file=False -> file_loaded False",
+   "tag": "B0",
+   "seconds": 0.02
+  },
+  {
+   "step": 155,
+   "name": "B0-18 list_render_devices + set_render_device",
+   "status": "PASS",
+   "detail": "3 devices listed; CPU set; METAL refused on Windows (backend 'METAL' not valid: bpy_struct: i)",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 156,
+   "name": "B0-19 get_version + PROTOCOL=1",
+   "status": "PASS",
+   "detail": "addon 2.2.0 protocol 1 blender 4.3.2 python 3.11.9",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 157,
+   "name": "B0-20 ensure_server_running port=0",
+   "status": "PASS",
+   "detail": "started on 127.0.0.1:53252 (started_now=True), socket accepted, second call idempotent, stopped",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 158,
+   "name": "B0-21 get_scene_info file block + extended set_render_settings + C11 tools",
+   "status": "PASS",
+   "detail": "file + settings_summary present; 7 extended render params applied; set_frame_range / set_scene_units (C11)",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 159,
+   "name": "B0-22 set_output_settings FFMPEG then PNG",
+   "status": "PASS",
+   "detail": "FFMPEG/H264 (media_type=None) then PNG RGB 16-bit compression 50 (media_type=None)",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 160,
+   "name": "B0-23 pack/unpack/paths/find_missing_files",
+   "status": "PASS",
+   "detail": "pack/find_missing/relative/absolute/unpack ok; bad unpack method rejected",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 161,
+   "name": "B0-24 set_autosave without persist",
+   "status": "PASS",
+   "detail": "autosave prefs applied in memory only, userpref.blend untouched",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 162,
+   "name": "B0-25 workspaces, viewport defaults, simplify",
+   "status": "PASS",
+   "detail": "11 workspaces, Layout set, bad name rejected; viewport defaults reply {\"success\": true, \"areas\": 1}; simplify on/off",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 163,
+   "name": "B0-26 new_file guard + recover_file graceful",
+   "status": "PASS",
+   "detail": "new_file dirty guard; recover_file BOGUS -> mode 'BOGUS' not valid; valid: ['LAST_SESSION', 'A; AUTOSAVE missing file -> AUTOSAVE needs an existing filepath (see get_file_",
+   "tag": "B0",
+   "seconds": 0.01
+  },
+  {
+   "step": 164,
+   "name": "B0-27 every B0 addon command is dispatchable",
+   "status": "PASS",
+   "detail": "49 B0 handlers present",
+   "tag": "B0",
+   "seconds": 0.0
+  },
+  {
+   "step": 165,
+   "name": "B1-1 create_armature 3-bone chain",
+   "status": "PASS",
+   "detail": "Arm with upper/fore/hand, fore+hand connected, reply names only",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 166,
+   "name": "B1-1b add_bones collision/snap + delete_bones",
+   "status": "PASS",
+   "detail": "collision -> hand.001 reported, connected snap reported, bad parent rejected, delete_bones back to 3",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 167,
+   "name": "B1-2 get_armature_info",
+   "status": "PASS",
+   "detail": "3 bones in order, parents/connected/length/children, pose block on filter, names only",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 168,
+   "name": "B1-2b set_bone_properties",
+   "status": "PASS",
+   "detail": "roll 30 deg set and read back via get_armature_info (30.00), rename, self-parent refused, renamed back",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 169,
+   "name": "B1-3 bind_armature AUTO + get_vertex_groups",
+   "status": "PASS",
+   "detail": "ARMATURE modifier + parent, 3 groups with verts and has_bone, active restored",
+   "tag": "B1",
+   "seconds": 0.01
+  },
+  {
+   "step": 170,
+   "name": "B1-4 find_unweighted_vertices",
+   "status": "PASS",
+   "detail": "0 unweighted after AUTO; vertex 0 stripped -> reported as the one unweighted",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 171,
+   "name": "B1-4b find_unweighted render=True restores select flags (A1.3)",
+   "status": "FAIL",
+   "detail": "AssertionError: select flags not restored after find_unweighted_vertices(render=True): vertices: 160 of 480 flags changed (first [0, 3, 6, 9, 12]); edges: 220 of 880 flags changed (first [1, 5, 9, 13, 17]); polygons: 201 of 402 flags changed (first [0, 2, 4, 6, 8]) |   File \"D:\\App Dev\\blender_mcp\\tests\\b1_steps.py\", line 229, in r4b /     assert not diffs, \"select flags not restored after find_unweighted_vertices(render=True): \" + \"; \".join(diffs) /            ^^^^^^^^^",
+   "tag": "B1",
+   "seconds": 0.01
+  },
+  {
+   "step": 172,
+   "name": "B1-5 set/get_vertex_weights",
+   "status": "PASS",
+   "detail": "5 weights written and read back at 0.42; index 9999 rejected; create_group",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 173,
+   "name": "B1-6 add/get/remove_constraint IK",
+   "status": "PASS",
+   "detail": "IK on hand chain_count 2 read back; bad type lists types; object-level constraint add/remove",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 174,
+   "name": "B1-7 set/get/reset_pose",
+   "status": "PASS",
+   "detail": "XYZ 45deg set (mode change reported), get_pose world head matches matrix_world @ head (K20), reset clears",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 175,
+   "name": "B1-8 set_keyframes + get_animation_info (K2/K17)",
+   "status": "PASS",
+   "detail": "3 keys x 3 fcurves (K2 readback identical on this build: legacy fcurves), LINEAR on key 3, slot set on 5.x, arity rejected",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 176,
+   "name": "B1-8b get_animation_info scene + add_keyframe bone + frame range",
+   "status": "PASS",
+   "detail": "scene summary; add_keyframe(bone=) keys the pose bone in XYZ; set_frame_range",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 177,
+   "name": "B1-9 bake_action (K12)",
+   "status": "PASS",
+   "detail": "baked 1-10: 29 fcurves on all 3 bones (legacy), mode/active restored",
+   "tag": "B1",
+   "seconds": 0.01
+  },
+  {
+   "step": 178,
+   "name": "B1-10 export/import rigged FBX + glTF (K7/K8)",
+   "status": "PASS",
+   "detail": "FBX round trip brought an ARMATURE + action; SMOOTH_GROUP rejected with the live enum (4.x); L2 form: disable_bone_shape suppressed the Icosphere, bone_shape_objects=[]",
+   "tag": "B1",
+   "seconds": 0.11
+  },
+  {
+   "step": 179,
+   "name": "B1-11 playblast headless camera fallback (K9)",
+   "status": "PASS",
+   "detail": "4 frames via camera fallback, all non-blank (48x32 std=0.098 clusters=11 alpha_cov=0.08), frame restored, no leaks",
+   "tag": "B1",
+   "seconds": 0.04
+  },
+  {
+   "step": 180,
+   "name": "B1-12 section-2 fixes: get_object_info, parent_object BONE, overlay restore",
+   "status": "PASS",
+   "detail": "get_object_info rig keys on ARMATURE/MESH; parent_object BONE; overlay param restores state on failure",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 181,
+   "name": "B1-12b render_weight_map headless graceful",
+   "status": "PASS",
+   "detail": "graceful headless error (Viewport capture needs a GUI session: screen.scree), mode/active restored, unknown group rejected (LIVE PASS REQUIRED for the image)",
+   "tag": "LIVE",
+   "seconds": 0.03
+  },
+  {
+   "step": 182,
+   "name": "B1-13 mirror_bones symmetrize (K6, L4)",
+   "status": "PASS",
+   "detail": "mirror_bones absent: Tier 2 L4 not in this run per ruling 13:56 (K6 symmetrize unverified through a tool)",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 183,
+   "name": "B1-14 import_file .bvh (K10)",
+   "status": "PASS",
+   "detail": "BVH imported as an armature; with io_anim_bvh disabled the error names the add-on (K10)",
+   "tag": "B1",
+   "seconds": 0.01
+  },
+  {
+   "step": 184,
+   "name": "B1-15 M8 sweep over rigging handlers",
+   "status": "PASS",
+   "detail": "12 rigging handlers keep the active object (creator = result) and OBJECT mode",
+   "tag": "B1",
+   "seconds": 0.01
+  },
+  {
+   "step": 185,
+   "name": "B1-16 every Tier 1 rigging command is dispatchable",
+   "status": "PASS",
+   "detail": "22 Tier 1 rigging handlers present",
+   "tag": "B1",
+   "seconds": 0.0
+  },
+  {
+   "step": 186,
+   "name": "M2 every addon handler exercised",
+   "status": "PASS",
+   "detail": "157 of 158 handlers exercised through execute_command; not covered by an enabled phase flag: ['set_scene_frame_range']",
+   "tag": "M2",
+   "seconds": 0.0
+  }
+ ]
+}
