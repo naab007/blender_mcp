@@ -53,4 +53,3 @@ tests/baseline_tools_2.2.txt (169). Live pass on 5.2.1 GUI:
 docs/LIVE-TEST-REPORT-2026-09-11.md.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01SLqqLddfVSsJSaEHHUQXeF
