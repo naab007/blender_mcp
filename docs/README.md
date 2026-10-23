@@ -69,7 +69,7 @@ the evidence line; until then build against the 5.2.1 diff in the migration doc.
    `598a765d`; harness 165/165 on 4.3.2 and 5.2.1; live L7-L9 pending in the user's batch).
    Its `_settings_scope` helper and secrets migration are used by everything after it.
 1. Rigging and animation Tier 1: DONE as 2.2.0 (`PLAN.md` section 10; committed `3459566`, deployed 2026-09-11, unreleased)
-2. Engine readiness Tier 1 (validation, LODs, collision, sockets, export presets): DONE headless as 2.4.0 (team lohjud, B2-G3 passed 2026-10-22; `PLAN.md` section 13; frozen pair addon `2a97736c` / server `8e3ca441`, 204 tools, harness 253/253 on 4.3.2 and 5.2.1; G5 live pass pending; Tier 2 set deferred, `PLAN.md` 13.10). Uncommitted with 2.3.0 (one commit, user's call).
+2. Engine readiness Tier 1 (validation, LODs, collision, sockets, export presets): DONE headless as 2.4.0 (team lohjud, B2-G3 passed 2026-10-22; `PLAN.md` section 13; frozen pair addon `2a97736c` / server `8e3ca441`, 204 tools, harness 253/253 on 4.3.2 and 5.2.1; G5 live pass PASSED 2026-10-23 on both builds, committed c002722; Tier 2 set deferred, `PLAN.md` 13.10). Uncommitted with 2.3.0 (one commit, user's call).
    2a. Generic driver Tier 1 + `find` / `context_info`: DONE headless as 2.3.0 (`PLAN.md` section 12, team nosubl, 2026-10-16); events (Tier 2) = their own later stage (user directive 2026-10-21: one feature request per stage).
 3. UV and texturing Tier 1: NEXT stage, 2.5.0, starts only on the user's explicit go (stage plan `PLAN.md` 13.1 H24)
 4. Presentation and library Tier 1 (perception tools pay back immediately)
