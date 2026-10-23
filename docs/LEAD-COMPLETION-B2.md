@@ -1,6 +1,6 @@
 # Lead completion report, stage 1 (engine readiness 2.4.0), team lohjud, 2026-10-21 .. 2026-10-23
 
-STATUS: COMPLETE. B2-G3 (freeze) 2026-10-22, G3.5 (code review) 2026-10-22, G4 (docs) 2026-10-22, G5 (live) PASSED
+STATUS: COMPLETE. Commit c002722 on blender-5.2, pushed to origin 2026-10-23 (user directive). B2-G3 2026-10-22, G3.5 2026-10-22, G4 2026-10-22, G5 PASSED 2026-10-23 after a ruled reopen for four live findings. Nothing deployed to the live targets, no GitHub release.
 2026-10-23 after a ruled reopen for four live findings. Committed to blender-5.2 and pushed on the user's directive
 ("when this stage is considered complete you can upload it to git on the 5.2 branch"); nothing deployed to the live
 targets, no GitHub release.
