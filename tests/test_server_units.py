@@ -18,6 +18,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
 import blender_mcp.server as server  # noqa: E402
 import blender_mcp  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_f6_connection import RELAXED_REQUIRED_24  # noqa: E402  R-B2-22: defined once, imported here
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 BASELINE_NAMES = os.path.join(TESTS, "baseline_tools_4.3.txt")
@@ -94,7 +96,8 @@ def test_tool_schemas_match_main_snapshot():
         old = base_rows[n]["inputSchema"].get("properties", {})
         new = live_rows.get(n, {}).get("inputSchema", {}).get("properties", {})
         for p, spec in old.items():
-            if p not in new or new[p] != spec:
+            if p not in new or (new[p] != spec and p not in RELAXED_REQUIRED_24.get(n, [])):
+                # R-B2-20/22: a field listed in RELAXED_REQUIRED_24 may become optional; nothing else may change
                 schema_diff.append("%s.%s" % (n, p))
         extra = sorted(set(new) - set(old))
         if extra:
@@ -115,7 +118,7 @@ def test_tool_schemas_match_main_snapshot():
 
 # ---------------------------------------------------------------- M11 versions
 def test_versions_all_agree():
-    expected = os.environ.get("BLENDER_MCP_EXPECTED_VERSION", "2.0.0")
+    expected = os.environ.get("BLENDER_MCP_EXPECTED_VERSION", "2.4.0")   # same default as test_version_sync.py (B2 T1)
     py = re.search(r'^version\s*=\s*"([^"]+)"', open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8").read(), re.M).group(1)
     addon = re.search(r'"version":\s*\((\d+),\s*(\d+),\s*(\d+)\)', open(os.path.join(REPO, "addon.py"), encoding="utf-8").read())
     addon_v = ".".join(addon.groups())

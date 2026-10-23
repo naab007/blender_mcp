@@ -32,6 +32,8 @@ DEFAULTS = {
     "image_max_pixels": 8_000_000,
     "log_level": "INFO",
     "img_to_3d_port": 7862,
+    "driver_reply_max_chars": 24000,   # generic driver: cap sent on every reading command (G7)
+    "driver_batch_max": 200,           # generic driver: batch refused server-side above this (G7)
 }
 
 # Environment variables that override the file for a key.
@@ -40,6 +42,8 @@ ENV_KEYS = {
     "port": "BLENDER_PORT",
     "blender_exe": "BLENDER_EXE",
     "img_to_3d_port": "IMG_TO_3D_PORT",
+    "driver_reply_max_chars": "BLENDER_DRIVER_REPLY_MAX",
+    "driver_batch_max": "BLENDER_DRIVER_BATCH_MAX",
 }
 
 _lock = threading.RLock()

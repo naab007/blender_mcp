@@ -29,6 +29,74 @@ sys.path.insert(0, TESTS)
 
 BASELINE_22 = os.path.join(TESTS, "baseline_tools_2.2.txt")
 SNAPSHOT_22 = os.path.join(TESTS, "baselines", "tools_list_2.2.json")
+# R11 (2026-10-16): the exact-list assertion moves to the 2.3 baseline, cut from the real list at D-G3;
+# the 2.2 files stay on disk untouched and become the superset / byte-identical-schema check.
+BASELINE_23 = os.path.join(TESTS, "baseline_tools_2.3.txt")
+SNAPSHOT_23 = os.path.join(TESTS, "baselines", "tools_list_2.3.json")
+# T0 (2026-10-21, Lead GO m_365c9d69, R-B2-10/D4): until B2-G3 cuts the 2.4 baselines, the 2.3 files are the
+# superset pin. Additive params allowed beyond the 2.3 snapshot = EXACTLY the PLAN.md 13.2.2 lists; anything
+# else needs a ruling. The 2.2 superset test keeps its G11b allowance plus this list.
+ADDITIVE_PARAMS_24 = {
+    "export_object": ["objects", "apply_modifiers", "axis_forward", "axis_up", "global_scale", "use_tspace",
+                      "use_triangles", "use_custom_props", "colors_type", "export_apply", "export_tangents",
+                      "export_extras", "export_yup", "export_attributes", "export_vertex_color",
+                      "export_animation_mode"],
+    "import_file": ["axis_forward", "axis_up", "global_scale", "use_custom_normals", "use_image_search",
+                    "ignore_leaf_bones", "import_shading", "merge_vertices"],
+    "apply_modifier": ["apply_all", "keep"],
+    "set_origin": ["location"],
+    "get_scene_info": ["limit"],          # R-B2-32 (PLAN 13.4.1): limit: int = 10, 0 = all; forwarded only when given
+}
+# R-B2-20: a 2.3 `required` field may be DROPPED only when listed here (apply_modifier.modifier_name is optional once
+# apply_all exists); a field may never be ADDED to a 2.3 tool's required list.
+RELAXED_REQUIRED_24 = {"apply_modifier": ["modifier_name"]}
+
+
+def _required_problems(name, old_schema, new_schema, relaxed):
+    old_req, new_req = list(old_schema.get("required", [])), list(new_schema.get("required", []))
+    added = [f for f in new_req if f not in old_req]
+    dropped = [f for f in old_req if f not in new_req and f not in relaxed.get(name, [])]
+    kept = [f for f in old_req if f in new_req]
+    out = []
+    if added:
+        out.append("%s.required gained %s" % (name, added))
+    if dropped:
+        out.append("%s.required dropped %s without a RELAXED_REQUIRED_24 entry" % (name, dropped))
+    if [f for f in new_req if f in kept] != kept:
+        out.append("%s.required reordered %s -> %s" % (name, old_req, new_req))
+    return out
+
+
+def _schema_problems(snapshot_path, live, relaxed):
+    """Every 2.x tool keeps its properties (same type / anyOf / default) and its required list (RELAXED_REQUIRED_24 aside)."""
+    with open(snapshot_path, encoding="utf-8") as fh:
+        snap_by_name = {r["name"]: r for r in json.load(fh)}
+    live_by_name = {r["name"]: r for r in live}
+    problems = []
+    for name, row in snap_by_name.items():
+        old_schema, new_schema = row["inputSchema"], live_by_name[name]["inputSchema"]
+        old_props, new_props = old_schema.get("properties", {}), new_schema.get("properties", {})
+        for p, spec in old_props.items():
+            if p not in new_props:
+                problems.append("%s.%s removed" % (name, p))
+            elif (spec.get("type"), spec.get("anyOf"), spec.get("default")) != (new_props[p].get("type"), new_props[p].get("anyOf"), new_props[p].get("default")):
+                problems.append("%s.%s retyped/redefaulted %s -> %s" % (name, p, json.dumps(spec, sort_keys=True), json.dumps(new_props[p], sort_keys=True)))
+        problems += _required_problems(name, old_schema, new_schema, relaxed)
+    return problems
+
+
+def _added_params_beyond(live, snapshot_path, allowed):
+    """{tool: [params in the live schema but not in the snapshot]} minus the allowed additions."""
+    with open(snapshot_path, encoding="utf-8") as fh:
+        snap_by_name = {r["name"]: r for r in json.load(fh)}
+    live_by_name = {r["name"]: r for r in live}
+    added = {}
+    for n, r in snap_by_name.items():
+        extra = sorted(set(live_by_name[n]["inputSchema"].get("properties", {}))
+                       - set(r["inputSchema"].get("properties", {})) - set(allowed.get(n, [])))
+        if extra:
+            added[n] = extra
+    return added
 
 WINERR_RESET = ConnectionResetError(10054, "An existing connection was forcibly closed by the remote host")
 
@@ -182,18 +250,56 @@ def test_two_threads_are_serialised(srv, monkeypatch):
 
 
 # ------------------------------------------------ the fix must not touch the tool surface
-def test_tools_list_byte_identical_to_2_2_baseline(srv):
+def test_tools_list_superset_of_2_2_baseline(srv):
+    """R11 + R29: every 2.2.0 tool keeps its name, its position relative to the other 2.2.0 tools, every
+    2.2.0 parameter with its type, and its `required` list; ADDITIVE parameters and description changes
+    are allowed (G11b adds result_expr to execute_blender_code); new tools may only be appended."""
     import dump_tools_list
     live = dump_tools_list.tools_payload(srv)
     names = [r["name"] for r in live]
     base_names = [l.strip() for l in open(BASELINE_22, encoding="ascii") if l.strip()]
-    assert names == base_names, "tools/list names differ from baseline_tools_2.2.txt"
-    with open(SNAPSHOT_22, encoding="utf-8") as fh:
-        snapshot = json.load(fh)
-    # order is asserted against the txt baseline above; the JSON snapshot is stored in another order
-    live_by_name = {r["name"]: r for r in live}
-    snap_by_name = {r["name"]: r for r in snapshot}
-    assert set(live_by_name) == set(snap_by_name), "tools/list names differ from baselines/tools_list_2.2.json"
-    changed = [n for n in live_by_name
-               if json.dumps(live_by_name[n], sort_keys=True) != json.dumps(snap_by_name[n], sort_keys=True)]
-    assert not changed, "tools/list schema differs from baselines/tools_list_2.2.json for: %s" % changed
+    missing = [n for n in base_names if n not in names]
+    assert not missing, "tools removed vs baseline_tools_2.2.txt: %s" % missing
+    assert [n for n in names if n in base_names] == base_names, "2.2.0 tools reordered vs baseline_tools_2.2.txt"
+    problems = _schema_problems(SNAPSHOT_22, live, RELAXED_REQUIRED_24)
+    assert not problems, problems
+    allowed = dict(ADDITIVE_PARAMS_24)
+    allowed["execute_blender_code"] = ["result_expr"]          # G11b
+    added = _added_params_beyond(live, SNAPSHOT_22, allowed)
+    assert not added, "additive params beyond G11b + PLAN.md 13.2.2 need a ruling: %s" % added
+
+
+def test_tools_list_superset_of_2_3_baseline(srv):
+    """T0 (R-B2-10, D4): every 2.3.0 tool keeps its name, its order relative to the other 2.3.0 tools, every
+    property (same type / anyOf / default) and its `required` list; the ONLY additive params allowed are the
+    PLAN.md 13.2.2 lists (ADDITIVE_PARAMS_24); new tools may only be appended. The byte-identical 2.4 check and
+    its baseline files (baseline_tools_2.4.txt, baselines/tools_list_2.4.json) are added at B2-G3. Never skips."""
+    import dump_tools_list
+    live = dump_tools_list.tools_payload(srv)
+    names = [r["name"] for r in live]
+    base_names = [l.strip() for l in open(BASELINE_23, encoding="ascii") if l.strip()]
+    missing = [n for n in base_names if n not in names]
+    assert not missing, "tools removed vs baseline_tools_2.3.txt: %s" % missing
+    assert [n for n in names if n in base_names] == base_names, "2.3.0 tools reordered vs baseline_tools_2.3.txt"
+    problems = _schema_problems(SNAPSHOT_23, live, RELAXED_REQUIRED_24)
+    assert not problems, problems
+    added = _added_params_beyond(live, SNAPSHOT_23, ADDITIVE_PARAMS_24)
+    assert not added, "additive params beyond PLAN.md 13.2.2 need a ruling: %s" % added
+
+
+BASELINE_24 = os.path.join(TESTS, "baseline_tools_2.4.txt")
+SNAPSHOT_24 = os.path.join(TESTS, "baselines", "tools_list_2.4.json")
+
+
+def test_tools_list_identical_to_2_4_baseline(srv):
+    """B2-G3 (R-B2-10/D4): the 2.4.0 tools/list is byte-identical to the baseline cut at the freeze
+    (server a2cdd77f): same names in the same registration order, same descriptions, same inputSchema.
+    Re-cut the two files on purpose only (dump_tools_list.py names / json); never skips."""
+    import dump_tools_list
+    names = dump_tools_list.names_in_order(srv)
+    base_names = [l.rstrip("\n") for l in open(BASELINE_24, encoding="ascii") if l.strip()]
+    assert names == base_names, "tools/list names or order differ from baseline_tools_2.4.txt: %s" % [
+        (i, a, b) for i, (a, b) in enumerate(zip(names, base_names)) if a != b][:5] + [("len", len(names), len(base_names))]
+    live = dump_tools_list.as_text(dump_tools_list.tools_payload(srv))
+    base = open(SNAPSHOT_24, encoding="ascii").read()
+    assert live == base, "tools/list payload differs from baselines/tools_list_2.4.json (run: dump_tools_list.py diff tests/baselines/tools_list_2.4.json)"

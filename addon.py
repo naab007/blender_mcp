@@ -1,6 +1,8 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid (c) 2025
 
 import re
+import math
+import random
 import bpy
 import mathutils
 import json
@@ -27,7 +29,7 @@ import bmesh
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (2, 2, 0),
+    "version": (2, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -38,6 +40,55 @@ bl_info = {
 # is renamed or removed, or an existing payload / reply key changes meaning or type; purely
 # additive keys with addon-side defaults do not bump it.
 PROTOCOL = 1
+
+# Generic driver (D1) constants, docs/PLAN.md 12.2.5. The server owns the settings keys
+# (driver_reply_max_chars, driver_batch_max) and sends max_chars on every read; these are the
+# add-on defaults for an older server.
+_DRV_REPLY_MAX_DEFAULT = 24000
+_DRV_BATCH_MAX = 200
+_DRV_BATCH_WALL_S = 60.0
+# Operators the driver refuses to keep the session alive (request doc 2.5); preferences.addon_disable
+# only when `module` names this add-on.
+_DRV_REFUSED_OPS = frozenset({"wm.quit_blender", "wm.console_toggle", "wm.window_new",
+                              "wm.window_fullscreen_toggle", "screen.animation_play",
+                              "wm.read_factory_settings", "preferences.addon_disable", "script.reload"})
+# R33: structs whose POINTER / COLLECTION members the encoder never dereferences (reported as {struct, path}
+# without a getattr): ToolSettings, every struct whose bl_rna.base chain reaches Paint (Sculpt, VertexPaint,
+# ImagePaint, UvSculpt, GpPaint, ...) and CurveMapping. ponytail: ceiling = the 4.3.2 factory file, where
+# scene.tool_settings.uv_sculpt is an uninitialised Paint: its getters fault the process (uncatchable), crash-file
+# frames rna_Paint_eraser_brush_get -> RNA_id_pointer_create -> rna_ID_refine and CurveMapping_tone_get <-
+# pyrna_prop_to_py (uv_sculpt.cavity_curve.tone); extend the set if another crash site appears (measured
+# 2026-10-16: with uv_sculpt skipped a depth-3 Scene walk of 1482 reads completes on 4.3.2).
+_DRV_UNSAFE_STRUCTS = frozenset({"ToolSettings", "Paint", "CurveMapping"})
+
+
+class _DrvRefError(Exception):
+    """A ref that did not resolve; .reply is the teaching error dict ({error, tried, closest, valid, rna_error})."""
+
+    def __init__(self, reply):
+        super().__init__(reply.get("error", "ref error"))
+        self.reply = reply
+
+
+def _drv_handler(fn):
+    """Driver handlers never raise on bad input (12.2.2): an unexpected exception becomes {error, rna_error}."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except _DrvRefError as e:
+            return dict(e.reply)
+        except TypeError as e:
+            # a wrong keyword reaches here before the body runs: keep the dispatcher's wording family;
+            # the traceback is printed too (RA-16) because a TypeError from inside the body lands here as well
+            traceback.print_exc()
+            return {"error": f"{fn.__name__}: {e}", "rna_error": str(e)}
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"{type(e).__name__}: {e}", "rna_error": str(e)}
+    return wrapper
 
 RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhofby80NJez"
 
@@ -87,11 +138,43 @@ def _port():
         return _DEFAULT_PORT
 
 
+def _legacy_groups(scene):
+    """
+    The ID-property groups a pre-2.4 Scene secret can live in, in read order (R-B2-18 / H15).
+    The four legacy Scene StringProperties are no longer registered (2.4.0), so their saved
+    values are orphaned ID properties: in the plain group (files written on 4.x, incl. every
+    1.6.0 file: scene.get) or, for files saved on 5.x while the props were registered, in the
+    5.x system group (scene.bl_system_properties_get; absent on 4.x). Yields (label, group).
+    """
+    yield "user", scene
+    getter = getattr(scene, "bl_system_properties_get", None)
+    if getter is not None:
+        try:
+            grp = getter(do_create=False)
+        except Exception:
+            grp = None
+        if grp is not None:
+            yield "system", grp
+
+
+def _legacy_secret_get(scene, name):
+    """Legacy Scene secret by short name from whichever group holds it: (value, group) or ("", None)."""
+    key = "blendermcp_" + name
+    for label, grp in _legacy_groups(scene):
+        try:
+            value = grp.get(key)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            return value, grp
+    return "", None
+
+
 def _secret(name):
     """
-    API key / secret by short name (see _SECRET_NAMES): preferences first, then the legacy
-    Scene property as a read-only fallback. The legacy Scene properties stay registered but
-    undrawn through 2.1.x so pre-2.1 files still load and migrate; they go away in 2.2.0.
+    API key / secret by short name (see _SECRET_NAMES): preferences first, then an orphaned
+    legacy Scene ID property as a read-only fallback (a file whose load_post migration has not
+    run yet, e.g. the harness).
     """
     prefs = _prefs()
     if prefs is not None:
@@ -99,13 +182,14 @@ def _secret(name):
         if value:
             return value
     scene = getattr(bpy.context, "scene", None)
-    return (getattr(scene, "blendermcp_" + name, "") or "") if scene is not None else ""
+    return _legacy_secret_get(scene, name)[0] if scene is not None else ""
 
 
 def _migrate_legacy_secrets(prefs, scene=None):
     """
     One-time move of non-empty legacy Scene secrets into prefs (only where the prefs value is
-    empty), blanking the Scene copy so it is not saved into the file again. prefs is a
+    empty) and deletion of the legacy copy from whichever ID-property group held it, so a
+    secret is never saved into the file again (R-B2-18: moved, not copied). prefs is a
     parameter so a headless test can pass a stand-in object. Returns the migrated names.
     """
     if prefs is None:
@@ -116,14 +200,20 @@ def _migrate_legacy_secrets(prefs, scene=None):
         return []
     migrated = []
     for name in _SECRET_NAMES:
-        legacy = getattr(scene, "blendermcp_" + name, "") or ""
-        if legacy and not (getattr(prefs, name, "") or ""):
-            try:
+        legacy, _grp = _legacy_secret_get(scene, name)
+        if not legacy:
+            continue
+        try:
+            if not (getattr(prefs, name, "") or ""):
                 setattr(prefs, name, legacy)
-                setattr(scene, "blendermcp_" + name, "")
                 migrated.append(name)
-            except Exception as e:
-                print(f"BlenderMCP: could not migrate legacy {name}: {e}")
+            # 5.x opens a 4.x file with the legacy value in BOTH groups (measured 2026-10-21): delete every copy
+            key = "blendermcp_" + name
+            for _label, grp in _legacy_groups(scene):
+                if key in grp.keys():
+                    del grp[key]
+        except Exception as e:
+            print(f"BlenderMCP: could not migrate legacy {name}: {e}")
     return migrated
 
 
@@ -570,6 +660,44 @@ class BlenderMCPServer:
             "set_scene_frame_range": self.set_scene_frame_range,
             "playblast": self.playblast,
             "bake_action": self.bake_action,
+            # Engine readiness (B2 L1): validation
+            "validate_asset": self.validate_asset,
+            "find_mesh_issues": self.find_mesh_issues,
+            "compare_meshes": self.compare_meshes,
+            "apply_transforms": self.apply_transforms,
+            "fix_normals": self.fix_normals,
+            "cleanup_mesh": self.cleanup_mesh,
+            # Engine readiness (B2 L2): optimisation, LODs, collision
+            "decimate_mesh": self.decimate_mesh,
+            "generate_lods": self.generate_lods,
+            "set_normals": self.set_normals,
+            "triangulate_for_export": self.triangulate_for_export,
+            "get_triangle_budget": self.get_triangle_budget,
+            "create_collision": self.create_collision,
+            "get_collision_info": self.get_collision_info,
+            "check_collision_fit": self.check_collision_fit,
+            # Engine readiness (B2 L3): sockets, pivots, hierarchy, export
+            "add_socket": self.add_socket,
+            "list_sockets": self.list_sockets,
+            "set_pivot": self.set_pivot,
+            "snap_to_grid": self.snap_to_grid,
+            "build_export_hierarchy": self.build_export_hierarchy,
+            "export_for_engine": self.export_for_engine,
+            "get_export_preset": self.get_export_preset,
+            # Generic driver (D1)
+            "drv_describe": self.drv_describe,
+            "drv_get": self.drv_get,
+            "drv_set": self.drv_set,
+            "drv_new": self.drv_new,
+            "drv_remove": self.drv_remove,
+            "drv_find": self.drv_find,
+            "drv_context": self.drv_context,
+            "drv_op": self.drv_op,
+            "drv_call": self.drv_call,
+            "drv_snapshot": self.drv_snapshot,
+            "drv_diff": self.drv_diff,
+            "drv_batch": self.drv_batch,
+            "drv_transaction": self.drv_transaction,
         }
         handlers.update(extended_handlers)
         return handlers
@@ -605,9 +733,13 @@ class BlenderMCPServer:
 
 
 
-    def get_scene_info(self):
-        """Get information about the current Blender scene"""
+    def get_scene_info(self, limit=10):
+        """Get information about the current Blender scene. limit = objects listed (default 10, 0 = all; R-B2-32)."""
         try:
+            try:
+                limit = int(limit) if limit is not None else 10
+            except (TypeError, ValueError):
+                return {"error": f"limit must be an integer >= 0 (0 = all), got {limit!r}"}
             print("Getting scene info...")
             scene = bpy.context.scene
             r, vs, units = scene.render, scene.view_settings, scene.unit_settings
@@ -641,18 +773,40 @@ class BlenderMCPServer:
                 },
             }
 
-            # Collect minimal object information (limit to first 10 objects; documented in TOOLS.md)
+            # B2 (13.2.2): scene budgets with modifiers evaluated (E13), MESH objects only; one evaluated_get
+            # per mesh gives both counts (RA-10)
+            dg = bpy.context.evaluated_depsgraph_get()
+            tri_by_name, total_verts = {}, 0
+            for o in scene.objects:
+                if o.type != 'MESH':
+                    continue
+                try:
+                    me = o.evaluated_get(dg).data
+                    me.calc_loop_triangles()
+                    tri_by_name[o.name] = len(me.loop_triangles)
+                    total_verts += len(me.vertices)
+                except Exception:
+                    tri_by_name[o.name] = 0
+            scene_info["total_triangles"] = sum(tri_by_name.values())
+            scene_info["total_vertices"] = total_verts
+
+            # Collect minimal object information (first `limit` objects, default 10; 0 = all; documented in TOOLS.md)
             for i, obj in enumerate(scene.objects):
-                if i >= 10:
+                if limit > 0 and i >= limit:
                     break
 
                 obj_info = {
                     "name": obj.name,
+                    "uid": obj.session_uid,
                     "type": obj.type,
                     # Only include basic location data
                     "location": [round(float(obj.location.x), 2),
                                 round(float(obj.location.y), 2),
                                 round(float(obj.location.z), 2)],
+                    "triangles": tri_by_name.get(obj.name, 0),
+                    "hidden": not obj.visible_get(),     # R-B2-17 (7)
+                    "parent": obj.parent.name if obj.parent else None,     # R-B2-28: batch_export resolves roots here
+                    "collections": [c.name for c in obj.users_collection],  # R-B2-30: batch_export(collection=) filters here
                 }
                 scene_info["objects"].append(obj_info)
 
@@ -694,6 +848,7 @@ class BlenderMCPServer:
         # Basic object info
         obj_info = {
             "name": obj.name,
+            "uid": obj.session_uid,
             "type": obj.type,
             "location": [obj.location.x, obj.location.y, obj.location.z],
             "rotation": [obj.rotation_euler.x, obj.rotation_euler.y, obj.rotation_euler.z],
@@ -796,22 +951,34 @@ class BlenderMCPServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
+    def execute_code(self, code, result_expr=None):
+        """
+        Execute arbitrary Blender Python code. result_expr: an expression evaluated in the same
+        namespace after the code, returned under "value" (encoded like rna_get, 12.2.4). An
+        exception returns {"error": "<type>: <msg>", "traceback": [last 3 frames], "line": n}
+        instead of raising (D1 G11b); the stdout capture stays under "result".
+        """
         # This is powerful but potentially dangerous - use with caution
+        # Create a local namespace for execution
+        namespace = {"bpy": bpy}
+        capture_buffer = io.StringIO()
         try:
-            # Create a local namespace for execution
-            namespace = {"bpy": bpy}
-
             # Capture stdout during execution, and return it as result
-            capture_buffer = io.StringIO()
+            value = None
             with redirect_stdout(capture_buffer):
                 exec(code, namespace)
-
-            captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
+                if result_expr:
+                    value = self._encode_value(eval(str(result_expr), namespace), None, 1)
+            reply = {"executed": True, "result": capture_buffer.getvalue()}     # RA-15: built once, after the capture
+            if result_expr:
+                reply["value"] = value
+            return reply
         except Exception as e:
-            raise Exception(f"Code execution error: {str(e)}")
+            frames = traceback.extract_tb(e.__traceback__)
+            line = next((f.lineno for f in reversed(frames) if f.filename == "<string>"), None)
+            return {"error": f"{type(e).__name__}: {e}",
+                    "traceback": [f"{f.filename}:{f.lineno} in {f.name}: {f.line or ''}".rstrip(": ") for f in frames[-3:]],
+                    "line": line, "result": capture_buffer.getvalue(), "executed": False}
 
 
 
@@ -1261,6 +1428,7 @@ class BlenderMCPServer:
         # Save original state
         orig_view_matrix = r3d.view_matrix.copy()
         orig_perspective = r3d.view_perspective
+        orig_view = (r3d.view_location.copy(), r3d.view_rotation.copy(), r3d.view_distance)   # F-B2-6
         orig_smooth_view = prefs_view.smooth_view
 
         try:
@@ -1272,6 +1440,8 @@ class BlenderMCPServer:
             prefs_view.smooth_view = orig_smooth_view
             r3d.view_matrix = orig_view_matrix
             r3d.view_perspective = orig_perspective
+            # F-B2-6: on 4.3.2 the next redraw rebuilds the matrix from these three, so put them back too
+            r3d.view_location, r3d.view_rotation, r3d.view_distance = orig_view
 
     def _capture_angle_inner(self, angle, max_size, filepath, area, space, region, r3d, prefs_view, overlay):
         import math
@@ -1744,7 +1914,11 @@ class BlenderMCPServer:
                 "blender": bpy.app.version_string,
                 "python": platform.python_version(),
                 "addon_file": __file__,
-                "background": bool(bpy.app.background)}
+                "background": bool(bpy.app.background),
+                # D1 G11c: every blendermcp_* driver_namespace registry (reference images, settings
+                # snapshots, session states, driver snapshots / transactions) and its entry count
+                "registries": {k: len(v) for k, v in bpy.app.driver_namespace.items()
+                               if k.startswith("blendermcp_") and hasattr(v, "__len__")}}
 
     def ensure_server_running(self, port=None):
         """
@@ -2165,19 +2339,47 @@ class BlenderMCPServer:
         return {"success": True, "name": name, "cuts": cuts,
                 "vertices": len(obj.data.vertices), "faces": len(obj.data.polygons)}
 
-    def apply_modifier(self, name, modifier_name):
-        """Apply a named modifier on an object."""
+    def apply_modifier(self, name, modifier_name=None, apply_all=False, keep=None):
+        """
+        Apply a named modifier on an object, or every modifier in stack order with apply_all=True.
+        keep: comma list of modifier NAMES or TYPES to skip (e.g. "ARMATURE"); one failure does not
+        stop the rest (B2 13.2.2). Reply: applied, kept, failed {name: reason} (+ applied_modifier
+        for the single-modifier form).
+        """
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
-        mod = obj.modifiers.get(modifier_name)
-        if not mod:
-            return {"error": f"Modifier '{modifier_name}' not found on {name}"}
+        keep_set = {k.upper() for k in (self._names_arg(keep) or [])} | set(self._names_arg(keep) or [])
+        if apply_all:
+            targets = [m for m in obj.modifiers]
+        else:
+            if not modifier_name:
+                return {"error": "modifier_name is required unless apply_all=True"}
+            mod = obj.modifiers.get(modifier_name)
+            if not mod:
+                return {"error": f"Modifier '{modifier_name}' not found on {name}; modifiers: {[m.name for m in obj.modifiers]}"}
+            targets = [mod]
+        applied, kept, failed = [], [], {}
         with self._selection_scope():
             self._select_only(obj)
-            with bpy.context.temp_override(object=obj, active_object=obj):
-                bpy.ops.object.modifier_apply(modifier=modifier_name)
-        return {"success": True, "name": name, "applied_modifier": modifier_name}
+            for mod in targets:
+                mname, mtype = mod.name, mod.type
+                if mname in keep_set or mtype in keep_set:
+                    kept.append(mname)
+                    continue
+                try:
+                    with bpy.context.temp_override(object=obj, active_object=obj):
+                        bpy.ops.object.modifier_apply(modifier=mname)
+                    applied.append(mname)
+                except Exception as e:
+                    failed[mname] = str(e).strip()
+        if not apply_all and failed:
+            return {"error": f"could not apply '{modifier_name}': {failed[modifier_name]}", "name": name, "failed": failed}
+        reply = {"success": True, "name": name, "applied": applied, "kept": kept, "failed": failed,
+                 "remaining": [m.name for m in obj.modifiers]}
+        if not apply_all:
+            reply["applied_modifier"] = modifier_name
+        return reply
 
     def get_mesh_stats(self, name):
         """Return detailed mesh topology stats for an object."""
@@ -2186,21 +2388,2109 @@ class BlenderMCPServer:
             return {"error": f"Object not found: {name}"}
         if obj.type != 'MESH':
             return {"error": f"{name} is not a mesh object"}
+        self._sync_editmesh(obj)
         mesh = obj.data
         n_polys = len(mesh.polygons)
         loop_totals = array.array('i', [0]) * n_polys
         mesh.polygons.foreach_get("loop_total", loop_totals)
-        tri_count = sum(loop_totals) - 2 * n_polys
+        tri_simple = sum(loop_totals) - 2 * n_polys
+        topo = self._topology_counts(obj)
+        # local-space bbox (the origin is local 0, so an offset IS the bbox point)
+        corners = [mathutils.Vector(c) for c in obj.bound_box]
+        lo = mathutils.Vector((min(c.x for c in corners), min(c.y for c in corners), min(c.z for c in corners)))
+        hi = mathutils.Vector((max(c.x for c in corners), max(c.y for c in corners), max(c.z for c in corners)))
+        center = (lo + hi) / 2.0
+        rot_identity = self._rotation_is_identity(obj)
         return {
             "name": name,
             "vertices": len(mesh.vertices),
             "edges": len(mesh.edges),
             "polygons": len(mesh.polygons),
-            "triangles": tri_count,
+            "triangles": self._eval_tri_count(obj),       # B2: evaluated (E13); the 2.2 formula stays below
+            "triangles_simple": tri_simple,
+            "ngons": int(sum(1 for n in loop_totals if n > 4)),
+            "quads": int(sum(1 for n in loop_totals if n == 4)),
+            "tris": int(sum(1 for n in loop_totals if n == 3)),
+            "loose_verts": topo["loose_verts"],
+            "loose_edges": topo["loose_edges"],
+            "non_manifold_edges": topo["non_manifold_edges"],
+            "boundary_edges": topo["boundary_edges"],
+            "has_custom_normals": bool(mesh.has_custom_normals),
+            "uv_layers": [uv.name for uv in mesh.uv_layers],
+            "color_attributes": [ca.name for ca in mesh.color_attributes],
+            "material_slots": [{"index": i, "material": s.material.name if s.material else None}
+                               for i, s in enumerate(obj.material_slots)],
+            "dimensions": [round(float(v), 6) for v in obj.dimensions],
+            "unapplied_transform": {"rotation": not rot_identity,
+                                    "scale": any(abs(s - 1.0) > 1e-6 for s in obj.scale),
+                                    "negative_scale": any(s < 0 for s in obj.scale)},
+            "origin_offset": {"to_bbox_center": [round(float(v), 6) for v in center],
+                              "to_bbox_bottom": [round(float(center.x), 6), round(float(center.y), 6), round(float(lo.z), 6)]},
             "materials": len(obj.material_slots),
             "modifiers": [m.name for m in obj.modifiers],
             "bounding_box": self._get_aabb(obj),
         }
+
+    def _topology_counts(self, obj):
+        """
+        Loose / non-manifold / boundary counts from a read-only BMesh of obj.data. Non-manifold =
+        BMEdge.is_manifold False (Blender's definition: >2 faces, opposed winding, boundary or wire);
+        boundary edges are also counted on their own, loose = verts without edges / edges without faces.
+        """
+        out = {"loose_verts": 0, "loose_edges": 0, "non_manifold_edges": 0, "boundary_edges": 0}
+        with self._bmesh_read(obj) as bm:          # R-B2-36: a read never changes mode or active
+            out["loose_verts"] = sum(1 for v in bm.verts if not v.link_edges)
+            out["loose_edges"] = sum(1 for e in bm.edges if not e.link_faces)
+            out["boundary_edges"] = sum(1 for e in bm.edges if e.is_boundary)
+            # Blender's own definition (BMEdge.is_manifold, = select_non_manifold with every flag): boundary and
+            # wire edges count too, so an open cube reports 4 and a plane 4
+            out["non_manifold_edges"] = sum(1 for e in bm.edges if not e.is_manifold)
+        return out
+
+    # ─── Engine readiness: validation (B2 L1, PLAN 13.2.3) ───────────────────
+
+    # H12 profiles. tangents: the preset exports tangents (E5: ngons then abort calc_tangents -> FAIL).
+    # collision: (prefix, suffixes) naming rule for collision children; socket: attach-point prefix;
+    # strict_names: spaces / dots / non-ASCII in object or material names are flagged.
+    _PROFILES = {
+        "GENERIC":    {"tangents": False, "collision": ("", ("_COL",)), "socket": "", "strict_names": False},
+        "UNITY":      {"tangents": True, "collision": ("", ("_Collider",)), "socket": "", "strict_names": True},
+        "UNREAL":     {"tangents": True, "collision": ("UCX_", ()), "socket": "SOCKET_", "strict_names": True},
+        "GODOT":      {"tangents": True, "collision": ("", ("-col", "-convcol", "-colonly")), "socket": "", "strict_names": True},
+        "BEVY":       {"tangents": True, "collision": ("", ("-col",)), "socket": "", "strict_names": True},
+        "TIMBERMESH": {"tangents": False, "collision": ("", ()), "socket": "#", "strict_names": False},
+    }
+    _ISSUE_KINDS = ("NON_MANIFOLD", "NGONS", "LOOSE", "DEGENERATE", "DOUBLES", "FLIPPED", "INTERIOR_FACES", "BOUNDARY")
+    _VALIDATE_CHECKS = ("unapplied_transform", "negative_scale", "origin_bottom_center", "dimensions", "ngons",
+                        "non_manifold", "loose", "degenerate", "doubles", "inconsistent_normals", "missing_uv",
+                        "uv_out_of_bounds", "missing_uv2", "vertex_count_16bit", "triangle_budget", "material_slots",
+                        "materials_without_nodes", "images_missing", "bone_influences", "illegal_names",
+                        "name_collisions", "hierarchy")
+    _ILLEGAL_NAME_RE = re.compile(r"[^A-Za-z0-9_\-]")
+
+    def _profile_names(self, profile):
+        """(profile id, rules dict) for an H12 profile name, or (None, {error, valid})."""
+        pid = str(profile or "GENERIC").strip().upper()
+        rules = self._PROFILES.get(pid)
+        if rules is None:
+            return None, {"error": f"profile '{profile}' not valid; valid: {list(self._PROFILES)}", "valid": list(self._PROFILES)}
+        return pid, rules
+
+    @classmethod
+    def _collision_named(cls, name, mesh_name):
+        """True when name matches ANY profile's collision naming rule for mesh_name (R-B2-17 (5))."""
+        for rules in cls._PROFILES.values():
+            prefix, suffixes = rules["collision"]
+            if prefix and name.startswith(prefix):
+                return True
+            if any(name.startswith(mesh_name + s) or name.endswith(s) for s in suffixes):
+                return True
+        return False
+
+    @staticmethod
+    def _flipped_face_indices(bm):
+        """Faces whose normal disagrees with a consistent outward recalculation (dry run on a copy)."""
+        before = [f.normal.copy() for f in bm.faces]
+        probe = bm.copy()
+        try:
+            probe.faces.ensure_lookup_table()
+            bmesh.ops.recalc_face_normals(probe, faces=probe.faces)
+            return [i for i, f in enumerate(probe.faces) if before[i].length > 0 and f.normal.dot(before[i]) < 0.0]
+        finally:
+            probe.free()
+
+    def _mesh_issue_indices(self, obj, issue, max_indices=500):
+        """
+        (element, count, indices, truncated) for one issue class on a MESH object. INTERIOR_FACES uses the
+        edit-mode select op (E7; its region rule is not a per-face predicate) under the three restore scopes,
+        the user's prior active object and mode come back in finally. Every other kind reads a BMesh copy
+        (R-B2-36): NON_MANIFOLD = BMEdge.is_manifold False (= select_non_manifold with every flag), NGONS =
+        faces with more than 4 verts (= select_face_by_sides GREATER 4).
+        """
+        issue = str(issue or "").strip().upper()
+        if issue not in self._ISSUE_KINDS:
+            return None, None, None, {"error": f"issue '{issue}' not valid; valid: {list(self._ISSUE_KINDS)}",
+                                      "valid": list(self._ISSUE_KINDS)}
+        try:
+            cap = int(max_indices)
+        except (TypeError, ValueError):
+            return None, None, None, {"error": f"max_indices must be an integer >= 1, got {max_indices!r}"}
+        if cap < 1:
+            return None, None, None, {"error": f"max_indices must be >= 1, got {cap}"}
+        element = {"NON_MANIFOLD": "EDGE", "BOUNDARY": "EDGE", "LOOSE": "VERT", "DOUBLES": "VERT"}.get(issue, "FACE")
+        indices = []
+        # read-only: _selection_scope keeps the handler's target active when nothing was active before;
+        # put None back so the caller's state is byte-identical
+        view_layer = bpy.context.view_layer
+        active_before = view_layer.objects.active
+        if issue == "INTERIOR_FACES":
+            with self._selection_scope(), self._mesh_select_scope(obj.data), self._mode_restore():
+                self._select_only(obj)
+                bpy.ops.object.mode_set(mode='EDIT')
+                try:
+                    bpy.ops.mesh.select_mode(type='FACE')
+                    bpy.ops.mesh.select_all(action='DESELECT')
+                    bpy.ops.mesh.select_interior_faces()
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    seq = bm.edges if element == "EDGE" else bm.faces
+                    seq.ensure_lookup_table()
+                    seq.index_update()      # edit-mesh indices are not guaranteed valid (-1) until updated
+                    indices = [x.index for x in seq if x.select]
+                finally:
+                    with suppress(Exception):
+                        bpy.ops.object.mode_set(mode='OBJECT')
+        else:
+            with self._bmesh_read(obj) as bm:           # R-B2-36: pure read
+                if issue == "NON_MANIFOLD":
+                    indices = [e.index for e in bm.edges if not e.is_manifold]
+                elif issue == "NGONS":
+                    indices = [f.index for f in bm.faces if len(f.verts) > 4]
+                elif issue == "BOUNDARY":
+                    indices = [e.index for e in bm.edges if e.is_boundary]
+                elif issue == "LOOSE":
+                    indices = [v.index for v in bm.verts if not v.link_faces]
+                elif issue == "DEGENERATE":
+                    indices = [f.index for f in bm.faces if f.calc_area() < 1e-8]
+                elif issue == "DOUBLES":
+                    res = bmesh.ops.find_doubles(bm, verts=bm.verts, dist=1e-5)
+                    indices = sorted(v.index for v in res["targetmap"].keys())
+                elif issue == "FLIPPED":
+                    indices = self._flipped_face_indices(bm)
+        if active_before is None:
+            with suppress(Exception):
+                view_layer.objects.active = None
+        return element, len(indices), indices[:cap], len(indices) > cap
+
+    def validate_asset(self, objects=None, collection=None, profile="GENERIC", max_triangles=None, require_uv=True,
+                       require_uv2=False, max_bone_influences=4, fix=False, _objs=None):
+        """
+        THE pre-flight tool (13.2.3): 22 fixed checks per mesh, verdict = worst status, summary counts
+        OBJECTS by verdict (R-B2-17 (6)); fix=False is read-only. fix=True applies only the six safe
+        fixes in order (apply transforms, normals outside, remove doubles, delete loose, triangulate
+        ngons, rename illegal characters), re-runs the checks and reports the post-fix verdict.
+        """
+        pid, rules = self._profile_names(profile)
+        if pid is None:
+            return rules
+        objs, oerr = self._names_or_collection(objects, collection, _objs=_objs)
+        if oerr:
+            return oerr
+        try:
+            max_tris = int(max_triangles) if max_triangles is not None else None
+            max_inf = int(max_bone_influences)
+        except (TypeError, ValueError):
+            return {"error": f"max_triangles / max_bone_influences must be integers, got {max_triangles!r} / {max_bone_influences!r}"}
+        opts = {"require_uv": bool(require_uv), "require_uv2": bool(require_uv2), "max_triangles": max_tris,
+                "max_bone_influences": max_inf}
+        all_names = {o.name for o in objs}
+
+        def run_checks():
+            dg = bpy.context.evaluated_depsgraph_get()
+            report, available = {}, []
+            stems = {}                                  # RA-11: one stem -> names map per call
+            for x in bpy.data.objects:
+                stems.setdefault(re.sub(r"\.\d{3,}$", "", x.name), []).append(x.name)
+            for o in objs:
+                if o.type != 'MESH':
+                    report[o.name] = {"verdict": "PASS", "checks": {}, "detail": "not a mesh"}
+                    continue
+                checks = self._validate_mesh(o, pid, rules, opts, dg, all_names, stems)
+                worst = "PASS"
+                for c in checks.values():
+                    if c["status"] == "FAIL":
+                        worst = "FAIL"
+                    elif c["status"] == "WARN" and worst == "PASS":
+                        worst = "WARN"
+                report[o.name] = {"verdict": worst, "checks": checks}
+                for cid, fix_name in (("unapplied_transform", "apply_transforms"), ("negative_scale", "apply_transforms"),
+                                      ("inconsistent_normals", "fix_normals_outside"), ("doubles", "remove_doubles"),
+                                      ("loose", "delete_loose"), ("ngons", "triangulate_ngons"),
+                                      ("illegal_names", "rename_illegal_characters")):
+                    if checks[cid]["status"] != "PASS" and not any(a["object"] == o.name and a["fix"] == fix_name for a in available):
+                        available.append({"object": o.name, "check_id": cid, "fix": fix_name})
+            return report, available
+
+        report, available = run_checks()
+        applied = []
+        if fix and available:
+            with self._selection_scope(), self._mode_restore():
+                for o in objs:
+                    mine = [a for a in available if a["object"] == o.name]
+                    if not mine or o.type != 'MESH':
+                        continue
+                    fixes = [a["fix"] for a in mine]
+                    try:
+                        if "apply_transforms" in fixes:
+                            negative = any(s < 0 for s in o.scale)
+                            r = self.apply_transforms(_objs=[o], rotation=True, scale=True)      # RA-4: refs, not names
+                            applied.append({"object": o.name, "check_id": "unapplied_transform", "fix": "apply_transforms",
+                                            "detail": "error: " + r["error"] if "error" in r else "rotation and scale applied"})
+                            if negative and "error" not in r:
+                                # a mirrored object comes out inside out once the scale is baked (E6): recalc outward
+                                r2 = self.fix_normals(objects=o.name, mode="OUTSIDE")
+                                applied.append({"object": o.name, "check_id": "negative_scale", "fix": "fix_normals_outside",
+                                                "detail": "error: " + r2["error"] if "error" in r2 else
+                                                f"{r2['faces_flipped'].get(o.name, 0)} faces flipped outward after baking the mirror"})
+                                fixes = [f for f in fixes if f != "fix_normals_outside"]
+                        if "fix_normals_outside" in fixes:
+                            r = self.fix_normals(_objs=[o], mode="OUTSIDE")
+                            applied.append({"object": o.name, "check_id": "inconsistent_normals", "fix": "fix_normals_outside",
+                                            "detail": "error: " + r["error"] if "error" in r else f"{r['faces_flipped'].get(o.name, 0)} faces flipped"})
+                        if "remove_doubles" in fixes or "delete_loose" in fixes:
+                            r = self.cleanup_mesh(_objs=[o], remove_doubles=1e-5 if "remove_doubles" in fixes else 0.0,
+                                                  delete_loose="delete_loose" in fixes, dissolve_degenerate=False)
+                            per = r.get("per_object", {}).get(o.name, {}) if "error" not in r else {}
+                            if "remove_doubles" in fixes:
+                                applied.append({"object": o.name, "check_id": "doubles", "fix": "remove_doubles",
+                                                "detail": "error: " + r["error"] if "error" in r else f"{per.get('doubles_removed', 0)} vertices merged"})
+                            if "delete_loose" in fixes:
+                                applied.append({"object": o.name, "check_id": "loose", "fix": "delete_loose",
+                                                "detail": "error: " + r["error"] if "error" in r else
+                                                f"{per.get('loose_verts_removed', 0)} verts, {per.get('loose_edges_removed', 0)} edges removed"})
+                        if "triangulate_ngons" in fixes:
+                            with self._bmesh_edit(o) as bm:
+                                ngons = [f for f in bm.faces if len(f.verts) > 4]
+                                n = len(ngons)
+                                if ngons:
+                                    bmesh.ops.triangulate(bm, faces=ngons, quad_method='BEAUTY', ngon_method='BEAUTY')
+                            applied.append({"object": o.name, "check_id": "ngons", "fix": "triangulate_ngons",
+                                            "detail": f"{n} ngons triangulated"})
+                        if "rename_illegal_characters" in fixes:
+                            renamed = []
+                            new = self._ILLEGAL_NAME_RE.sub("_", o.name)
+                            if new != o.name:
+                                old = o.name
+                                o.name = new
+                                all_names.discard(old)
+                                all_names.add(o.name)
+                                renamed.append(f"{old} -> {o.name}")
+                            for slot in o.material_slots:
+                                m = slot.material
+                                if m is not None:
+                                    new = self._ILLEGAL_NAME_RE.sub("_", m.name)
+                                    if new != m.name:
+                                        old = m.name
+                                        m.name = new
+                                        renamed.append(f"material {old} -> {m.name}")
+                            applied.append({"object": o.name, "check_id": "illegal_names", "fix": "rename_illegal_characters",
+                                            "detail": "; ".join(renamed) or "nothing to rename"})
+                    except Exception as e:
+                        applied.append({"object": o.name, "check_id": "-", "fix": "-", "detail": f"error: {e}"})
+            bpy.context.view_layer.update()
+            report, available = run_checks()
+        verdict = "PASS"
+        summary = {"pass": 0, "warn": 0, "fail": 0}
+        for entry in report.values():
+            summary[entry["verdict"].lower()] += 1
+            if entry["verdict"] == "FAIL":
+                verdict = "FAIL"
+            elif entry["verdict"] == "WARN" and verdict == "PASS":
+                verdict = "WARN"
+        return {"success": True, "profile": pid, "verdict": verdict, "summary": summary, "objects": report,
+                "fixes_available": available, "fixes_applied": applied, "fixed": bool(fix)}
+
+    def _validate_mesh(self, o, pid, rules, opts, dg, all_names, stems=None):
+        """The 22 checks for one MESH object; every id present, status PASS when clean."""
+        self._sync_editmesh(o)
+        me = o.data
+        n_v = len(me.vertices)
+        checks = {}
+
+        def put(cid, bad, status, detail, count=None, sample=()):
+            checks[cid] = {"status": status if bad else "PASS", "detail": detail if bad else "ok",
+                           "count": int(count if count is not None else (1 if bad else 0)),
+                           "sample_indices": [int(i) for i in list(sample)[:20]]}
+
+        # transforms
+        rot_id = self._rotation_is_identity(o)
+        scale_id = all(abs(s - 1.0) < 1e-6 for s in o.scale)
+        put("unapplied_transform", not (rot_id and scale_id), "FAIL",
+            f"rotation {[round(math.degrees(a), 3) for a in o.rotation_euler]} deg, scale {[round(float(s), 4) for s in o.scale]} not applied")
+        put("negative_scale", any(s < 0 for s in o.scale), "FAIL", f"negative scale {[round(float(s), 4) for s in o.scale]} mirrors the mesh")
+        # origin + dimensions (local bbox)
+        corners = [mathutils.Vector(c) for c in o.bound_box]
+        lo = [min(c[i] for c in corners) for i in range(3)]
+        hi = [max(c[i] for c in corners) for i in range(3)]
+        size = max(hi[i] - lo[i] for i in range(3))
+        tol = 1e-4 * max(size, 1.0)
+        off = ((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2])
+        put("origin_bottom_center", n_v > 0 and any(abs(v) > tol for v in off), "WARN",
+            f"origin is {[round(v, 4) for v in off]} from the bbox bottom centre")
+        scale_len = float(bpy.context.scene.unit_settings.scale_length) or 1.0
+        dims = [float(d) * scale_len for d in o.dimensions]
+        put("dimensions", n_v > 0 and (max(dims) > 100.0 or max(dims) < 0.01), "WARN",
+            f"dimensions {[round(d, 4) for d in dims]} m are outside 1 cm .. 100 m")        # topology (one read-only bmesh, R-B2-36)
+        uvs = list(me.uv_layers)
+        oob = []
+        with self._bmesh_read(o) as bm:
+            ngons = [f.index for f in bm.faces if len(f.verts) > 4]
+            # UVs from the BMesh copy: Mesh.uv_layers[].data reads as length 0 while the object is in EDIT mode
+            # (RNA), the BMesh sees the layer either way; loop order = mesh loop order (from_mesh)
+            uvl = bm.loops.layers.uv.get(uvs[0].name) if uvs else None
+            if uvl is not None:
+                i = 0
+                for f in bm.faces:
+                    for l in f.loops:
+                        u, v = l[uvl].uv
+                        if not (-1e-6 <= u <= 1.0 + 1e-6 and -1e-6 <= v <= 1.0 + 1e-6):
+                            oob.append(i)
+                        i += 1
+            # R-B2-29: boundary edges are NOT non-manifold for this check (foliage cards, decals and trim pieces are
+            # open by design); >2 faces, wire and opposed-winding edges are. get_mesh_stats keeps Blender's definition.
+            nonman = [e.index for e in bm.edges
+                      if len(e.link_faces) > 2 or not e.link_faces or (len(e.link_faces) == 2 and not e.is_contiguous)]
+            n_boundary = sum(1 for e in bm.edges if e.is_boundary)
+            loose_v = [v.index for v in bm.verts if not v.link_edges]
+            loose_e = [e.index for e in bm.edges if not e.link_faces]
+            degen = [f.index for f in bm.faces if f.calc_area() < 1e-8]
+            doubles = sorted(v.index for v in bmesh.ops.find_doubles(bm, verts=bm.verts, dist=1e-5)["targetmap"].keys())
+            flipped = self._flipped_face_indices(bm) if len(bm.faces) else []
+        put("ngons", bool(ngons), "FAIL" if rules["tangents"] else "WARN",
+            f"{len(ngons)} faces with more than 4 vertices" + (" (tangent export aborts on ngons, E5)" if rules["tangents"] else ""),
+            len(ngons), ngons)
+        put("non_manifold", bool(nonman), "WARN", f"{len(nonman)} non-manifold edges (>2 faces, wire or opposed winding)",
+            len(nonman), nonman)
+        checks["non_manifold"]["detail"] += f"; boundary: {n_boundary}"      # boundary edges reported, never flagged
+        put("loose", bool(loose_v or loose_e), "WARN", f"{len(loose_v)} loose vertices, {len(loose_e)} loose edges",
+            len(loose_v) + len(loose_e), loose_v or loose_e)
+        put("degenerate", bool(degen), "FAIL", f"{len(degen)} zero-area faces", len(degen), degen)
+        put("doubles", bool(doubles), "WARN", f"{len(doubles)} vertices within 1e-5 of another", len(doubles), doubles)
+        put("inconsistent_normals", bool(flipped), "FAIL", f"{len(flipped)} faces point inward", len(flipped), flipped)
+        # UVs (oob read above, from the BMesh)
+        put("missing_uv", opts["require_uv"] and not uvs, "FAIL", "no UV layer")
+        put("uv_out_of_bounds", bool(oob), "WARN", f"{len(oob)} loops of '{uvs[0].name if uvs else ''}' outside 0..1", len(oob), oob)
+        put("missing_uv2", opts["require_uv2"] and len(uvs) < 2, "FAIL", f"{len(uvs)} UV layer(s); a second (lightmap) layer is required")
+        # budgets (evaluated)
+        ev_v, ev_t = self._eval_vert_count(o, dg), self._eval_tri_count(o, dg)
+        put("vertex_count_16bit", ev_v > 65535, "WARN", f"{ev_v} evaluated vertices exceed a 16-bit index buffer", ev_v)
+        put("triangle_budget", opts["max_triangles"] is not None and ev_t > opts["max_triangles"], "FAIL",
+            f"{ev_t} evaluated triangles over the budget of {opts['max_triangles']}", ev_t)
+        # materials and images
+        slots = list(o.material_slots)
+        used = set()
+        if len(me.polygons):
+            mi = array.array('i', [0]) * len(me.polygons)
+            me.polygons.foreach_get("material_index", mi)
+            used = set(mi)
+        bad_slots = [i for i, s in enumerate(slots) if s.material is None or i not in used]
+        put("material_slots", not slots or bool(bad_slots), "WARN",
+            "no material slots" if not slots else
+            "empty or unused slots: " + ", ".join(f"{i}={slots[i].material.name if slots[i].material else '<empty>'}" for i in bad_slots),
+            len(bad_slots) if slots else 1, bad_slots)
+        nonodes = [i for i, s in enumerate(slots) if s.material is not None and not s.material.use_nodes]
+        put("materials_without_nodes", bool(nonodes), "WARN",
+            f"materials without node trees: {[slots[i].material.name for i in nonodes]}", len(nonodes), nonodes)
+        missing = []
+        for s in slots:
+            m = s.material
+            if m is None or not m.use_nodes or m.node_tree is None:
+                continue
+            for node in m.node_tree.nodes:
+                img = getattr(node, "image", None)
+                if img is None or img.packed_file is not None or img.source in ('GENERATED', 'VIEWER'):
+                    continue
+                p = bpy.path.abspath(img.filepath, library=img.library) if img.filepath else ""
+                if not p or not os.path.exists(p):
+                    missing.append(f"{m.name}:{img.name}")
+        put("images_missing", bool(missing), "FAIL", f"images not on disk: {missing}", len(missing))
+        # skinning
+        over = [v.index for v in me.vertices if sum(1 for g in v.groups if g.weight > 0.0) > opts["max_bone_influences"]]
+        put("bone_influences", bool(over), "WARN", f"{len(over)} vertices with more than {opts['max_bone_influences']} weighted groups", len(over), over)
+        # names
+        if rules["strict_names"]:
+            bad_names = [n for n in [o.name] + [s.material.name for s in slots if s.material is not None]
+                         if self._ILLEGAL_NAME_RE.search(n)]
+            put("illegal_names", bool(bad_names), "WARN", f"names with spaces, dots or non-ASCII: {bad_names}", len(bad_names))
+        else:
+            put("illegal_names", False, "WARN", "ok")
+        stem = re.sub(r"\.\d{3,}$", "", o.name)
+        if stems is None:
+            stems = {}
+            for x in bpy.data.objects:
+                stems.setdefault(re.sub(r"\.\d{3,}$", "", x.name), []).append(x.name)
+        twins = [n for n in stems.get(stem, []) if n != o.name]
+        put("name_collisions", bool(twins), "WARN", f"'{o.name}' collides with {twins} once the .NNN suffix is stripped", len(twins))
+        # hierarchy (R-B2-17 (5))
+        children = list(o.children)
+        coll_children = [c for c in children if (c.type == 'MESH' and c.display_type == 'WIRE' and c.hide_render)
+                         or self._collision_named(c.name, o.name)]
+        h_bad, h_detail = False, "ok"
+        if pid == "UNREAL":
+            wrong = [c.name for c in coll_children if not c.name.startswith("UCX_")]
+            h_bad, h_detail = bool(wrong), f"collision children without UCX_ naming: {wrong}"
+        elif pid == "GODOT":
+            wrong = [c.name for c in coll_children if not any(c.name.endswith(s) for s in ("-col", "-convcol", "-colonly"))]
+            h_bad, h_detail = bool(wrong), f"collision children without a -col suffix: {wrong}"
+        elif pid == "TIMBERMESH":
+            chain, p = [], o
+            while p is not None:
+                chain.append(p.name)
+                p = p.parent
+            h_bad, h_detail = not any(n.startswith("#") for n in chain), f"no '#' root in the parent chain {chain}"
+        put("hierarchy", h_bad, "FAIL", h_detail, len(coll_children) if h_bad else 0)
+        return {cid: checks[cid] for cid in self._VALIDATE_CHECKS}
+
+    def find_mesh_issues(self, mesh, issue, render=False, angle="iso_front_right", max_indices=500):
+        """
+        Element indices for one issue class (NON_MANIFOLD / NGONS / LOOSE / DEGENERATE / DOUBLES / FLIPPED /
+        INTERIOR_FACES / BOUNDARY): validate_asset says what, this says where. render=True selects them
+        in edit mode and captures the viewport (GUI only; headless returns the R20 error).
+        """
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        element, count, indices, truncated = self._mesh_issue_indices(m_obj, issue, max_indices)
+        if element is None:
+            return truncated
+        reply = {"success": True, "mesh": m_obj.name, "issue": str(issue).strip().upper(), "element": element,
+                 "count": count, "indices": indices, "truncated": truncated}
+        if render:
+            if bpy.app.background:
+                return {"error": "find_mesh_issues(render=True) needs a GUI session: the viewport capture cannot run under --background",
+                        "background": True, "mesh": m_obj.name, "issue": reply["issue"], "count": count}
+            wanted = set(indices)
+            with self._selection_scope(), self._mesh_select_scope(m_obj.data), self._mode_restore():
+                self._select_only(m_obj)
+                for coll in (m_obj.data.vertices, m_obj.data.edges, m_obj.data.polygons):
+                    for x in coll:
+                        x.select = False
+                seq = {"VERT": m_obj.data.vertices, "EDGE": m_obj.data.edges, "FACE": m_obj.data.polygons}[element]
+                for x in seq:
+                    x.select = x.index in wanted
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_mode(type=element)
+                cap = self.capture_viewport_angle(angle=angle)
+                with suppress(Exception):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            if "error" in cap:
+                reply["image_error"] = cap["error"]
+            else:
+                reply["image"] = cap
+                if cap.get("filepath"):
+                    reply["image_path"] = cap["filepath"]
+        return reply
+
+    _COMPARE_KINDS = ("VERTS", "ORDER", "NORMALS", "UVS", "TANGENTS", "MATERIALS", "GROUPS")
+
+    def compare_meshes(self, mesh_a, mesh_b, tolerance=1e-5, compare="ALL"):
+        """
+        Numeric diff of two meshes for round-trip safety (the SPT lesson, 13.2.3): unit_test_compare first
+        pass (same == "Same", E13), then numpy passes via foreach_get into float64 buffers (M12).
+        """
+        import numpy as np
+        a, err = self._get_mesh(mesh_a)
+        if err:
+            return err
+        b, err = self._get_mesh(mesh_b)
+        if err:
+            return err
+        self._sync_editmesh(a)      # a mesh in EDIT mode is compared as it is now, not as it was at edit entry
+        self._sync_editmesh(b)
+        kinds = [k.strip().upper() for k in str(compare or "ALL").split(",") if k.strip()]
+        if "ALL" in kinds:
+            kinds = list(self._COMPARE_KINDS)
+        bad = [k for k in kinds if k not in self._COMPARE_KINDS]
+        if bad:
+            return {"error": f"compare kinds not valid: {bad}; valid: {list(self._COMPARE_KINDS) + ['ALL']}",
+                    "valid": list(self._COMPARE_KINDS) + ["ALL"]}
+        try:
+            tol = float(tolerance)
+        except (TypeError, ValueError):
+            return {"error": f"tolerance must be a number, got {tolerance!r}"}
+        ma, mb = a.data, b.data
+        try:
+            utc = ma.unit_test_compare(mesh=mb, threshold=tol)
+        except TypeError:
+            utc = ma.unit_test_compare(mesh=mb)
+        na, nb = len(ma.vertices), len(mb.vertices)
+        reply = {"success": True, "mesh_a": a.name, "mesh_b": b.name, "same": utc == "Same", "unit_test_compare": str(utc),
+                 "compare": kinds, "vertices": {"a": na, "b": nb, "delta": nb - na},
+                 "triangles": {"a": self._eval_tri_count(a), "b": self._eval_tri_count(b)},
+                 "positions": None, "order_match": None, "custom_normals": None, "uvs": None, "tangents": None,
+                 "materials": None, "vertex_groups": None}
+        reply["triangles"]["delta"] = reply["triangles"]["b"] - reply["triangles"]["a"]
+
+        def buf(coll, attr, width):
+            out = np.empty(len(coll) * width, dtype=np.float64)
+            coll.foreach_get(attr, out)
+            return out.reshape(-1, width)
+
+        if ("VERTS" in kinds or "ORDER" in kinds) and na == nb and na > 0:
+            ca, cb = buf(ma.vertices, "co", 3), buf(mb.vertices, "co", 3)
+            d = np.linalg.norm(ca - cb, axis=1)
+            differing = int((d > tol).sum())
+            if "VERTS" in kinds:
+                reply["positions"] = {"differing": differing, "max_delta": float(d.max())}
+            if "ORDER" in kinds:
+                # ORDER = index i of A corresponds to index i of B: B's nearest vertex to A[i] is B[i] for every i
+                # (a moved vertex keeps its index; a permutation does not). KD-tree, O(n log n).
+                from mathutils import kdtree
+                tree = kdtree.KDTree(nb)
+                for i in range(nb):
+                    tree.insert(cb[i], i)
+                tree.balance()
+                # B[i] must be as close to A[i] as B's closest vertex is (ties from duplicate vertices allowed)
+                reply["order_match"] = all(d[i] <= tree.find(ca[i])[2] + 1e-9 for i in range(na))
+        elif na == nb == 0:
+            if "VERTS" in kinds:
+                reply["positions"] = {"differing": 0, "max_delta": 0.0}
+            if "ORDER" in kinds:
+                reply["order_match"] = True
+        if "NORMALS" in kinds:
+            cn = {"a": bool(ma.has_custom_normals), "b": bool(mb.has_custom_normals), "max_angle_deg": None}
+            if len(ma.loops) == len(mb.loops) and len(ma.loops) > 0:
+                try:
+                    va, vb = buf(ma.corner_normals, "vector", 3), buf(mb.corner_normals, "vector", 3)
+                    dots = np.clip((va * vb).sum(axis=1), -1.0, 1.0)
+                    cn["max_angle_deg"] = float(np.degrees(np.arccos(dots)).max())
+                except Exception:
+                    cn["max_angle_deg"] = None
+            reply["custom_normals"] = cn
+        if "UVS" in kinds:
+            uv = {"layers_a": [l.name for l in ma.uv_layers], "layers_b": [l.name for l in mb.uv_layers], "max_delta": None}
+            if ma.uv_layers and mb.uv_layers and len(ma.loops) == len(mb.loops) and len(ma.loops) > 0:
+                d = np.linalg.norm(buf(ma.uv_layers[0].data, "uv", 2) - buf(mb.uv_layers[0].data, "uv", 2), axis=1)
+                uv["max_delta"] = float(d.max())
+            reply["uvs"] = uv
+        if "TANGENTS" in kinds:
+            def can_tangent(m):
+                if not m.uv_layers or not len(m.loops):
+                    return False
+                try:
+                    m.calc_tangents(uvmap=m.uv_layers[0].name)
+                    m.free_tangents()
+                    return True
+                except Exception:
+                    return False
+            reply["tangents"] = {"a": can_tangent(ma), "b": can_tangent(mb)}
+        if "MATERIALS" in kinds:
+            la = [s.material.name if s.material else None for s in a.material_slots]
+            lb = [s.material.name if s.material else None for s in b.material_slots]
+            reply["materials"] = {"a": la, "b": lb, "same": la == lb}
+        if "GROUPS" in kinds:
+            ga, gb = [g.name for g in a.vertex_groups], [g.name for g in b.vertex_groups]
+            reply["vertex_groups"] = {"a": ga, "b": gb, "same": ga == gb}
+        # sections that were not asked for are left out of the reply, not reported as null
+        for kind, key in (("VERTS", "positions"), ("ORDER", "order_match"), ("NORMALS", "custom_normals"), ("UVS", "uvs"),
+                          ("TANGENTS", "tangents"), ("MATERIALS", "materials"), ("GROUPS", "vertex_groups")):
+            if kind not in kinds:
+                reply.pop(key, None)
+        return reply
+
+    def apply_transforms(self, objects=None, location=False, rotation=True, scale=True, keep_children_world=True, _objs=None):
+        """
+        object.transform_apply per object with isolate_users=True (a shared mesh gets its own data, E6);
+        5.x corrective_flip_normals is try-passed (flip_corrected). Negative scale is applied anyway and
+        reported. Children keep their world transform (Blender counter-transforms them).
+        """
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        flags = {"location": bool(location), "rotation": bool(rotation), "scale": bool(scale)}
+        if not any(flags.values()):
+            return {"error": "nothing to apply: set location, rotation or scale"}
+        isolated, flipped, negative = [], [], [o.name for o in objs if any(s < 0 for s in o.scale)]
+        with self._selection_scope(), self._mode_restore():
+            for o in objs:
+                if o.type not in ('MESH', 'CURVE', 'SURFACE', 'FONT', 'LATTICE', 'EMPTY', 'ARMATURE', 'META', 'GPENCIL', 'GREASEPENCIL'):
+                    continue
+                shared = o.data is not None and getattr(o.data, "users", 1) > 1
+                # R-B2-39: children either keep their world matrix (default) or keep their parent-inverse and
+                # follow the applied transform
+                kids = [(c, c.matrix_world.copy(), c.matrix_parent_inverse.copy()) for c in o.children]
+                self._select_only(o)
+                kw = dict(flags, isolate_users=True)
+                try:
+                    bpy.ops.object.transform_apply(**kw, corrective_flip_normals=True)
+                    if any(s < 0 for s in o.scale) or o.name in negative:
+                        flipped.append(o.name)
+                except TypeError:
+                    bpy.ops.object.transform_apply(**kw)
+                except Exception as e:
+                    return {"error": f"transform_apply failed on {o.name}: {e}", "objects": [x.name for x in objs]}
+                bpy.context.view_layer.update()
+                for c, world, pinv in kids:
+                    if keep_children_world:
+                        c.matrix_world = world
+                    else:
+                        c.matrix_parent_inverse = pinv
+                if shared and o.data is not None and o.data.users == 1:
+                    isolated.append(o.name)
+        bpy.context.view_layer.update()
+        return {"success": True, "objects": [o.name for o in objs], "applied": flags, "isolated": isolated,
+                "flip_corrected": [n for n in flipped if n in negative], "negative_scale": negative}
+
+    def fix_normals(self, objects=None, mode="OUTSIDE", also_sharp_by_angle=None, _objs=None):
+        """
+        OUTSIDE / INSIDE = bmesh recalc_face_normals (+ reverse for INSIDE); FLIP reverses every face;
+        CLEAR_CUSTOM drops custom split normals (customdata_custom_splitnormals_clear in OBJECT mode, E4).
+        also_sharp_by_angle (degrees) marks edges sharper than the angle. Reply counts per object.
+        """
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        mode_id = str(mode or "").strip().upper()
+        valid = ("OUTSIDE", "INSIDE", "FLIP", "CLEAR_CUSTOM")
+        if mode_id not in valid:
+            return {"error": f"mode '{mode}' not valid; valid: {list(valid)}", "valid": list(valid)}
+        thresh = None
+        if also_sharp_by_angle is not None:
+            try:
+                thresh = math.radians(float(also_sharp_by_angle))
+            except (TypeError, ValueError):
+                return {"error": f"also_sharp_by_angle must be degrees, got {also_sharp_by_angle!r}"}
+        for o in objs:                          # RA-6: the whole list is checked before anything changes (H11)
+            if o.type != 'MESH':
+                return {"error": f"{o.name} is not a mesh object (it is {o.type}); nothing changed"}
+        flipped_by, cleared, sharp_by = {}, [], {}
+        with self._selection_scope(), self._mode_restore():
+            for o in objs:
+                if mode_id == "CLEAR_CUSTOM":
+                    self._select_only(o)
+                    if o.data.has_custom_normals:
+                        with bpy.context.temp_override(object=o, active_object=o):
+                            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+                        cleared.append(o.name)
+                    flipped_by[o.name] = 0
+                else:
+                    with self._bmesh_edit(o) as bm:
+                        before = [f.normal.copy() for f in bm.faces]
+                        if mode_id == "FLIP":
+                            bmesh.ops.reverse_faces(bm, faces=bm.faces)
+                        else:
+                            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+                            if mode_id == "INSIDE":
+                                bmesh.ops.reverse_faces(bm, faces=bm.faces)
+                        bm.normal_update()
+                        flipped_by[o.name] = sum(1 for i, f in enumerate(bm.faces)
+                                                 if before[i].length > 0 and f.normal.dot(before[i]) < 0.0)
+                if thresh is not None:
+                    with self._bmesh_edit(o) as bm:
+                        n = 0
+                        for e in bm.edges:
+                            if len(e.link_faces) == 2:
+                                try:
+                                    if e.calc_face_angle() > thresh:
+                                        e.smooth = False
+                                        n += 1
+                                except ValueError:
+                                    pass
+                        sharp_by[o.name] = n
+        return {"success": True, "objects": [o.name for o in objs], "mode": mode_id, "faces_flipped": flipped_by,
+                "custom_normals_cleared": cleared, "sharp_edges_marked": sharp_by}
+
+    def cleanup_mesh(self, objects=None, remove_doubles=0.0001, delete_loose=True, dissolve_degenerate=True, fill_holes=0,
+                     limited_dissolve=None, _objs=None):
+        """One BMesh pass per object: remove doubles (0 = skip), delete loose verts/edges, dissolve degenerate,
+        fill holes up to N sides (0 = skip), limited dissolve by angle (degrees). Counts per step."""
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        try:
+            dist = float(remove_doubles or 0.0)
+            sides = int(fill_holes or 0)
+            dissolve = math.radians(float(limited_dissolve)) if limited_dissolve is not None else None
+        except (TypeError, ValueError):
+            return {"error": f"remove_doubles / fill_holes / limited_dissolve must be numbers, got "
+                             f"{remove_doubles!r} / {fill_holes!r} / {limited_dissolve!r}"}
+        for o in objs:                          # RA-6: the whole list is checked before anything changes (H11)
+            if o.type != 'MESH':
+                return {"error": f"{o.name} is not a mesh object (it is {o.type}); nothing changed"}
+        per = {}
+        with self._selection_scope(), self._mode_restore():
+            for o in objs:
+                with self._bmesh_edit(o) as bm:
+                    rec = {"faces_before": len(bm.faces), "doubles_removed": 0, "loose_verts_removed": 0,
+                           "loose_edges_removed": 0, "degenerate_dissolved": 0, "holes_filled": 0, "faces_dissolved": 0}
+                    # degenerate first: a zero-area face's coincident verts would otherwise be counted as doubles
+                    if dissolve_degenerate:
+                        n = len(bm.faces)
+                        bmesh.ops.dissolve_degenerate(bm, dist=1e-6, edges=bm.edges)
+                        rec["degenerate_dissolved"] = n - len(bm.faces)
+                    if dist > 0:
+                        n = len(bm.verts)
+                        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=dist)
+                        rec["doubles_removed"] = n - len(bm.verts)
+                    if delete_loose:
+                        wire = [e for e in bm.edges if not e.link_faces]
+                        rec["loose_edges_removed"] = len(wire)
+                        if wire:
+                            bmesh.ops.delete(bm, geom=wire, context='EDGES')
+                        lone = [v for v in bm.verts if not v.link_edges]
+                        rec["loose_verts_removed"] = len(lone)
+                        if lone:
+                            bmesh.ops.delete(bm, geom=lone, context='VERTS')
+                    if sides > 0:
+                        res = bmesh.ops.holes_fill(bm, edges=bm.edges, sides=sides)
+                        rec["holes_filled"] = len(res.get("faces", []))
+                    if dissolve is not None:
+                        n = len(bm.faces)
+                        bmesh.ops.dissolve_limit(bm, angle_limit=dissolve, verts=bm.verts, edges=bm.edges)
+                        rec["faces_dissolved"] = n - len(bm.faces)
+                    rec["faces_after"] = len(bm.faces)
+                    per[o.name] = rec
+        return {"success": True, "objects": [o.name for o in objs], "per_object": per}
+
+    # ─── Engine readiness: optimisation and LODs (B2 L2, PLAN 13.2.3) ─────────
+
+    _DECIMATE_ALIASES = {"COLLAPSE": "COLLAPSE", "PLANAR": "DISSOLVE", "DISSOLVE": "DISSOLVE",
+                         "UNSUBDIVIDE": "UNSUBDIV", "UNSUBDIV": "UNSUBDIV"}
+    _LOD_SUFFIX_RE = re.compile(r"_LOD\d+$")
+
+    def _duplicate_object(self, obj, new_name):
+        """Object + mesh copy linked to the same collections (materials shared through the mesh copy)."""
+        dup = obj.copy()
+        dup.data = obj.data.copy()
+        dup.name = new_name
+        dup.data.name = new_name
+        dup.animation_data_clear() if dup.animation_data else None
+        for coll in (obj.users_collection or [bpy.context.scene.collection]):
+            coll.objects.link(dup)
+        return dup
+
+    @staticmethod
+    def _remove_object_and_mesh(obj):
+        """Delete an object this handler created, and its mesh when nothing else uses it (RA-7)."""
+        with suppress(Exception):
+            me = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if me is not None and me.users == 0:
+                bpy.data.meshes.remove(me)
+
+    def _apply_modifier_on(self, obj, mod_name):
+        """Apply one modifier with the object active (the apply_modifier idiom); raises on failure."""
+        self._select_only(obj)
+        with bpy.context.temp_override(object=obj, active_object=obj):
+            bpy.ops.object.modifier_apply(modifier=mod_name)
+
+    def decimate_mesh(self, mesh, ratio=None, target_triangles=None, mode="COLLAPSE", angle_limit=5.0, iterations=2,
+                      symmetry_axis=None, vertex_group=None, vertex_group_factor=1.0, keep_uv_seams=True,
+                      triangulate=True, apply=True, new_object=None):
+        """
+        Decimate modifier configured then applied (or left live with apply=False). ratio XOR target_triangles;
+        target_triangles iterates the ratio (max 6 passes) until the evaluated triangle count is within 5 %
+        (E3: the modifier's result is read back before applying, never applied per pass). mode COLLAPSE /
+        PLANAR (= DISSOLVE) / UNSUBDIVIDE (= UNSUBDIV); the reply carries the enum id. keep_uv_seams =
+        delimit {UV, SEAM}; triangulate = use_collapse_triangulate; new_object duplicates first (source untouched).
+        """
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        if (ratio is None) == (target_triangles is None):
+            return {"error": "give either ratio or target_triangles, not both and not neither"}
+        mode_id = self._DECIMATE_ALIASES.get(str(mode or "").strip().upper())
+        if mode_id is None:
+            return {"error": f"mode '{mode}' not valid; valid: {list(self._DECIMATE_ALIASES)}", "valid": list(self._DECIMATE_ALIASES)}
+        if ratio is not None:
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError):
+                return {"error": f"ratio must be a number in (0, 1], got {ratio!r}"}
+            if not (0.0 < ratio <= 1.0):
+                return {"error": f"ratio must be in (0, 1], got {ratio}"}
+        if target_triangles is not None:
+            try:
+                target_triangles = int(target_triangles)
+            except (TypeError, ValueError):
+                return {"error": f"target_triangles must be a positive integer, got {target_triangles!r}"}
+            if target_triangles < 1:
+                return {"error": f"target_triangles must be >= 1, got {target_triangles}"}
+        axis = None
+        if symmetry_axis is not None:
+            axis = str(symmetry_axis).strip().upper()
+            if axis not in ("X", "Y", "Z"):
+                return {"error": f"symmetry_axis '{symmetry_axis}' not valid; valid: ['X', 'Y', 'Z']", "valid": ["X", "Y", "Z"]}
+        if vertex_group is not None and m_obj.vertex_groups.get(str(vertex_group)) is None:
+            return {"error": f"vertex group '{vertex_group}' not found on {m_obj.name}; groups: {[g.name for g in m_obj.vertex_groups]}"}
+        if new_object is not None and bpy.data.objects.get(str(new_object)) is not None:
+            return {"error": f"new_object '{new_object}' already exists", "existing": [str(new_object)]}
+        tris_before = self._eval_tri_count(m_obj)
+        with self._selection_scope(), self._mode_restore():
+            target = self._duplicate_object(m_obj, str(new_object)) if new_object is not None else m_obj
+            self._ensure_object_mode(target)
+            mod = target.modifiers.new(name="Decimate", type='DECIMATE')
+            mod.decimate_type = mode_id
+            if mode_id == "COLLAPSE":
+                mod.use_collapse_triangulate = bool(triangulate)
+                mod.delimit = {'UV', 'SEAM'} if keep_uv_seams else set()
+                if axis is not None:
+                    mod.use_symmetry = True
+                    mod.symmetry_axis = axis
+                if vertex_group is not None:
+                    mod.vertex_group = str(vertex_group)
+                    mod.vertex_group_factor = float(vertex_group_factor)
+            elif mode_id == "DISSOLVE":
+                mod.angle_limit = math.radians(float(angle_limit))
+            else:
+                mod.iterations = int(iterations)
+            passes = 1
+            if mode_id == "COLLAPSE":
+                if ratio is not None:
+                    mod.ratio = ratio
+                    ratio_used = ratio
+                else:
+                    ratio_used = max(1e-4, min(1.0, target_triangles / float(tris_before or 1)))
+                    for passes in range(1, 7):
+                        mod.ratio = ratio_used
+                        bpy.context.view_layer.update()
+                        got = self._eval_tri_count(target)
+                        if got <= 0 or abs(got - target_triangles) <= 0.05 * target_triangles:
+                            break
+                        ratio_used = max(1e-4, min(1.0, ratio_used * target_triangles / float(got)))
+            else:
+                ratio_used = ratio if ratio is not None else None
+            bpy.context.view_layer.update()
+            if apply:
+                try:
+                    self._apply_modifier_on(target, mod.name)
+                except Exception as e:
+                    if new_object is not None:          # RA-7: no orphan duplicate on an error
+                        self._remove_object_and_mesh(target)
+                    else:
+                        with suppress(Exception):
+                            target.modifiers.remove(mod)
+                    return {"error": f"could not apply the Decimate modifier on {target.name}: {e}"}
+                mod_name = None
+            else:
+                mod_name = mod.name
+            bpy.context.view_layer.update()
+            tris_after = self._eval_tri_count(target)
+        return {"success": True, "mesh": m_obj.name, "result_object": target.name, "mode": mode_id,
+                "ratio_used": ratio_used, "triangles_before": tris_before, "triangles_after": tris_after,
+                "passes": passes, "applied": bool(apply), "modifier": mod_name}
+
+    def generate_lods(self, mesh, ratios=None, triangle_targets=None, naming="{name}_LOD{level}", collection=None,
+                      parent_to_lod0=False, mode="COLLAPSE", symmetry_axis=None, keep_uv_seams=True,
+                      preserve_silhouette_group=None, transfer_normals=False):
+        """
+        Renames the source to <base>_LOD0 (an existing _LOD<n> suffix is stripped to get base, R-B2-17 (9)) and
+        makes each level with decimate_mesh(new_object=...). ratios XOR triangle_targets; both None = the
+        default "0.5,0.25,0.1" (R-B2-26). Every target name is checked BEFORE any change: a collision returns
+        {error, existing} with the scene untouched. Materials are shared through the mesh copies;
+        transfer_normals = Data Transfer of custom normals from LOD0 (applied).
+        """
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        if ratios is not None and triangle_targets is not None:
+            return {"error": "give ratios or triangle_targets, not both"}
+        if ratios is None and triangle_targets is None:
+            ratios = "0.5,0.25,0.1"
+        levels_spec = []
+        if ratios is not None:
+            parts = [p.strip() for p in str(ratios).split(",") if p.strip()] if isinstance(ratios, str) else list(ratios)
+            if not parts:
+                return {"error": "ratios is empty"}
+            for p in parts:
+                try:
+                    v = float(p)
+                except (TypeError, ValueError):
+                    return {"error": f"ratios must be numbers in (0, 1), got {p!r}"}
+                if not (0.0 < v < 1.0):
+                    return {"error": f"ratios must be in (0, 1), got {v}"}
+                levels_spec.append(("ratio", v))
+        else:
+            parts = [p.strip() for p in str(triangle_targets).split(",") if p.strip()] if isinstance(triangle_targets, str) else list(triangle_targets)
+            if not parts:
+                return {"error": "triangle_targets is empty"}
+            for p in parts:
+                try:
+                    v = int(p)
+                except (TypeError, ValueError):
+                    return {"error": f"triangle_targets must be positive integers, got {p!r}"}
+                if v < 1:
+                    return {"error": f"triangle_targets must be >= 1, got {v}"}
+                levels_spec.append(("target", v))
+        base = self._LOD_SUFFIX_RE.sub("", m_obj.name)
+        try:
+            names = [str(naming).format(name=base, level=i) for i in range(len(levels_spec) + 1)]
+        except (KeyError, IndexError, ValueError) as e:
+            return {"error": f"naming '{naming}' is not a valid template ({{name}}, {{level}}): {e}"}
+        existing = [n for n in names if n != m_obj.name and bpy.data.objects.get(n) is not None]
+        if existing:
+            return {"error": f"LOD names already exist: {existing}", "existing": existing}
+        if preserve_silhouette_group is not None and m_obj.vertex_groups.get(str(preserve_silhouette_group)) is None:
+            return {"error": f"vertex group '{preserve_silhouette_group}' not found on {m_obj.name}"}
+        original_name = m_obj.name
+        m_obj.name = names[0]
+        made = []
+        try:
+            with self._selection_scope(), self._mode_restore():
+                levels = [{"level": 0, "name": m_obj.name, "triangles": self._eval_tri_count(m_obj), "ratio": 1.0}]
+                for i, (kind, value) in enumerate(levels_spec, start=1):
+                    kw = {"mode": mode, "symmetry_axis": symmetry_axis, "keep_uv_seams": keep_uv_seams, "apply": True,
+                          "new_object": names[i], "vertex_group": preserve_silhouette_group}
+                    if kind == "ratio":
+                        kw["ratio"] = value
+                    else:
+                        kw["target_triangles"] = value
+                    r = self.decimate_mesh(m_obj.name, **kw)
+                    if "error" in r:
+                        raise RuntimeError(f"level {i}: {r['error']}")
+                    made.append(bpy.data.objects[names[i]])
+                    levels.append({"level": i, "name": names[i], "triangles": r["triangles_after"],
+                                   "ratio": r["ratio_used"] if r["ratio_used"] is not None else
+                                   (r["triangles_after"] / float(levels[0]["triangles"] or 1))})
+                coll_name = None
+                if collection is not None:
+                    coll = bpy.data.collections.get(str(collection))
+                    if coll is None:
+                        coll = bpy.data.collections.new(str(collection))
+                        bpy.context.scene.collection.children.link(coll)
+                    for o in [m_obj] + made:
+                        if o.name not in coll.objects:
+                            coll.objects.link(o)
+                    coll_name = coll.name
+                if parent_to_lod0:
+                    for o in made:
+                        o.parent = m_obj
+                        o.matrix_parent_inverse = m_obj.matrix_world.inverted()
+                transferred = False
+                if transfer_normals and made:
+                    for o in made:
+                        dt = o.modifiers.new(name="LODNormals", type='DATA_TRANSFER')
+                        dt.object = m_obj
+                        dt.use_loop_data = True
+                        dt.data_types_loops = {'CUSTOM_NORMAL'}
+                        dt.loop_mapping = 'POLYINTERP_NEAREST'
+                        self._apply_modifier_on(o, dt.name)
+                    transferred = all(o.data.has_custom_normals for o in made)
+        except Exception as e:
+            for o in made:
+                with suppress(Exception):
+                    me = o.data
+                    bpy.data.objects.remove(o, do_unlink=True)
+                    if me.users == 0:
+                        bpy.data.meshes.remove(me)
+            m_obj.name = original_name
+            return {"error": f"generate_lods failed, scene restored: {e}"}
+        return {"success": True, "source": base, "lod0": m_obj.name, "levels": levels, "collection": coll_name,
+                "custom_normals_transferred": transferred}
+
+    _NORMAL_MODES = ("AUTO_SMOOTH", "AUTO_SMOOTH_MODIFIER", "WEIGHTED", "SMOOTH", "FLAT", "FROM_OBJECT", "CLEAR_CUSTOM")
+
+    def set_normals(self, objects=None, mode="AUTO_SMOOTH", angle=30.0, keep_sharp=True, source_object=None, apply=True, _objs=None):
+        """
+        AUTO_SMOOTH = object.shade_smooth_by_angle (marks sharp edges, no modifier, both versions, E4);
+        AUTO_SMOOTH_MODIFIER = object.shade_auto_smooth (the 5.x Smooth by Angle nodes modifier; CANCELLED headless
+        on 4.3.2 -> teach error); WEIGHTED = Weighted Normal modifier (FACE_AREA_WITH_ANGLE, keep_sharp);
+        FROM_OBJECT = Data Transfer of custom normals from source_object; SMOOTH / FLAT = mesh shading;
+        CLEAR_CUSTOM = customdata_custom_splitnormals_clear. apply=False leaves the modifier live. angle in degrees.
+        """
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        mode_id = str(mode or "").strip().upper()
+        if mode_id not in self._NORMAL_MODES:
+            return {"error": f"mode '{mode}' not valid; valid: {list(self._NORMAL_MODES)}", "valid": list(self._NORMAL_MODES)}
+        src = None
+        if mode_id == "FROM_OBJECT":
+            if not source_object:
+                return {"error": "source_object is required for mode FROM_OBJECT"}
+            src, serr = self._get_mesh(str(source_object))
+            if serr:
+                return serr
+        try:
+            rad = math.radians(float(angle))
+        except (TypeError, ValueError):
+            return {"error": f"angle must be degrees, got {angle!r}"}
+        for o in objs:
+            if o.type != 'MESH':
+                return {"error": f"{o.name} is not a mesh object (it is {o.type})"}
+        method = {"AUTO_SMOOTH": "shade_smooth_by_angle", "AUTO_SMOOTH_MODIFIER": "smooth_by_angle_modifier",
+                  "WEIGHTED": "weighted_normal", "SMOOTH": "shade_smooth", "FLAT": "shade_flat",
+                  "FROM_OBJECT": "data_transfer", "CLEAR_CUSTOM": "clear_custom"}[mode_id]
+        modifier_used = None
+        with self._selection_scope(), self._mode_restore():
+            for o in objs:
+                self._ensure_object_mode(o)
+                me = o.data
+                if mode_id == "AUTO_SMOOTH":
+                    self._select_only(o)
+                    with bpy.context.temp_override(object=o, active_object=o, selected_editable_objects=[o]):
+                        res = bpy.ops.object.shade_smooth_by_angle(angle=rad, keep_sharp_edges=bool(keep_sharp))
+                    if 'FINISHED' not in res:
+                        return {"error": f"shade_smooth_by_angle returned {sorted(res)} on {o.name}"}
+                elif mode_id == "AUTO_SMOOTH_MODIFIER":
+                    self._select_only(o)
+                    before = {m.name for m in o.modifiers}
+                    with bpy.context.temp_override(object=o, active_object=o, selected_editable_objects=[o]):
+                        res = bpy.ops.object.shade_auto_smooth(angle=rad)
+                    added = [m for m in o.modifiers if m.name not in before]
+                    if 'FINISHED' not in res or not added:
+                        for m in added:
+                            o.modifiers.remove(m)
+                        return {"error": f"shade_auto_smooth returned {sorted(res)} on this Blender (no Smooth by Angle "
+                                         f"modifier was added, E4); use mode AUTO_SMOOTH instead", "valid": list(self._NORMAL_MODES)}
+                    modifier_used = added[-1].name
+                    if apply:
+                        self._apply_modifier_on(o, modifier_used)
+                        modifier_used = None
+                elif mode_id == "WEIGHTED":
+                    m = o.modifiers.new(name="WeightedNormal", type='WEIGHTED_NORMAL')
+                    m.mode = 'FACE_AREA_WITH_ANGLE'
+                    m.keep_sharp = bool(keep_sharp)
+                    modifier_used = m.name
+                    if apply:
+                        self._apply_modifier_on(o, m.name)
+                        modifier_used = None
+                elif mode_id == "FROM_OBJECT":
+                    m = o.modifiers.new(name="NormalsFrom", type='DATA_TRANSFER')
+                    m.object = src
+                    m.use_loop_data = True
+                    m.data_types_loops = {'CUSTOM_NORMAL'}
+                    m.loop_mapping = 'POLYINTERP_NEAREST'
+                    modifier_used = m.name
+                    if apply:
+                        self._apply_modifier_on(o, m.name)
+                        modifier_used = None
+                elif mode_id == "SMOOTH":
+                    me.shade_smooth()
+                elif mode_id == "FLAT":
+                    me.shade_flat()
+                else:
+                    self._select_only(o)
+                    if me.has_custom_normals:
+                        with bpy.context.temp_override(object=o, active_object=o):
+                            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+                me.update()
+        bpy.context.view_layer.update()
+        return {"success": True, "objects": [o.name for o in objs], "mode": mode_id, "method": method,
+                "modifier_used": modifier_used,
+                "has_custom_normals": {o.name: bool(o.data.has_custom_normals) for o in objs},
+                "sharp_edges": {o.name: sum(1 for e in o.data.edges if e.use_edge_sharp) for o in objs}}
+
+    def triangulate_for_export(self, objects=None, quad_method="SHORTEST_DIAGONAL", ngon_method="BEAUTY", keep_custom_normals=True,
+                               min_vertices=4, as_modifier=False, _objs=None):
+        """Triangulate modifier (keeps custom normals, unlike the BMesh op) applied, or left live with as_modifier=True."""
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        for o in objs:
+            if o.type != 'MESH':
+                return {"error": f"{o.name} is not a mesh object (it is {o.type})"}
+        rna = bpy.types.TriangulateModifier.bl_rna.properties
+        q_valid = [i.identifier for i in rna["quad_method"].enum_items]
+        n_valid = [i.identifier for i in rna["ngon_method"].enum_items]
+        q = str(quad_method or "").strip().upper()
+        n = str(ngon_method or "").strip().upper()
+        if q not in q_valid:
+            return {"error": f"quad_method '{quad_method}' not valid; valid: {q_valid}", "valid": q_valid}
+        if n not in n_valid:
+            return {"error": f"ngon_method '{ngon_method}' not valid; valid: {n_valid}", "valid": n_valid}
+        try:
+            min_v = int(min_vertices)
+        except (TypeError, ValueError):
+            return {"error": f"min_vertices must be an integer >= 4, got {min_vertices!r}"}
+        per = {}
+        with self._selection_scope(), self._mode_restore():
+            for o in objs:
+                self._ensure_object_mode(o)
+                before = self._eval_tri_count(o)
+                m = o.modifiers.new(name="Triangulate", type='TRIANGULATE')
+                m.quad_method = q
+                m.ngon_method = n
+                m.min_vertices = max(4, min_v)
+                m.keep_custom_normals = bool(keep_custom_normals)
+                name = m.name
+                if not as_modifier:
+                    try:
+                        self._apply_modifier_on(o, m.name)
+                    except Exception as e:
+                        return {"error": f"could not apply the Triangulate modifier on {o.name}: {e}"}
+                    name = None
+                bpy.context.view_layer.update()
+                per[o.name] = {"triangles_before": before, "triangles_after": self._eval_tri_count(o), "modifier": name}
+        return {"success": True, "objects": [o.name for o in objs], "as_modifier": bool(as_modifier), "per_object": per}
+
+    _BUDGET_GROUPS = ("OBJECT", "COLLECTION", "MATERIAL")
+
+    def get_triangle_budget(self, objects=None, budget=None, group_by="OBJECT", _objs=None):
+        """Evaluated triangle counts (E13) grouped by OBJECT / COLLECTION / MATERIAL, sorted descending, with the share of
+        the total and the budget verdict (over_budget null when no budget). Read-only."""
+        group = str(group_by or "OBJECT").strip().upper()
+        if group not in self._BUDGET_GROUPS:
+            return {"error": f"group_by '{group_by}' not valid; valid: {list(self._BUDGET_GROUPS)}", "valid": list(self._BUDGET_GROUPS)}
+        if objects is None:
+            objs = [o for o in bpy.context.scene.objects if o.type == 'MESH']
+        else:
+            objs, oerr = self._names_or_collection(objects, _objs=_objs)
+            if oerr:
+                return oerr
+            objs = [o for o in objs if o.type == 'MESH']
+        if budget is not None:
+            try:
+                budget = int(budget)
+            except (TypeError, ValueError):
+                return {"error": f"budget must be an integer, got {budget!r}"}
+        dg = bpy.context.evaluated_depsgraph_get()
+        counts = {}
+        for o in objs:
+            if group == "OBJECT":
+                counts[o.name] = counts.get(o.name, 0) + self._eval_tri_count(o, dg)
+            elif group == "COLLECTION":
+                key = o.users_collection[0].name if o.users_collection else "(none)"
+                counts[key] = counts.get(key, 0) + self._eval_tri_count(o, dg)
+            else:
+                ev = o.evaluated_get(dg)
+                me = ev.data
+                try:
+                    me.calc_loop_triangles()
+                    mats = list(me.materials)
+                    for t in me.loop_triangles:
+                        mat = mats[t.material_index] if 0 <= t.material_index < len(mats) else None
+                        key = mat.name if mat is not None else "(none)"
+                        counts[key] = counts.get(key, 0) + 1
+                except Exception:
+                    counts["(none)"] = counts.get("(none)", 0) + self._eval_tri_count(o, dg)
+        total = sum(counts.values())
+        items = [{"name": k, "triangles": v, "share": (v / float(total)) if total else 0.0}
+                 for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+        return {"success": True, "group_by": group, "budget": budget, "total": total, "items": items,
+                "over_budget": (total > budget) if budget is not None else None}
+
+    # ─── Engine readiness: collision (B2 L2, PLAN 13.2.4) ─────────────────────
+
+    _COLLISION_SHAPES = ("CONVEX", "BOX", "SPHERE", "CAPSULE", "CYLINDER", "MESH_DECIMATED", "SLICED_CONVEX")
+
+    def _collision_name(self, pid, mesh_name, shape):
+        """Next free proxy name for a profile (13.2.4 naming rules); Blender's own .NNN suffix handles the rest."""
+        if pid == "UNREAL":
+            n = 0
+            while bpy.data.objects.get(f"UCX_{mesh_name}_{n:02d}") is not None:
+                n += 1
+            return f"UCX_{mesh_name}_{n:02d}"
+        if pid == "GODOT":
+            return f"{mesh_name}-convcol" if shape in ("CONVEX", "SLICED_CONVEX") else f"{mesh_name}-col"
+        if pid == "UNITY":
+            return f"{mesh_name}_Collider"
+        return f"{mesh_name}_COL"
+
+    @staticmethod
+    def _collision_profile_of(name, mesh_name):
+        """Profile whose naming rule the proxy name matches (None when none), used by get_collision_info."""
+        stem = re.sub(r"\.\d{3,}$", "", name)
+        if re.match(rf"^UCX_{re.escape(mesh_name)}_\d+$", stem):
+            return "UNREAL"
+        if stem in (f"{mesh_name}-col", f"{mesh_name}-convcol", f"{mesh_name}-colonly"):
+            return "GODOT"
+        if stem == f"{mesh_name}_Collider":
+            return "UNITY"
+        if stem == f"{mesh_name}_COL":
+            return "GENERIC"
+        return None
+
+    @staticmethod
+    def _hull_bmesh(src):
+        """
+        NEW BMesh = convex hull of src's vertex cloud (E11): coincident vertices merged first (a bisected slab
+        carries doubles along the cut), hull faces built on bare vertices so no source face survives, interior and
+        unused geometry deleted, zero-area faces dissolved, every face a triangle, normals outward. src is untouched.
+        """
+        bm = bmesh.new()
+        for v in src.verts:
+            bm.verts.new(v.co)
+        bm.verts.ensure_lookup_table()
+        if len(bm.verts) >= 2:
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+        if len(bm.verts) < 4:
+            return bm
+        res = bmesh.ops.convex_hull(bm, input=bm.verts)
+        doomed = [g for g in res.get("geom_interior", []) + res.get("geom_unused", []) if g.is_valid]
+        verts = list(dict.fromkeys(g for g in doomed if isinstance(g, bmesh.types.BMVert)))   # a vert can sit in both lists
+        if verts:
+            bmesh.ops.delete(bm, geom=verts, context='VERTS')
+        if bm.faces:
+            bmesh.ops.dissolve_degenerate(bm, dist=1e-6, edges=bm.edges)
+            bmesh.ops.triangulate(bm, faces=bm.faces, quad_method='BEAUTY', ngon_method='BEAUTY')
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        return bm
+
+    @staticmethod
+    def _bm_volume(bm):
+        try:
+            return abs(float(bm.calc_volume(signed=False)))
+        except Exception:
+            return 0.0
+
+    def _proxy_bmesh(self, src_bm, shape, count, axis, padding, lo, hi):
+        """Build the proxy BMeshes for one shape from the evaluated source bmesh (local space). Returns [bm, ...]."""
+        ext = [hi[i] - lo[i] for i in range(3)]
+        center = mathutils.Vector([(lo[i] + hi[i]) / 2.0 for i in range(3)])
+        pad = float(padding)
+        if shape == "CONVEX":
+            return [self._hull_bmesh(src_bm)]
+        if shape == "SLICED_CONVEX":
+            ai = "XYZ".index(axis)
+            out = []
+            step = ext[ai] / float(count) if count else ext[ai]
+            for k in range(count):
+                a0 = lo[ai] + k * step
+                a1 = lo[ai] + (k + 1) * step
+                bm = src_bm.copy()
+                no = mathutils.Vector((0, 0, 0))
+                no[ai] = 1.0
+                if k > 0:
+                    p = center.copy()
+                    p[ai] = a0
+                    bmesh.ops.bisect_plane(bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], plane_co=p, plane_no=no,
+                                           clear_inner=True, clear_outer=False)
+                if k < count - 1:
+                    p = center.copy()
+                    p[ai] = a1
+                    bmesh.ops.bisect_plane(bm, geom=bm.verts[:] + bm.edges[:] + bm.faces[:], plane_co=p, plane_no=no,
+                                           clear_inner=False, clear_outer=True)
+                hull = self._hull_bmesh(bm)
+                bm.free()
+                out.append(hull)
+            return out
+        if shape == "BOX":
+            bm = bmesh.new()
+            bmesh.ops.create_cube(bm, size=1.0)
+            bmesh.ops.scale(bm, vec=mathutils.Vector([ext[i] + 2 * pad for i in range(3)]), verts=bm.verts)
+            bmesh.ops.translate(bm, vec=center, verts=bm.verts)
+            return [bm]
+        if shape == "SPHERE":
+            r = max((mathutils.Vector(v.co) - center).length for v in src_bm.verts) + pad if len(src_bm.verts) else pad
+            bm = bmesh.new()
+            bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12, radius=r)
+            bmesh.ops.translate(bm, vec=center, verts=bm.verts)
+            return [bm]
+        # CAPSULE / CYLINDER: along the longest extent
+        ai = max(range(3), key=lambda i: ext[i])
+        minor = [ext[i] for i in range(3) if i != ai]
+        r = max(minor) / 2.0 + pad
+        h = ext[ai] + 2 * pad
+        bm = bmesh.new()
+        if shape == "CYLINDER":
+            bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=24, radius1=r, radius2=r, depth=h)
+        else:
+            body = max(0.0, h - 2 * r)
+            bmesh.ops.create_uvsphere(bm, u_segments=24, v_segments=12, radius=r)
+            for v in bm.verts:
+                v.co.z += body / 2.0 if v.co.z >= 0 else -body / 2.0
+        rot = {0: mathutils.Matrix.Rotation(math.radians(90.0), 4, 'Y'), 1: mathutils.Matrix.Rotation(math.radians(90.0), 4, 'X'),
+               2: mathutils.Matrix.Identity(4)}[ai]
+        bmesh.ops.transform(bm, matrix=mathutils.Matrix.Translation(center) @ rot, verts=bm.verts)
+        return [bm]
+
+    def create_collision(self, mesh, shape="CONVEX", profile="UNREAL", count=1, axis="Z", decimate_ratio=0.1, padding=0.0,
+                         display_wire=True, parent=True, collection=None):
+        """
+        Collision proxy from the EVALUATED mesh in the source's local space: CONVEX hull (E11), BOX / SPHERE /
+        CAPSULE / CYLINDER fitted to the local bounds (+padding), SLICED_CONVEX = count slabs along axis each hulled,
+        MESH_DECIMATED = the mesh decimated by decimate_ratio. Named per profile, WIRE display, hide_render, no
+        material, parented to the source (parent=True). volume_ratio = proxy volume / source volume.
+        """
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        shape_id = str(shape or "").strip().upper()
+        if shape_id not in self._COLLISION_SHAPES:
+            return {"error": f"shape '{shape}' not valid; valid: {list(self._COLLISION_SHAPES)}", "valid": list(self._COLLISION_SHAPES)}
+        pid, rules = self._profile_names(profile)
+        if pid is None:
+            return rules
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            return {"error": f"count must be an integer 1..32, got {count!r}"}
+        if not (1 <= count <= 32):
+            return {"error": f"count must be 1..32, got {count}"}
+        axis_id = str(axis or "").strip().upper()
+        if axis_id not in ("X", "Y", "Z"):
+            return {"error": f"axis '{axis}' not valid; valid: ['X', 'Y', 'Z']", "valid": ["X", "Y", "Z"]}
+        try:
+            decimate_ratio = float(decimate_ratio)
+            padding = float(padding)
+        except (TypeError, ValueError):
+            return {"error": f"decimate_ratio / padding must be numbers, got {decimate_ratio!r} / {padding!r}"}
+        if not (0.0 < decimate_ratio <= 1.0):
+            return {"error": f"decimate_ratio must be in (0, 1], got {decimate_ratio}"}
+        coll = None
+        if collection is not None:
+            coll = bpy.data.collections.get(str(collection))
+            if coll is None:
+                coll = bpy.data.collections.new(str(collection))
+                bpy.context.scene.collection.children.link(coll)
+        else:
+            coll = m_obj.users_collection[0] if m_obj.users_collection else bpy.context.scene.collection
+        dg = bpy.context.evaluated_depsgraph_get()
+        src_bm = bmesh.new()
+        try:
+            src_bm.from_mesh(m_obj.evaluated_get(dg).data)
+        except Exception as e:
+            src_bm.free()
+            return {"error": f"could not read the evaluated mesh of {m_obj.name}: {e}"}
+        if not src_bm.verts:
+            src_bm.free()
+            return {"error": f"{m_obj.name} has no vertices"}
+        src_volume = self._bm_volume(src_bm)
+        lo = [min(v.co[i] for v in src_bm.verts) for i in range(3)]
+        hi = [max(v.co[i] for v in src_bm.verts) for i in range(3)]
+        proxies = []
+        with self._selection_scope(), self._mode_restore():
+            try:
+                if shape_id == "MESH_DECIMATED":
+                    bms = [src_bm.copy()]
+                else:
+                    bms = self._proxy_bmesh(src_bm, shape_id, count if shape_id == "SLICED_CONVEX" else 1, axis_id,
+                                            padding, lo, hi)
+            finally:
+                src_bm.free()
+            for bm in bms:
+                name = self._collision_name(pid, m_obj.name, shape_id)
+                me = bpy.data.meshes.new(name)
+                try:
+                    bm.to_mesh(me)
+                    volume = self._bm_volume(bm)
+                finally:
+                    bm.free()
+                me.update()
+                px = bpy.data.objects.new(name, me)
+                coll.objects.link(px)
+                if shape_id == "MESH_DECIMATED":
+                    mod = px.modifiers.new(name="Decimate", type='DECIMATE')
+                    mod.decimate_type = 'COLLAPSE'
+                    mod.ratio = decimate_ratio
+                    mod.use_collapse_triangulate = True
+                    try:
+                        self._apply_modifier_on(px, mod.name)
+                    except Exception as e:
+                        self._remove_object_and_mesh(px)            # RA-7: no orphan proxy on an error
+                        for p in proxies:
+                            self._remove_object_and_mesh(bpy.data.objects.get(p["name"]))
+                        return {"error": f"could not decimate the proxy: {e}"}
+                    tmp = bmesh.new()
+                    tmp.from_mesh(px.data)
+                    volume = self._bm_volume(tmp)
+                    tmp.free()
+                if parent:
+                    px.parent = m_obj
+                    px.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+                else:
+                    px.matrix_world = m_obj.matrix_world.copy()
+                px.display_type = 'WIRE' if display_wire else 'TEXTURED'
+                px.hide_render = True
+                bpy.context.view_layer.update()
+                proxies.append({"name": px.name, "triangles": self._eval_tri_count(px),
+                                "volume_ratio": (volume / src_volume) if src_volume > 1e-12 else None})
+        return {"success": True, "mesh": m_obj.name, "shape": shape_id, "profile": pid, "proxies": proxies,
+                "parent": m_obj.name if parent else None, "collection": coll.name if collection is not None else None}
+
+    def get_collision_info(self, mesh):
+        """Proxies of mesh by every profile's naming rule (UCX_<mesh>_NN, -col / -convcol / -colonly, _Collider, _COL),
+        with their evaluated triangle counts and whether they are children of the mesh. Read-only."""
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        dg = bpy.context.evaluated_depsgraph_get()
+        out = []
+        for o in bpy.data.objects:
+            if o is m_obj or o.type != 'MESH':
+                continue
+            pid = self._collision_profile_of(o.name, m_obj.name)
+            if pid is None:
+                continue
+            out.append({"name": o.name, "profile": pid, "triangles": self._eval_tri_count(o, dg), "is_child": o.parent is m_obj})
+        out.sort(key=lambda p: p["name"])
+        return {"success": True, "mesh": m_obj.name, "proxies": out}
+
+    def check_collision_fit(self, mesh, samples=2000):
+        """
+        Fraction of area-weighted random surface samples of the evaluated mesh (seed 0, deterministic) that lie inside
+        the union of its proxies (BVH nearest-point normal test), and the largest distance an uncovered sample is
+        from the nearest proxy surface. The numeric answer to "does the collider cover the mesh".
+        """
+        from mathutils.bvhtree import BVHTree
+        m_obj, err = self._get_mesh(mesh)
+        if err:
+            return err
+        try:
+            samples = int(samples)
+        except (TypeError, ValueError):
+            return {"error": f"samples must be an integer 1..20000, got {samples!r}"}
+        if not (1 <= samples <= 20000):
+            return {"error": f"samples must be 1..20000, got {samples}"}
+        info = self.get_collision_info(m_obj.name)
+        names = [p["name"] for p in info.get("proxies", [])]
+        if not names:
+            return {"error": f"no collision proxies found for {m_obj.name} (create_collision first)", "mesh": m_obj.name}
+        dg = bpy.context.evaluated_depsgraph_get()
+        me = m_obj.evaluated_get(dg).data
+        me.calc_loop_triangles()
+        tris = list(me.loop_triangles)
+        if not tris:
+            return {"error": f"{m_obj.name} has no faces to sample"}
+        mw = m_obj.matrix_world
+        verts = me.vertices
+        areas = []
+        for t in tris:
+            a, b, c = (mw @ verts[i].co for i in t.vertices)
+            areas.append((b - a).cross(c - a).length / 2.0)
+        total = sum(areas)
+        if total <= 0:
+            return {"error": f"{m_obj.name} has zero surface area"}
+        cum, acc = [], 0.0
+        for ar in areas:
+            acc += ar
+            cum.append(acc)
+        import bisect
+        rng = random.Random(0)
+        proxies = []
+        for n in names:
+            px = bpy.data.objects[n]
+            try:
+                proxies.append((BVHTree.FromObject(px, dg), px.matrix_world.inverted(), px.matrix_world))
+            except Exception:
+                continue
+        if not proxies:
+            return {"error": f"no usable proxy geometry for {m_obj.name}", "proxies": names}
+        inside = 0
+        max_outside = 0.0
+        for _ in range(samples):
+            t = tris[min(bisect.bisect_left(cum, rng.random() * total), len(tris) - 1)]
+            r1, r2 = rng.random(), rng.random()
+            if r1 + r2 > 1.0:
+                r1, r2 = 1.0 - r1, 1.0 - r2
+            a, b, c = (mw @ verts[i].co for i in t.vertices)
+            p = a + (b - a) * r1 + (c - a) * r2
+            covered = False
+            best = None
+            for tree, inv, pmw in proxies:
+                lp = inv @ p
+                loc, nor, idx, dist = tree.find_nearest(lp)
+                if loc is None:
+                    continue
+                if nor.dot(lp - loc) <= 1e-6:
+                    covered = True
+                    break
+                d = (pmw @ loc - p).length
+                best = d if best is None else min(best, d)
+            if covered:
+                inside += 1
+            elif best is not None:
+                max_outside = max(max_outside, best)
+        return {"success": True, "mesh": m_obj.name, "samples": samples, "proxies": names,
+                "covered_fraction": inside / float(samples), "max_outside_distance": max_outside, "inside_samples": inside}
+
+    # ─── Engine readiness: sockets, pivots and hierarchy (B2 L3, PLAN 13.2.5) ──
+
+    _SOCKET_PROFILES = ("UNREAL", "TIMBERMESH", "UNITY", "GENERIC")
+    _SOCKET_PREFIX = {"UNREAL": "SOCKET_", "TIMBERMESH": "#", "UNITY": "", "GENERIC": ""}
+    _PIVOT_MODES = ("BOTTOM_CENTER", "CENTER", "TOP_CENTER", "WORLD_ORIGIN", "CURSOR", "CUSTOM")
+    _SNAP_WHAT = ("ORIGIN", "BOUNDS_MIN", "BOUNDS_CENTER")
+
+    def _vec3_arg(self, value, label):
+        """"x,y,z" string or a 3-list -> ([x, y, z], None) or (None, error dict)."""
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+        else:
+            parts = value
+        try:
+            vec, err = self._vec3(parts, label)
+        except TypeError:
+            vec, err = None, f"{label} must be 3 numbers, got {value!r}"
+        return (vec, None) if err is None else (None, {"error": err})
+
+    @staticmethod
+    def _has_hash_root(obj):
+        p = obj
+        while p is not None:
+            if p.name.startswith("#"):
+                return True
+            p = p.parent
+        return False
+
+    @staticmethod
+    def _parent_keep_world(child, parent, bone=None):
+        """Parent child under parent (or a bone) keeping its world transform."""
+        world = child.matrix_world.copy()
+        child.parent = parent
+        if bone:
+            child.parent_type = 'BONE'
+            child.parent_bone = bone
+        else:
+            child.parent_type = 'OBJECT'
+        child.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        child.matrix_world = world
+
+    def add_socket(self, parent, name, location="0,0,0", rotation="0,0,0", space="LOCAL", profile="UNREAL", bone=None,
+                   display_size=0.1, snap_to="NONE", vertex_index=None):
+        """
+        Empty parented to `parent` (or to `bone` of an ARMATURE parent) named SOCKET_<name> (UNREAL), #<name>
+        (TIMBERMESH, needs a '#' root in the parent chain) or <name>. location / rotation (degrees) in LOCAL or
+        WORLD space; snap_to SURFACE = closest point on the parent mesh from the location, VERTEX = vertex_index.
+        """
+        p_obj = bpy.data.objects.get(str(parent))
+        if p_obj is None:
+            return {"error": f"Object not found: {parent}"}
+        if not name:
+            return {"error": "name is required"}
+        pid = str(profile or "UNREAL").strip().upper()
+        if pid not in self._SOCKET_PROFILES:
+            return {"error": f"profile '{profile}' not valid; valid: {list(self._SOCKET_PROFILES)}", "valid": list(self._SOCKET_PROFILES)}
+        space_id = str(space or "LOCAL").strip().upper()
+        if space_id not in ("LOCAL", "WORLD"):
+            return {"error": f"space '{space}' not valid; valid: ['LOCAL', 'WORLD']", "valid": ["LOCAL", "WORLD"]}
+        snap_id = str(snap_to or "NONE").strip().upper()
+        if snap_id not in ("NONE", "SURFACE", "VERTEX"):
+            return {"error": f"snap_to '{snap_to}' not valid; valid: ['NONE', 'SURFACE', 'VERTEX']", "valid": ["NONE", "SURFACE", "VERTEX"]}
+        loc, lerr = self._vec3_arg(location, "location")
+        if lerr:
+            return lerr
+        rot, rerr = self._vec3_arg(rotation, "rotation")
+        if rerr:
+            return rerr
+        try:
+            display_size = float(display_size)
+        except (TypeError, ValueError):
+            return {"error": f"display_size must be a number, got {display_size!r}"}
+        if bone is not None:
+            if p_obj.type != 'ARMATURE':
+                return {"error": f"bone given but {p_obj.name} is a {p_obj.type}, not an ARMATURE"}
+            if p_obj.data.bones.get(str(bone)) is None:
+                return {"error": f"bone '{bone}' not found on {p_obj.name}; bones: {[b.name for b in p_obj.data.bones][:30]}"}
+        if pid == "TIMBERMESH" and not self._has_hash_root(p_obj):
+            return {"error": f"TIMBERMESH sockets need a '#' root in the parent chain of {p_obj.name} (Timbermesh merges "
+                             f"everything else into its nearest '#' node); none found"}
+        loc_v = mathutils.Vector(loc)
+        world_loc = (p_obj.matrix_world @ loc_v) if space_id == "LOCAL" else loc_v
+        if snap_id == "VERTEX":
+            if p_obj.type != 'MESH':
+                return {"error": f"snap_to VERTEX needs a MESH parent, {p_obj.name} is {p_obj.type}"}
+            if vertex_index is None:
+                return {"error": "vertex_index is required for snap_to VERTEX"}
+            try:
+                vi = int(vertex_index)
+            except (TypeError, ValueError):
+                return {"error": f"vertex_index must be an integer, got {vertex_index!r}"}
+            n = len(p_obj.data.vertices)
+            if not (0 <= vi < n):
+                return {"error": f"vertex_index {vi} out of range (mesh has {n} vertices)"}
+            world_loc = p_obj.matrix_world @ p_obj.data.vertices[vi].co
+        elif snap_id == "SURFACE":
+            if p_obj.type != 'MESH':
+                return {"error": f"snap_to SURFACE needs a MESH parent, {p_obj.name} is {p_obj.type}"}
+            hit, lp, _nor, _idx = p_obj.closest_point_on_mesh(p_obj.matrix_world.inverted() @ world_loc)
+            if not hit:
+                return {"error": f"closest_point_on_mesh found no surface on {p_obj.name}"}
+            world_loc = p_obj.matrix_world @ lp
+        rot_m = mathutils.Euler([math.radians(v) for v in rot], 'XYZ').to_matrix().to_4x4()
+        full = self._SOCKET_PREFIX[pid] + str(name)
+        sock = bpy.data.objects.new(full, None)
+        sock.empty_display_type = 'ARROWS'
+        sock.empty_display_size = display_size
+        coll = p_obj.users_collection[0] if p_obj.users_collection else bpy.context.scene.collection
+        coll.objects.link(sock)
+        sock.parent = p_obj
+        if bone is not None:
+            sock.parent_type = 'BONE'
+            sock.parent_bone = str(bone)
+        sock.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        bpy.context.view_layer.update()
+        if space_id == "LOCAL" and snap_id == "NONE":
+            sock.location = loc_v
+            sock.rotation_euler = [math.radians(v) for v in rot]
+        else:
+            sock.matrix_world = mathutils.Matrix.Translation(world_loc) @ (rot_m if space_id == "WORLD" else
+                                                                           (p_obj.matrix_world.to_3x3().to_4x4() @ rot_m))
+        bpy.context.view_layer.update()
+        mw = sock.matrix_world
+        return {"success": True, "name": sock.name, "parent": p_obj.name, "bone": str(bone) if bone is not None else None,
+                "profile": pid, "location_world": [round(float(v), 6) for v in mw.translation],
+                "rotation_world": [round(math.degrees(a), 6) for a in mw.to_euler('XYZ')],
+                "matrix_world": [[round(float(v), 6) for v in row] for row in mw]}
+
+    def list_sockets(self, parent=None):
+        """EMPTY objects named SOCKET_* or #* (any parent), or every EMPTY child of `parent` when given. Read-only."""
+        if parent is not None:
+            p_obj = bpy.data.objects.get(str(parent))
+            if p_obj is None:
+                return {"error": f"Object not found: {parent}"}
+            pool = [o for o in p_obj.children if o.type == 'EMPTY']
+        else:
+            pool = [o for o in bpy.data.objects if o.type == 'EMPTY' and (o.name.startswith("SOCKET_") or o.name.startswith("#"))]
+        out = []
+        for o in sorted(pool, key=lambda x: x.name):
+            prof = "UNREAL" if o.name.startswith("SOCKET_") else ("TIMBERMESH" if o.name.startswith("#") else "GENERIC")
+            out.append({"name": o.name, "profile": prof, "parent": o.parent.name if o.parent else None,
+                        "bone": o.parent_bone if (o.parent is not None and o.parent_type == 'BONE' and o.parent_bone) else None,
+                        "location_local": [round(float(v), 6) for v in o.location],
+                        "location_world": [round(float(v), 6) for v in o.matrix_world.translation],
+                        "rotation_local": [round(math.degrees(a), 6) for a in o.rotation_euler]})
+        return {"success": True, "parent": p_obj.name if parent is not None else None, "count": len(out), "sockets": out}
+
+    def set_pivot(self, objects=None, mode="BOTTOM_CENTER", location=None, keep_world=True, _objs=None):
+        """Batch wrapper on set_origin: BOTTOM_CENTER / TOP_CENTER / CUSTOM pass through, CENTER = ORIGIN_GEOMETRY,
+        WORLD_ORIGIN = CUSTOM at 0,0,0, CURSOR = ORIGIN_CURSOR. World geometry never moves; every name is checked first."""
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        mode_id = str(mode or "").strip().upper()
+        if mode_id not in self._PIVOT_MODES:
+            return {"error": f"mode '{mode}' not valid; valid: {list(self._PIVOT_MODES)}", "valid": list(self._PIVOT_MODES)}
+        if mode_id == "CUSTOM" and location is None:
+            return {"error": "location=\"x,y,z\" (world) is required for mode CUSTOM"}
+        for o in objs:
+            if o.type != 'MESH' and mode_id in ("BOTTOM_CENTER", "TOP_CENTER", "CUSTOM", "WORLD_ORIGIN"):
+                return {"error": f"{o.name} is not a mesh object (it is {o.type})"}
+        per = {}
+        for o in objs:
+            if mode_id in ("BOTTOM_CENTER", "TOP_CENTER"):
+                r = self.set_origin(o.name, mode_id, keep_world=keep_world)          # R-B2-39
+            elif mode_id == "CUSTOM":
+                r = self.set_origin(o.name, "CUSTOM", location, keep_world=keep_world)
+            elif mode_id == "WORLD_ORIGIN":
+                r = self.set_origin(o.name, "CUSTOM", "0,0,0", keep_world=keep_world)
+            elif mode_id == "CENTER":
+                r = self.set_origin(o.name, "ORIGIN_GEOMETRY")
+            else:
+                r = self.set_origin(o.name, "ORIGIN_CURSOR")
+            if "error" in r:
+                return {"error": f"{o.name}: {r['error']}", "objects": [x.name for x in objs], "done": list(per)}
+            per[o.name] = {"new_location": [float(v) for v in o.location]}
+        return {"success": True, "objects": [o.name for o in objs], "mode": mode_id, "per_object": per,
+                "keep_world": bool(keep_world)}
+
+    def snap_to_grid(self, objects=None, grid=1.0, axes="XYZ", what="ORIGIN", _objs=None):
+        """Move each object so its origin (or world bbox min / centre) lands on the grid on the chosen axes."""
+        objs, oerr = self._names_or_collection(objects, _objs=_objs)
+        if oerr:
+            return oerr
+        try:
+            grid = float(grid)
+        except (TypeError, ValueError):
+            return {"error": f"grid must be a number > 0, got {grid!r}"}
+        if grid <= 0:
+            return {"error": f"grid must be > 0, got {grid}"}
+        ax = str(axes or "").strip().upper()
+        if not ax or any(c not in "XYZ" for c in ax):
+            return {"error": f"axes '{axes}' not valid; use any of X, Y, Z (e.g. \"XY\")", "valid": ["X", "Y", "Z", "XY", "XZ", "YZ", "XYZ"]}
+        what_id = str(what or "ORIGIN").strip().upper()
+        if what_id not in self._SNAP_WHAT:
+            return {"error": f"what '{what}' not valid; valid: {list(self._SNAP_WHAT)}", "valid": list(self._SNAP_WHAT)}
+        per = {}
+        for o in objs:
+            before = [float(v) for v in o.location]
+            if what_id == "ORIGIN":
+                anchor = o.matrix_world.translation.copy()
+            else:
+                corners = [o.matrix_world @ mathutils.Vector(c) for c in o.bound_box]
+                lo = [min(c[i] for c in corners) for i in range(3)]
+                hi = [max(c[i] for c in corners) for i in range(3)]
+                anchor = mathutils.Vector(lo) if what_id == "BOUNDS_MIN" else mathutils.Vector([(lo[i] + hi[i]) / 2.0 for i in range(3)])
+            delta = mathutils.Vector((0, 0, 0))
+            for i, c in enumerate("XYZ"):
+                if c in ax:
+                    delta[i] = round(anchor[i] / grid) * grid - anchor[i]
+            mw = o.matrix_world.copy()
+            mw.translation = mw.translation + delta
+            o.matrix_world = mw
+            bpy.context.view_layer.update()
+            per[o.name] = {"before": before, "after": [round(float(v), 6) for v in o.location]}
+        return {"success": True, "objects": [o.name for o in objs], "grid": grid, "axes": ax, "what": what_id, "per_object": per}
+
+    def build_export_hierarchy(self, root_name, meshes, collision=None, sockets=None, lods=None, profile="UNREAL"):
+        """
+        Root EMPTY (reused when it exists) with the meshes under it; LODs as root siblings with an int `lod_group`
+        custom prop; collision under its mesh (GODOT: a root sibling); sockets under their mesh. World transforms
+        are kept. Every name is checked before anything changes ({error, unknown}).
+        """
+        pid, rules = self._profile_names(profile)
+        if pid is None:
+            return rules
+        if not root_name:
+            return {"error": "root_name is required"}
+        groups = {}
+        for label, value in (("meshes", meshes), ("collision", collision), ("sockets", sockets), ("lods", lods)):
+            names = self._names_arg(value) or []
+            if label == "meshes" and not names:
+                return {"error": "meshes is required (comma list)"}
+            unknown = [n for n in names if bpy.data.objects.get(n) is None]
+            if unknown:
+                return {"error": f"{label} not found: {unknown}", "unknown": unknown}
+            groups[label] = [bpy.data.objects[n] for n in names]
+        root = bpy.data.objects.get(str(root_name))
+        created = False
+        if root is None:
+            root = bpy.data.objects.new(str(root_name), None)
+            root.empty_display_type = 'PLAIN_AXES'
+            coll = groups["meshes"][0].users_collection[0] if groups["meshes"][0].users_collection else bpy.context.scene.collection
+            coll.objects.link(root)
+            created = True
+        elif root.type != 'EMPTY':
+            return {"error": f"root_name '{root_name}' exists but is a {root.type}, not an EMPTY"}
+        props_set = {}
+
+        def set_prop(o, key, value):
+            o[key] = value
+            props_set.setdefault(o.name, {})[key] = value
+
+        def mesh_for(name):
+            """The mesh a collision / socket name refers to (naming rule prefix), else the first mesh."""
+            best = None
+            for m in groups["meshes"] + groups["lods"]:
+                if name.startswith(m.name) or name.startswith("UCX_" + m.name):
+                    if best is None or len(m.name) > len(best.name):
+                        best = m
+            return best or groups["meshes"][0]
+
+        with self._selection_scope(), self._mode_restore():
+            for i, m in enumerate(groups["meshes"]):
+                if m.parent is not root:
+                    self._parent_keep_world(m, root)
+                mm = self._LOD_SUFFIX_RE.search(m.name)
+                set_prop(m, "lod_group", int(mm.group(0)[4:]) if mm else 0)
+            for i, l in enumerate(groups["lods"], start=1):
+                if l.parent is not root:
+                    self._parent_keep_world(l, root)
+                mm = self._LOD_SUFFIX_RE.search(l.name)
+                set_prop(l, "lod_group", int(mm.group(0)[4:]) if mm else i)
+            for c in groups["collision"]:
+                target = root if pid == "GODOT" else mesh_for(c.name)
+                if c.parent is not target:
+                    self._parent_keep_world(c, target)
+            for s in groups["sockets"]:
+                target = s.parent if (s.parent is not None and s.parent in groups["meshes"] + groups["lods"]) else mesh_for(s.name)
+                if s.parent is not target:
+                    self._parent_keep_world(s, target)
+            bpy.context.view_layer.update()
+
+        def tree(o):
+            return {"name": o.name, "type": o.type, "children": [tree(c) for c in sorted(o.children, key=lambda x: x.name)]}
+
+        return {"success": True, "root": root.name, "profile": pid, "created_root": created, "tree": tree(root),
+                "custom_props_set": props_set}
+
+    # ─── Engine readiness: engine export (B2 L3, PLAN 13.2.6) ─────────────────
+
+    _ENGINE_PRESETS = {
+        "UNITY": {"format": "fbx", "exporter": "fbx", "axis": {"forward": "-Z", "up": "Y"},
+                  "units": {"scale_length": 1.0, "length_unit": "METERS"},
+                  "kwargs": {"axis_forward": "-Z", "axis_up": "Y", "apply_scale_options": "FBX_SCALE_ALL", "global_scale": 1.0,
+                             "use_tspace": True, "mesh_smooth_type": "FACE", "add_leaf_bones": False, "bake_space_transform": False,
+                             "use_custom_props": True},
+                  "notes": ["Y-up, metres; _LOD0.._LODn naming builds a LODGroup on import"]},
+        "UNREAL": {"format": "fbx", "exporter": "fbx", "axis": {"forward": "-Y", "up": "Z"},
+                   "units": {"scale_length": 0.01, "length_unit": "CENTIMETERS"},
+                   "kwargs": {"axis_forward": "-Y", "axis_up": "Z", "global_scale": 1.0, "apply_scale_options": "FBX_SCALE_NONE",
+                              "use_tspace": True, "mesh_smooth_type": "FACE", "add_leaf_bones": False, "use_custom_props": True},
+                   "notes": ["Z-up, centimetres: run set_scene_units(UNREAL) so scale_length is 0.01",
+                             "UCX_<mesh>_NN collision children, SOCKET_ empties, UV1 lightmaps"]},
+        "GODOT": {"format": "glb", "exporter": "gltf", "axis": {"forward": "-Z", "up": "Y"},
+                  "units": {"scale_length": 1.0, "length_unit": "METERS"},
+                  "kwargs": {"export_yup": True, "export_apply": True, "export_tangents": True, "export_extras": True,
+                             "export_attributes": True, "export_vertex_color": "MATERIAL", "export_image_format": "AUTO"},
+                  "notes": ["glTF Y-up; -col / -convcol / -colonly suffixes; colour attribute names are not preserved by glTF"]},
+        "BEVY": {"format": "glb", "exporter": "gltf", "axis": {"forward": "-Z", "up": "Y"},
+                 "units": {"scale_length": 1.0, "length_unit": "METERS"},
+                 "kwargs": {"export_yup": True, "export_apply": True, "export_tangents": True, "export_extras": True,
+                            "export_attributes": True, "export_vertex_color": "MATERIAL", "export_image_format": "AUTO"},
+                 "notes": ["glTF Y-up; named nodes and extras are readable from Bevy"]},
+        "TIMBERMESH": {"format": "timbermesh", "exporter": "timbermesh", "axis": None,
+                       "units": {"scale_length": 1.0, "length_unit": "METERS"},
+                       "kwargs": {"merge_meshes": True, "single_animation": True, "use_vertex_animations": False},
+                       "notes": ["exports a collection; '#'-prefixed objects keep their own node; meshes split per material name"]},
+        "GENERIC_FBX": {"format": "fbx", "exporter": "fbx", "axis": None,
+                        "units": {"scale_length": 1.0, "length_unit": "METERS"}, "kwargs": {}, "notes": ["Blender FBX defaults"]},
+        "GENERIC_GLTF": {"format": "glb", "exporter": "gltf", "axis": None,
+                         "units": {"scale_length": 1.0, "length_unit": "METERS"}, "kwargs": {}, "notes": ["Blender glTF defaults"]},
+    }
+    _TEXTURE_MODES = ("COPY", "EMBED", "NONE", "KEEP_PATHS")
+
+    def _engine_profile(self, engine):
+        return engine if engine in self._PROFILES else "GENERIC"
+
+    def _engine_naming(self, engine):
+        pid = self._engine_profile(engine)
+        prefix, suffixes = self._PROFILES[pid]["collision"]
+        return {"collision": (prefix + "{mesh}_{nn}") if prefix else ("{mesh}" + (suffixes[0] if suffixes else "_COL")),
+                "socket": (self._PROFILES[pid]["socket"] or "") + "{name}", "lod": "{name}_LOD{level}"}
+
+    def get_export_preset(self, engine):
+        """The preset table entry export_for_engine applies (single source, H6)."""
+        eid = str(engine or "").strip().upper()
+        entry = self._ENGINE_PRESETS.get(eid)
+        if entry is None:
+            return {"error": f"engine '{engine}' not valid; valid: {list(self._ENGINE_PRESETS)}", "valid": list(self._ENGINE_PRESETS)}
+        return {"success": True, "engine": eid, "format": entry["format"], "exporter": entry["exporter"],
+                "kwargs": dict(entry["kwargs"]), "axis": dict(entry["axis"]) if entry["axis"] else None,
+                "units": dict(entry["units"]), "naming": self._engine_naming(eid), "notes": list(entry["notes"])}
+
+    @staticmethod
+    def _images_of(objs):
+        """(material, image) pairs referenced by the node trees of the objects' materials."""
+        seen, out = set(), []
+        for o in objs:
+            if o.type != 'MESH':
+                continue
+            for slot in o.material_slots:
+                m = slot.material
+                if m is None or not m.use_nodes or m.node_tree is None:
+                    continue
+                for node in m.node_tree.nodes:
+                    img = getattr(node, "image", None)
+                    if img is not None and img.name not in seen:
+                        seen.add(img.name)
+                        out.append((m, img))
+        return out
+
+    def export_for_engine(self, objects=None, collection=None, engine=None, filepath=None, include_hierarchy=True,
+                          include_collision=True, include_sockets=True, include_lods=True, include_animation=False,
+                          apply_modifiers=True, triangulate=True, validate=True, textures="COPY", overrides=None, _objs=None):
+        """
+        Preset export (13.2.6): validate_asset first (FAIL refuses unless overrides {"force": true}), the full
+        hierarchy selected, a TEMPORARY Triangulate modifier per mesh during the export (D6: removed in finally, the
+        scene mesh keeps its polygons), the preset kwargs + overrides checked against the live exporter, textures
+        copied beside the file, and <file>.manifest.json written beside it (H7).
+        """
+        eid = str(engine or "").strip().upper()
+        entry = self._ENGINE_PRESETS.get(eid)
+        if entry is None:
+            return {"error": f"engine '{engine}' not valid; valid: {list(self._ENGINE_PRESETS)}", "valid": list(self._ENGINE_PRESETS)}
+        roots, oerr = self._names_or_collection(objects, collection, _objs=_objs)
+        if oerr:
+            return oerr
+        if triangulate and not apply_modifiers:
+            # R-B2-38: the temporary Triangulate modifier only reaches the file when the exporter evaluates modifiers
+            return {"error": "triangulate=True requires apply_modifiers=True (the exporter must evaluate the temporary "
+                             "Triangulate modifier); pass triangulate=False to export the polygons as they are"}
+        tex_mode = str(textures or "COPY").strip().upper()
+        if tex_mode not in self._TEXTURE_MODES:
+            return {"error": f"textures '{textures}' not valid; valid: {list(self._TEXTURE_MODES)}", "valid": list(self._TEXTURE_MODES)}
+        ov, jerr = self._json_arg(overrides, "overrides")
+        if jerr:
+            return jerr
+        if ov is None:
+            ov = {}
+        if not isinstance(ov, dict):
+            return {"error": f"overrides must be a JSON object, got {type(ov).__name__}"}
+        force = bool(ov.pop("force", False))
+        fmt = entry["format"]
+        if not filepath:
+            filepath = os.path.join(tempfile.gettempdir(), f"blender_export_{os.getpid()}.{fmt}")
+        filepath = str(filepath)
+        out_dir = os.path.dirname(os.path.abspath(filepath))
+        if not os.path.isdir(out_dir):
+            return {"error": f"directory does not exist: {out_dir}"}
+        # the object set
+        objs = []
+        for r in roots:
+            if r not in objs:
+                objs.append(r)
+            if include_hierarchy:
+                for c in r.children_recursive:
+                    if c not in objs:
+                        objs.append(c)
+        mesh_names = {o.name for o in objs if o.type == 'MESH'}
+
+        def is_collision(o):
+            return o.type == 'MESH' and (any(self._collision_profile_of(o.name, m) for m in mesh_names if m != o.name)
+                                         or (o.display_type == 'WIRE' and o.hide_render))
+
+        def is_socket(o):
+            return o.type == 'EMPTY' and o.parent is not None and (o.name.startswith("SOCKET_") or o.name.startswith("#") or o.parent.type == 'MESH')
+
+        def is_lod(o):
+            mm = self._LOD_SUFFIX_RE.search(o.name)
+            return o.type == 'MESH' and mm is not None and int(mm.group(0)[4:]) >= 1
+
+        if not include_collision:
+            objs = [o for o in objs if o in roots or not is_collision(o)]
+        if not include_sockets:
+            objs = [o for o in objs if o in roots or not is_socket(o)]
+        if not include_lods:
+            objs = [o for o in objs if o in roots or not is_lod(o)]
+        meshes = [o for o in objs if o.type == 'MESH']
+        if not meshes and fmt != "timbermesh":
+            return {"error": "nothing to export: the object set holds no mesh", "objects": [o.name for o in objs]}
+        warnings = []
+        # validation
+        validation = None
+        if validate:
+            # collision proxies are helpers (no UVs, no materials by design): the renderable meshes are validated
+            to_validate = [m for m in meshes if not is_collision(m)] or meshes
+            if meshes:
+                v = self.validate_asset(_objs=to_validate, profile=self._engine_profile(eid))     # RA-4: refs, not names
+                if "error" in v:
+                    return {"error": f"validation failed to run: {v['error']}"}
+                validation = {"verdict": v["verdict"], "fail": v["summary"]["fail"], "warn": v["summary"]["warn"]}
+                if v["verdict"] == "FAIL" and not force:
+                    failed = sorted({cid for o in v["objects"].values() for cid, c in o.get("checks", {}).items() if c["status"] == "FAIL"})
+                    return {"error": f"validation FAIL on {len(failed)} check(s): {failed}; pass overrides with force true to export anyway",
+                            "validation": validation, "checks_failed": failed}
+            else:
+                validation = {"verdict": "PASS", "fail": 0, "warn": 0}
+        # exporter kwargs: preset + overrides, checked against the live operator
+        kwargs = dict(entry["kwargs"])
+        kwargs.update(ov)
+        op = {"fbx": bpy.ops.export_scene.fbx, "gltf": bpy.ops.export_scene.gltf}.get(entry["exporter"])
+        if op is not None:
+            live_props = op.get_rna_type().properties
+            for key in list(kwargs):
+                prop = live_props.get(key)
+                if prop is None:
+                    warnings.append(f"exporter kwarg '{key}' is not available on this Blender; dropped")
+                    kwargs.pop(key)
+                    continue
+                if prop.type == 'ENUM':
+                    valid = [i.identifier for i in prop.enum_items]
+                    val = str(kwargs[key]).upper()
+                    if val not in valid:
+                        return {"error": f"{key} '{kwargs[key]}' not valid for the {entry['exporter']} exporter on this Blender; valid: {valid}",
+                                "valid": valid}
+                    kwargs[key] = val
+            if entry["exporter"] == "fbx":
+                kwargs.setdefault("use_mesh_modifiers", bool(apply_modifiers))
+                kwargs.setdefault("bake_anim", bool(include_animation))
+                kwargs.setdefault("object_types", {'EMPTY', 'MESH', 'ARMATURE', 'OTHER'})
+                if tex_mode == "EMBED":
+                    kwargs.setdefault("path_mode", 'COPY')
+                    kwargs.setdefault("embed_textures", True)
+                elif tex_mode == "NONE":
+                    kwargs.setdefault("path_mode", 'STRIP')
+            else:
+                kwargs.setdefault("export_apply", bool(apply_modifiers))
+                kwargs.setdefault("export_animations", bool(include_animation))
+                kwargs.setdefault("export_format", 'GLB')
+                if tex_mode == "NONE":
+                    kwargs.setdefault("export_image_format", 'NONE')
+        if eid == "UNREAL":
+            sl = float(bpy.context.scene.unit_settings.scale_length)
+            if abs(sl - 0.01) > 1e-9:
+                warnings.append(f"scene scale_length is {sl}, Unreal expects 0.01: run set_scene_units(UNREAL)")
+        if eid in ("GODOT", "BEVY"):
+            for m in meshes:
+                for ca in m.data.color_attributes:
+                    warnings.append(f"{m.name}: colour attribute '{ca.name}' is renamed by glTF (names are not stored, E9)")
+        for m in meshes:
+            if not m.data.uv_layers:
+                warnings.append(f"{m.name}: no UV layer")
+        # textures: COPY writes each image beside the export; a basename collision gets <parentfolder>_<basename>
+        # (RA-17) and the exporter is pointed at the copies for the duration of the export
+        textures_copied = []
+        retarget = []
+        if tex_mode == "COPY":
+            used = {}
+            for mat, img in self._images_of(meshes):
+                if img.packed_file is not None or img.source in ('GENERATED', 'VIEWER') or not img.filepath:
+                    continue
+                src = os.path.abspath(bpy.path.abspath(img.filepath, library=img.library))
+                if not os.path.exists(src):
+                    warnings.append(f"image '{img.name}' of material '{mat.name}' not on disk: {src}")
+                    continue
+                base = os.path.basename(src)
+                if base in used and used[base] != src:
+                    base = f"{os.path.basename(os.path.dirname(src)) or 'img'}_{base}"
+                used.setdefault(base, src)
+                dst = os.path.join(out_dir, base)
+                try:
+                    if src != os.path.abspath(dst):
+                        shutil.copy2(src, dst)
+                    textures_copied.append(dst)
+                    retarget.append((img, img.filepath, img.filepath_raw))
+                    img.filepath = dst
+                except Exception as e:
+                    warnings.append(f"could not copy '{src}': {e}")
+        # the export, with a temporary Triangulate modifier per mesh (D6)
+        temp_mods = []
+        timbermesh_root = None
+        try:
+            with self._selection_scope(), self._mode_restore():
+                for m in meshes:
+                    self._ensure_object_mode(m)
+                if triangulate:
+                    for m in meshes:
+                        tm = m.modifiers.new(name="MCP_TmpTriangulate", type='TRIANGULATE')
+                        tm.keep_custom_normals = True
+                        temp_mods.append((m, tm.name))
+                bpy.context.view_layer.update()
+                if entry["exporter"] == "timbermesh":
+                    timbermesh_root = self._export_timbermesh(objs, filepath, kwargs)
+                    if isinstance(timbermesh_root, dict):
+                        return timbermesh_root
+                else:
+                    for o in bpy.context.view_layer.objects:
+                        o.select_set(False)
+                    for o in objs:
+                        if o.name in bpy.context.view_layer.objects:
+                            o.select_set(True)
+                    bpy.context.view_layer.objects.active = meshes[0] if meshes else objs[0]
+                    if entry["exporter"] == "fbx":
+                        bpy.ops.export_scene.fbx(filepath=filepath, use_selection=True, **kwargs)
+                    else:
+                        bpy.ops.export_scene.gltf(filepath=filepath, use_selection=True, **kwargs)
+        except Exception as e:
+            return {"error": f"export failed: {e}", "engine": eid, "filepath": filepath}
+        finally:
+            for m, name in temp_mods:
+                with suppress(Exception):
+                    m.modifiers.remove(m.modifiers[name])
+            for img, old_fp, old_raw in retarget:          # RA-17: the scene's images point back at their originals
+                with suppress(Exception):
+                    img.filepath = old_fp
+                    img.filepath_raw = old_raw
+        if not os.path.exists(filepath):
+            return {"error": f"exporter finished but {filepath} was not written", "engine": eid}
+        dg = bpy.context.evaluated_depsgraph_get()
+        materials = sorted({s.material.name for m in meshes for s in m.material_slots if s.material is not None})
+        reply = {"success": True, "filepath": filepath, "engine": eid, "format": fmt, "exporter": entry["exporter"],
+                 "size_bytes": os.path.getsize(filepath), "manifest_path": filepath + ".manifest.json",
+                 "objects": [o.name for o in objs], "triangles": sum(self._eval_tri_count(m, dg) for m in meshes),
+                 "materials": materials, "textures_copied": textures_copied, "validation": validation, "warnings": warnings,
+                 "exporter_kwargs": {k: (sorted(v) if isinstance(v, set) else v) for k, v in kwargs.items()},
+                 "timbermesh_root": timbermesh_root}
+        manifest = {k: v for k, v in reply.items() if k not in ("manifest_path", "success")}
+        manifest.update({"manifest_version": 1, "written_at": datetime.now().isoformat(timespec="seconds"),
+                         "blender": bpy.app.version_string, "preset": eid})
+        try:
+            with open(reply["manifest_path"], "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=1, sort_keys=True)
+        except Exception as e:
+            reply["warnings"].append(f"manifest not written: {e}")
+            reply["manifest_path"] = None
+        return reply
+
+    def _export_timbermesh(self, objs, filepath, kwargs):
+        """Timbermesh export via the plugin's exporter class on a temporary collection (H17/E14). Returns the '#'
+        root name, or an error dict. The temporary collection is removed in finally."""
+        roots = [o for o in objs if o.name.startswith("#") and (o.parent is None or o.parent not in objs)]
+        if not roots:
+            hashed = [o.name for o in objs if o.name.startswith("#")]
+            if not hashed:
+                return {"error": "TIMBERMESH export needs a '#'-prefixed root object in the set (Timbermesh merges everything "
+                                 "into its nearest '#' node); none found", "objects": [o.name for o in objs]}
+            roots = hashed[:1]
+        import addon_utils
+        try:
+            addon_utils.enable("timbermesh_blender_plugin", default_set=False)
+            from timbermesh_blender_plugin import timbermesh_exporter as te
+        except Exception as e:
+            return {"error": f"the Timbermesh add-on (timbermesh_blender_plugin) could not be enabled on this Blender: {e}; "
+                             f"install it from https://github.com/mechanistry/timbermesh and retry"}
+        coll = bpy.data.collections.new(f"MCP_TmpTimbermesh_{os.getpid()}")
+        scene = bpy.context.scene
+        frame = scene.frame_current                 # F-B2-7: the plugin's single_animation export rewinds it
+        try:
+            scene.collection.children.link(coll)
+            for o in objs:
+                if o.type in ('MESH', 'EMPTY') and o.name not in coll.objects:
+                    coll.objects.link(o)
+            bpy.context.view_layer.update()
+            settings = te.ExportSettings(bpy.context, bool(kwargs.get("merge_meshes", True)),
+                                         bool(kwargs.get("single_animation", True)),
+                                         bool(kwargs.get("use_vertex_animations", False)))
+            te.Exporter.export_collection(coll, filepath, settings)
+        except Exception as e:
+            return {"error": f"Timbermesh export failed: {e}"}
+        finally:
+            with suppress(Exception):
+                if scene.frame_current != frame:
+                    scene.frame_set(frame)
+            with suppress(Exception):
+                bpy.data.collections.remove(coll)
+        return roots[0].name if hasattr(roots[0], "name") else str(roots[0])
 
     # ─── Camera management ──────────────────────────────────────────────────
 
@@ -2575,6 +4865,7 @@ class BlenderMCPServer:
             if obj.type == obj_type:
                 results.append({
                     "name": obj.name,
+                    "uid": obj.session_uid,
                     "location": [round(float(v), 4) for v in obj.location],
                     "visible": obj.visible_get(),
                 })
@@ -2692,21 +4983,148 @@ class BlenderMCPServer:
         except Exception:
             return []
 
+    @staticmethod
+    def _op_kwarg_ids(op):
+        """The kwargs this operator accepts on the running Blender (live RNA, never a version compare)."""
+        try:
+            return {p.identifier for p in op.get_rna_type().properties}
+        except Exception:
+            return set()
+
+    # ─── Engine readiness helpers (B2) ───────────────────────────────────────
+
+    @staticmethod
+    def _eval_tri_count(obj, depsgraph=None):
+        """
+        Triangle count of obj with modifiers evaluated (E13: evaluated_get + calc_loop_triangles),
+        0 for anything that does not evaluate to a mesh. Pass the depsgraph when counting many objects.
+        """
+        if obj is None or obj.type != 'MESH':
+            return 0
+        try:
+            dg = depsgraph or bpy.context.evaluated_depsgraph_get()
+            me = obj.evaluated_get(dg).data
+            me.calc_loop_triangles()
+            return len(me.loop_triangles)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _rotation_is_identity(obj, tol=1e-6):
+        """True when the object carries no rotation, keyed on rotation_mode (RA-5): Euler modes read
+        rotation_euler, QUATERNION reads w, AXIS_ANGLE reads the angle."""
+        mode = obj.rotation_mode
+        if mode == 'QUATERNION':
+            return abs(abs(obj.rotation_quaternion.w) - 1.0) < tol
+        if mode == 'AXIS_ANGLE':
+            return abs(obj.rotation_axis_angle[0]) < tol
+        return all(abs(a) < tol for a in obj.rotation_euler)
+
+    @staticmethod
+    def _sync_editmesh(obj):
+        """
+        A MESH object in EDIT mode (also as a co-edited object of a multi-object edit session) keeps its
+        live geometry in the edit-mesh; obj.data is stale and its custom-data layers can be empty
+        (uv.data of length 0 -> foreach_get length mismatch). update_from_editmode() flushes it into
+        obj.data without leaving EDIT mode, so R-B2-36 reads stay mode-neutral. Returns True when flushed.
+        """
+        if obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT':
+            with suppress(Exception):
+                return bool(obj.update_from_editmode())
+        return False
+
+    @contextmanager
+    def _bmesh_read(self, obj):
+        """
+        Read-only BMesh of obj.data with lookup tables (R-B2-36): bmesh.new() + from_mesh, no mode or active
+        change, never written back, always freed. An object in EDIT mode is flushed first (_sync_editmesh).
+        """
+        self._sync_editmesh(obj)
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            yield bm
+        finally:
+            bm.free()
+
+    @staticmethod
+    def _eval_vert_count(obj, depsgraph=None):
+        if obj is None or obj.type != 'MESH':
+            return 0
+        try:
+            dg = depsgraph or bpy.context.evaluated_depsgraph_get()
+            return len(obj.evaluated_get(dg).data.vertices)
+        except Exception:
+            return 0
+
+    def _names_or_collection(self, objects=None, collection=None, label="objects", _objs=None):
+        """
+        Resolve the B2 `objects` (comma list with fnmatch globs, H11) / `collection` pair to a list of
+        Objects: (objects, None) or (None, error dict). Nothing is applied when a name is unknown or a
+        glob matches nothing ({error, unknown, valid_count}); both or neither given -> {error}.
+        _objs: internal callers pass bpy Object references here (RA-4) so names with , * ? [ never
+        meet the wire parser; anything that is not an Object is refused.
+        """
+        if _objs is not None:
+            refs = list(_objs) if isinstance(_objs, (list, tuple)) else [_objs]
+            bad = [r for r in refs if not isinstance(r, bpy.types.Object)]
+            if bad or not refs:
+                return None, {"error": f"_objs is internal: it takes Blender Object references only ({len(bad)} refused)"}
+            return refs, None
+        if objects is None and collection is None:
+            return None, {"error": f"give {label} (comma list, globs allowed) or collection"}
+        if objects is not None and collection is not None:
+            return None, {"error": f"give either {label} or collection, not both"}
+        if collection is not None:
+            coll = bpy.data.collections.get(str(collection))
+            if coll is None:
+                return None, {"error": f"collection '{collection}' not found; collections: {[c.name for c in bpy.data.collections][:30]}"}
+            found = list(coll.all_objects)
+            if not found:
+                return None, {"error": f"collection '{collection}' holds no objects", "unknown": [], "valid_count": 0}
+            return found, None
+        if isinstance(objects, str) and objects.strip() in bpy.data.objects:
+            patterns = [objects.strip()]        # R-B2-41: a whole string that IS a name ("Wall, left") is never split
+        else:
+            patterns = self._names_arg(objects)
+        if not patterns:
+            return None, {"error": f"{label} is empty"}
+        names = [o.name for o in bpy.data.objects]
+        matched, unmatched = self._glob_names(patterns, names)
+        if unmatched:
+            return None, {"error": f"{label} not found: {unmatched}", "unknown": unmatched, "valid_count": len(matched)}
+        return [bpy.data.objects[n] for n in matched], None
+
     def export_object(self, name=None, filepath=None, file_format="glb", include_hierarchy=True,
                       bake_anim=True, add_leaf_bones=False, use_armature_deform_only=True,
                       bake_anim_simplify_factor=0.0, mesh_smooth_type=None, primary_bone_axis=None,
                       secondary_bone_axis=None, apply_scale_options=None,
-                      export_animations=True, export_skins=True, export_morph=True):
+                      export_animations=True, export_skins=True, export_morph=True,
+                      objects=None, apply_modifiers=True, axis_forward=None, axis_up=None, global_scale=None,
+                      use_tspace=None, use_triangles=None, use_custom_props=None, colors_type=None,
+                      export_apply=None, export_tangents=None, export_extras=None, export_yup=None,
+                      export_attributes=None, export_vertex_color=None, export_animation_mode=None):
         """
-        Export an object (or the entire scene if name is None).
+        Export an object (or the entire scene if name and objects are None).
         file_format: glb, gltf, fbx, obj, stl, ply
+        name / objects: one object, or a comma list (fnmatch globs) as the alternative; not both.
         include_hierarchy: also select the parent armature (if any) and every child, so a
                            skinned mesh exports rigged (selection restored afterwards).
         FBX only: bake_anim, add_leaf_bones (default False: no *_end bones), use_armature_deform_only,
                   bake_anim_simplify_factor, mesh_smooth_type (live enum: OFF/FACE/EDGE, +SMOOTH_GROUP
                   on 5.2), primary_bone_axis / secondary_bone_axis (X/Y/Z/-X/-Y/-Z), apply_scale_options.
         glTF only: export_animations, export_skins, export_morph.
-        Params that do not apply to the chosen format are reported under "ignored".
+        B2 engine params (13.2.2; None = exporter default): apply_modifiers (FBX use_mesh_modifiers /
+        glTF export_apply / OBJ-STL-PLY apply_modifiers), axis_forward / axis_up / global_scale
+        (FBX, OBJ, STL, PLY), use_tspace / use_triangles / use_custom_props / colors_type (FBX; OBJ and
+        PLY take use_triangles and colors as their own kwargs), export_apply / export_tangents /
+        export_extras / export_yup / export_attributes / export_vertex_color / export_animation_mode (glTF).
+        Enum values are checked against the live operator enum; a param the chosen exporter does not
+        take is reported under "ignored". Reply adds size_bytes, object_count, vertices_written,
+        triangles_written (evaluated, E13), warnings and, for OBJ, transform_baked (E10).
         """
         file_format = (file_format or "glb").lower().lstrip(".")
         supported = ("glb", "gltf", "fbx", "obj", "stl", "ply")
@@ -2715,14 +5133,21 @@ class BlenderMCPServer:
         if not filepath:
             filepath = os.path.join(tempfile.gettempdir(),
                                     f"blender_export_{os.getpid()}.{file_format}")
+        if name is not None and objects is not None:
+            return {"error": "give either name or objects, not both"}
 
-        # Select only the target object (and its rig hierarchy) if specified
-        selected = name is not None
-        obj = None
+        # Select only the target object(s) (and their rig hierarchy) if specified
+        targets = []
         if name:
             obj = bpy.data.objects.get(name)
             if not obj:
                 return {"error": f"Object not found: {name}"}
+            targets = [obj]
+        elif objects is not None:
+            targets, oerr = self._names_or_collection(objects=objects)
+            if oerr:
+                return oerr
+        selected = bool(targets)
 
         fbx_given = {k: v for k, v in {"bake_anim": bake_anim, "add_leaf_bones": add_leaf_bones,
                                        "use_armature_deform_only": use_armature_deform_only,
@@ -2759,25 +5184,80 @@ class BlenderMCPServer:
             ignored = [k for k, v in fbx_given.items() if defaults.get(k, None) != v] + \
                       [k for k in self._GLTF_EXPORT_PARAMS if gltf_given[k] is not True]
 
+        # B2 engine params: map each to the chosen exporter's kwarg name, check enums against the live
+        # operator, report the rest under "ignored" (live RNA decides what exists, never the version)
+        op = {"fbx": bpy.ops.export_scene.fbx, "glb": bpy.ops.export_scene.gltf, "gltf": bpy.ops.export_scene.gltf,
+              "obj": bpy.ops.wm.obj_export if self._op_exists(bpy.ops.wm.obj_export) else bpy.ops.export_scene.obj,
+              "stl": bpy.ops.wm.stl_export if self._op_exists(bpy.ops.wm.stl_export) else bpy.ops.export_mesh.stl,
+              "ply": bpy.ops.wm.ply_export if self._op_exists(bpy.ops.wm.ply_export) else bpy.ops.export_mesh.ply}[file_format]
+        live = self._op_kwarg_ids(op)
+        b2_given = {k: v for k, v in {
+            "axis_forward": axis_forward, "axis_up": axis_up, "global_scale": global_scale, "use_tspace": use_tspace,
+            "use_triangles": use_triangles, "use_custom_props": use_custom_props, "colors_type": colors_type,
+            "export_apply": export_apply, "export_tangents": export_tangents, "export_extras": export_extras,
+            "export_yup": export_yup, "export_attributes": export_attributes, "export_vertex_color": export_vertex_color,
+            "export_animation_mode": export_animation_mode}.items() if v is not None}
+        # param -> candidate kwarg names per exporter family (first one the live operator has wins)
+        aliases = {"axis_forward": ("axis_forward", "forward_axis"), "axis_up": ("axis_up", "up_axis"),
+                   "use_triangles": ("use_triangles", "export_triangulated_mesh"),
+                   "colors_type": ("colors_type",)}
+        enum_params = {"axis_forward", "axis_up", "colors_type", "export_vertex_color", "export_animation_mode"}
+        extra_kwargs = {}
+        for key, value in b2_given.items():
+            target = next((a for a in aliases.get(key, (key,)) if a in live), None)
+            if target is None:
+                ignored.append(key)
+                continue
+            if key in enum_params:
+                valid = self._op_enum_ids(op, target)
+                value = str(value).upper() if key != "axis_forward" and key != "axis_up" else str(value).upper().replace("NEG_", "-")
+                if valid and value not in valid:
+                    return {"error": f"{key} '{b2_given[key]}' not valid for {file_format} on this Blender; valid: {valid}"}
+            elif key == "global_scale":
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return {"error": f"global_scale must be a number, got {value!r}"}
+            else:
+                value = bool(value)
+            extra_kwargs[target] = value
+        # apply_modifiers: one caller flag, three exporter spellings; glTF export_apply explicit wins
+        mod_key = next((a for a in ("use_mesh_modifiers", "apply_modifiers") if a in live), None)
+        if mod_key is not None:
+            extra_kwargs[mod_key] = bool(apply_modifiers)
+        elif "export_apply" in live and "export_apply" not in extra_kwargs:
+            extra_kwargs["export_apply"] = bool(apply_modifiers)
+        if file_format == "fbx":
+            fbx_kwargs.update(extra_kwargs)
+        elif file_format in ("glb", "gltf"):
+            gltf_kwargs.update(extra_kwargs)
+
         exported = []
+        written = []
         # Blender 4.x: OBJ/STL/PLY moved from the Python add-ons to wm.* C operators
         try:
             with self._selection_scope():
-                if obj is not None:
-                    self._select_only(obj)
-                    if include_hierarchy:
-                        extra = []
-                        if obj.parent is not None and obj.parent.type == 'ARMATURE':
-                            extra.append(obj.parent)
-                            extra += list(obj.parent.children_recursive)
-                        arm_mod = next((m for m in obj.modifiers if m.type == 'ARMATURE' and m.object), None)
-                        if arm_mod is not None:
-                            extra.append(arm_mod.object)
-                        extra += list(obj.children_recursive)
-                        for o in extra:
-                            if o.name in bpy.context.view_layer.objects:
-                                o.select_set(True)
+                if targets:
+                    self._select_only(targets[0])
+                    for obj in targets:
+                        if obj.name in bpy.context.view_layer.objects:
+                            obj.select_set(True)
+                        if include_hierarchy:
+                            extra = []
+                            if obj.parent is not None and obj.parent.type == 'ARMATURE':
+                                extra.append(obj.parent)
+                                extra += list(obj.parent.children_recursive)
+                            arm_mod = next((m for m in obj.modifiers if m.type == 'ARMATURE' and m.object), None)
+                            if arm_mod is not None:
+                                extra.append(arm_mod.object)
+                            extra += list(obj.children_recursive)
+                            for o in extra:
+                                if o.name in bpy.context.view_layer.objects:
+                                    o.select_set(True)
                     exported = sorted(o.name for o in bpy.context.view_layer.objects if o.select_get())
+                    written = [bpy.data.objects[n] for n in exported]
+                else:
+                    written = list(bpy.context.scene.objects)
                 if file_format in ("glb", "gltf"):
                     bpy.ops.export_scene.gltf(
                         filepath=filepath,
@@ -2788,17 +5268,17 @@ class BlenderMCPServer:
                     bpy.ops.export_scene.fbx(filepath=filepath, use_selection=selected, **fbx_kwargs)
                 elif file_format == "obj":
                     if self._op_exists(bpy.ops.wm.obj_export):
-                        bpy.ops.wm.obj_export(filepath=filepath, export_selected_objects=selected)
+                        bpy.ops.wm.obj_export(filepath=filepath, export_selected_objects=selected, **extra_kwargs)
                     else:
                         bpy.ops.export_scene.obj(filepath=filepath, use_selection=selected)
                 elif file_format == "stl":
                     if self._op_exists(bpy.ops.wm.stl_export):
-                        bpy.ops.wm.stl_export(filepath=filepath, export_selected_objects=selected)
+                        bpy.ops.wm.stl_export(filepath=filepath, export_selected_objects=selected, **extra_kwargs)
                     else:
                         bpy.ops.export_mesh.stl(filepath=filepath, use_selection=selected)
                 elif file_format == "ply":
                     if self._op_exists(bpy.ops.wm.ply_export):
-                        bpy.ops.wm.ply_export(filepath=filepath, export_selected_objects=selected)
+                        bpy.ops.wm.ply_export(filepath=filepath, export_selected_objects=selected, **extra_kwargs)
                     else:
                         bpy.ops.export_mesh.ply(filepath=filepath, use_selection=selected)
         except Exception as e:
@@ -2806,22 +5286,62 @@ class BlenderMCPServer:
 
         if not os.path.exists(filepath) and file_format != "gltf":
             return {"error": f"Exporter finished but {filepath} was not written"}
+        # B2 counts + warnings over the objects that went into the file: evaluated (E13) when the exporter
+        # applied modifiers, the base mesh otherwise (what the file actually holds)
+        dg = bpy.context.evaluated_depsgraph_get()
+        meshes = [o for o in written if o.type == 'MESH']
+        applied_mods = bool(extra_kwargs.get(mod_key, extra_kwargs.get("export_apply", apply_modifiers))) if mod_key or "export_apply" in live \
+            else bool(apply_modifiers)
+        if not applied_mods:
+            dg = None
+            self_eval_tris = lambda o, _dg: sum(len(p.vertices) - 2 for p in o.data.polygons)
+            self_eval_verts = lambda o, _dg: len(o.data.vertices)
+        else:
+            self_eval_tris, self_eval_verts = self._eval_tri_count, self._eval_vert_count
+        warnings = []
+        for o in meshes:
+            if any(abs(s - 1.0) > 1e-6 for s in o.scale):
+                warnings.append(f"{o.name}: unapplied scale {[round(float(s), 4) for s in o.scale]}")
+            if not o.data.uv_layers:
+                warnings.append(f"{o.name}: no UV layer")
+            if file_format == "fbx" and not fbx_kwargs.get("use_triangles", False) \
+                    and any(len(p.vertices) > 4 for p in o.data.polygons):
+                warnings.append(f"{o.name}: ngons exported as-is (use_triangles is off)")
+            for slot in o.material_slots:
+                if slot.material is not None and not slot.material.use_nodes:
+                    warnings.append(f"{o.name}: material '{slot.material.name}' has no nodes")
         reply = {"success": True, "filepath": filepath, "format": file_format,
                  "exported_objects": exported if selected else "all",
-                 "include_hierarchy": bool(include_hierarchy) if selected else None}
+                 "include_hierarchy": bool(include_hierarchy) if selected else None,
+                 "size_bytes": os.path.getsize(filepath) if os.path.exists(filepath) else 0,
+                 "object_count": len(written),
+                 "vertices_written": sum(self_eval_verts(o, dg) for o in meshes),
+                 "triangles_written": sum(self_eval_tris(o, dg) for o in meshes),
+                 "modifiers_applied": applied_mods,
+                 "warnings": warnings}
+        # E10: wm.obj_export bakes the object transform into the vertices: always on 4.x (no apply_transform
+        # kwarg), and by default on 5.x (the kwarg is not exposed here). Other exporters keep transforms as nodes.
+        reply["transform_baked"] = file_format == "obj" and bool(extra_kwargs.get("apply_transform", True))
         if fbx_kwargs:
             reply["fbx_options"] = fbx_kwargs
         if gltf_kwargs:
             reply["gltf_options"] = gltf_kwargs
+        if extra_kwargs and file_format in ("obj", "stl", "ply"):
+            reply["export_options"] = extra_kwargs
         if ignored:
             reply["ignored"] = ignored
         return reply
 
-    def import_file(self, filepath):
+    def import_file(self, filepath, axis_forward=None, axis_up=None, global_scale=None, use_custom_normals=True,
+                    use_image_search=None, ignore_leaf_bones=None, import_shading=None, merge_vertices=None):
         """
         Import a 3D file. Supports: glb/gltf, fbx, obj, stl, ply, blend, bvh (needs the
         io_anim_bvh add-on, enabled in factory preferences).
-        Reply: imported_objects (user geometry), armatures, actions (all), new_actions, and
+        B2 (13.2.2): axis_forward / axis_up / global_scale (FBX, OBJ, STL, PLY), use_custom_normals /
+        use_image_search / ignore_leaf_bones (FBX), import_shading / merge_vertices (glTF); every kwarg
+        is passed only when the live importer has it (E8/E9), the rest are listed under "ignored".
+        Reply: imported_objects (user geometry), objects (per object: name, type, vertices, triangles,
+        has_custom_normals, uv_layers, materials), armatures, actions (all), new_actions, and
         bone_shape_objects (the glTF importer's bone custom-shape meshes, e.g. "Icosphere",
         which are not user geometry).
         """
@@ -2837,33 +5357,59 @@ class BlenderMCPServer:
         before = set(bpy.data.objects.keys())
         actions_before = set(bpy.data.actions.keys())
 
+        # B2 kwargs, mapped per importer against the live operator (never a version compare)
+        op = None
+        if ext in (".glb", ".gltf"):
+            op = bpy.ops.import_scene.gltf
+        elif ext == ".fbx":
+            op = bpy.ops.import_scene.fbx
+        elif ext == ".obj":
+            op = bpy.ops.wm.obj_import if self._op_exists(bpy.ops.wm.obj_import) else bpy.ops.import_scene.obj
+        elif ext == ".stl":
+            op = bpy.ops.wm.stl_import if self._op_exists(bpy.ops.wm.stl_import) else bpy.ops.import_mesh.stl
+        elif ext == ".ply":
+            op = bpy.ops.wm.ply_import if self._op_exists(bpy.ops.wm.ply_import) else bpy.ops.import_mesh.ply
+        live = self._op_kwarg_ids(op) if op is not None else set()
+        given = {k: v for k, v in {"axis_forward": axis_forward, "axis_up": axis_up, "global_scale": global_scale,
+                                   "use_custom_normals": use_custom_normals, "use_image_search": use_image_search,
+                                   "ignore_leaf_bones": ignore_leaf_bones, "import_shading": import_shading,
+                                   "merge_vertices": merge_vertices}.items() if v is not None}
+        aliases = {"axis_forward": ("axis_forward", "forward_axis"), "axis_up": ("axis_up", "up_axis")}
+        kwargs, ignored = {}, []
+        for key, value in given.items():
+            target = next((a for a in aliases.get(key, (key,)) if a in live), None)
+            if target is None:
+                if not (key == "use_custom_normals" and use_custom_normals is True):   # the default, silently
+                    ignored.append(key)
+                continue
+            if key in ("axis_forward", "axis_up", "import_shading"):
+                value = str(value).upper()
+                valid = self._op_enum_ids(op, target)
+                if valid and value not in valid:
+                    return {"error": f"{key} '{given[key]}' not valid for {ext} on this Blender; valid: {valid}"}
+            elif key == "global_scale":
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return {"error": f"global_scale must be a number, got {value!r}"}
+            else:
+                value = bool(value)
+            kwargs[target] = value
+
         try:
             if ext in (".glb", ".gltf"):
                 # K8: the importer's bone custom-shape mesh (Icosphere) is suppressed at the source
                 # on both versions; the kwarg is try-passed so an importer without it still works
                 try:
-                    bpy.ops.import_scene.gltf(filepath=filepath, disable_bone_shape=True)
+                    bpy.ops.import_scene.gltf(filepath=filepath, disable_bone_shape=True, **kwargs)
                 except TypeError:
-                    bpy.ops.import_scene.gltf(filepath=filepath)
+                    bpy.ops.import_scene.gltf(filepath=filepath, **kwargs)
             elif ext == ".fbx":
-                bpy.ops.import_scene.fbx(filepath=filepath)
+                bpy.ops.import_scene.fbx(filepath=filepath, **kwargs)
             elif ext == ".bvh":
                 bpy.ops.import_anim.bvh(filepath=filepath)
-            elif ext == ".obj":
-                if self._op_exists(bpy.ops.wm.obj_import):
-                    bpy.ops.wm.obj_import(filepath=filepath)
-                else:
-                    bpy.ops.import_scene.obj(filepath=filepath)
-            elif ext == ".stl":
-                if self._op_exists(bpy.ops.wm.stl_import):
-                    bpy.ops.wm.stl_import(filepath=filepath)
-                else:
-                    bpy.ops.import_mesh.stl(filepath=filepath)
-            elif ext == ".ply":
-                if self._op_exists(bpy.ops.wm.ply_import):
-                    bpy.ops.wm.ply_import(filepath=filepath)
-                else:
-                    bpy.ops.import_mesh.ply(filepath=filepath)
+            elif ext in (".obj", ".stl", ".ply"):
+                op(filepath=filepath, **kwargs)
             elif ext == ".blend":
                 # Append every object from the file (dependencies come along)
                 with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
@@ -2890,10 +5436,25 @@ class BlenderMCPServer:
                        if o.name in shapes or (o.type == 'MESH' and not o.users_collection)]
         imported = [n for n in new_names if n not in bone_shapes]
         new_actions = sorted(set(bpy.data.actions.keys()) - actions_before)
-        return {"success": True, "filepath": filepath, "imported_objects": imported,
-                "armatures": armatures, "actions": sorted(bpy.data.actions.keys()),
-                "new_actions": new_actions, "bone_shape_objects": bone_shapes}
-
+        dg = bpy.context.evaluated_depsgraph_get()
+        per_object = []
+        for n in imported:
+            o = bpy.data.objects[n]
+            entry = {"name": o.name, "type": o.type, "vertices": 0, "triangles": 0, "has_custom_normals": False,
+                     "uv_layers": [], "materials": [s.material.name for s in o.material_slots if s.material]}
+            if o.type == 'MESH':
+                entry.update({"vertices": len(o.data.vertices), "triangles": self._eval_tri_count(o, dg),
+                              "has_custom_normals": bool(o.data.has_custom_normals),
+                              "uv_layers": [uv.name for uv in o.data.uv_layers]})
+            per_object.append(entry)
+        reply = {"success": True, "filepath": filepath, "imported_objects": imported, "objects": per_object,
+                 "armatures": armatures, "actions": sorted(bpy.data.actions.keys()),
+                 "new_actions": new_actions, "bone_shape_objects": bone_shapes}
+        if kwargs:
+            reply["import_options"] = kwargs
+        if ignored:
+            reply["ignored"] = ignored
+        return reply
     def save_blend(self, filepath=None, compress=None, relative_remap=True, copy=False,
                    incremental=False, backup=True, overwrite=True, purge_orphans=False):
         """
@@ -3188,20 +5749,71 @@ class BlenderMCPServer:
             obj.data.name = new_name
         return {"success": True, "old_name": old_name, "new_name": obj.name}
 
-    def set_origin(self, name, origin_type="ORIGIN_GEOMETRY"):
+    _ORIGIN_B2_TYPES = ("BOTTOM_CENTER", "TOP_CENTER", "CUSTOM")
+
+    def set_origin(self, name, origin_type="ORIGIN_GEOMETRY", location=None, keep_world=True):
         """
         Set the object origin.
-        origin_type: ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS,
-                     ORIGIN_CENTER_OF_VOLUME
+        origin_type: ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS, ORIGIN_CENTER_OF_VOLUME
+                     (Blender's origin_set), or B2: BOTTOM_CENTER (bbox bottom centre, the game-prop
+                     standard), TOP_CENTER, CUSTOM (location="x,y,z" in WORLD space, required).
+        The B2 types move the mesh data by -delta (shape keys included, RA-1) and, with keep_world=True,
+        the object by +delta so world vertex positions and children stay where they were (E13:
+        mesh.transform + location, never cursor tricks); keep_world=False moves the geometry instead
+        (R-B2-39). A mesh shared by other objects is isolated first (R-B2-37, reply `isolated`).
         """
         obj = bpy.data.objects.get(name)
         if not obj:
             return {"error": f"Object not found: {name}"}
-        with self._selection_scope():
-            self._select_only(obj)
-            bpy.ops.object.origin_set(type=origin_type, center='MEDIAN')
-        return {"success": True, "name": name, "origin_type": origin_type,
-                "new_location": list(obj.location)}
+        origin_id = str(origin_type or "").strip().upper()
+        if origin_id not in self._ORIGIN_B2_TYPES:
+            valid = self._op_enum_ids(bpy.ops.object.origin_set, "type")
+            if valid and origin_id not in valid:
+                return {"error": f"origin_type '{origin_type}' not valid; valid: {valid + list(self._ORIGIN_B2_TYPES)}"}
+            with self._selection_scope():
+                self._select_only(obj)
+                bpy.ops.object.origin_set(type=origin_id, center='MEDIAN')
+            return {"success": True, "name": name, "origin_type": origin_id,
+                    "new_location": list(obj.location)}
+        if obj.type != 'MESH':
+            return {"error": f"{name} is not a mesh object; {origin_id} needs mesh data (object is {obj.type})"}
+        self._ensure_object_mode(obj)
+        isolated = False
+        if obj.data.users > 1:                      # R-B2-37: never move the geometry of the other users
+            obj.data = obj.data.copy()
+            isolated = True
+        mesh = obj.data
+        if origin_id == "CUSTOM":
+            if location is None:
+                return {"error": "location=\"x,y,z\" (world space) is required for origin_type CUSTOM"}
+            parts = location.split(",") if isinstance(location, str) else location
+            vec, verr = self._vec3(parts, "location")
+            if verr:
+                return {"error": verr}
+            delta = obj.matrix_world.inverted() @ mathutils.Vector(vec)
+        else:
+            if not mesh.vertices:
+                return {"error": f"{name} has no vertices"}
+            n = len(mesh.vertices)
+            co = array.array('f', [0.0]) * (n * 3)
+            mesh.vertices.foreach_get("co", co)
+            xs, ys, zs = co[0::3], co[1::3], co[2::3]
+            cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+            delta = mathutils.Vector((cx, cy, min(zs) if origin_id == "BOTTOM_CENTER" else max(zs)))
+        mesh.transform(mathutils.Matrix.Translation(-delta), shape_keys=True)     # RA-1: every key block moves too
+        mesh.update()
+        if keep_world:
+            shift = mathutils.Matrix.Translation(delta)
+            # M' = M @ T(delta) keeps every vertex in place; children get the inverse in their parent-inverse
+            for child in obj.children:
+                child.matrix_parent_inverse = mathutils.Matrix.Translation(-delta) @ child.matrix_parent_inverse
+            obj.matrix_world = obj.matrix_world @ shift
+        bpy.context.view_layer.update()
+        return {"success": True, "name": name, "origin_type": origin_id,
+                "new_location": [float(v) for v in obj.location],
+                "offset_applied": [round(float(v), 6) for v in delta],      # F-B2-1: local-space shift of the mesh data
+                "keep_world": bool(keep_world), "isolated": isolated,
+                "children_kept": [c.name for c in obj.children] if keep_world else []}
 
     def snap_to_ground(self, name, ground_z=0.0):
         """Translate an object so its lowest bounding-box point sits at ground_z."""
@@ -3515,21 +6127,28 @@ class BlenderMCPServer:
         values.update(kwargs)
         unset = {}
         for k, v in values.items():
-            if not hasattr(mod, k):
+            # D1 L3: every value goes through the driver coercer (_coerce_value via _drv_assign): dotted keys reach
+            # nested settings (domain_settings.resolution_max), pointers accept "#uid" / "IDTYPE:Name" / {"uid"} and,
+            # as before, a plain object name (R28). The two legacy reason texts are kept.
+            parent, leaf, index = self._split_path(str(k))
+            owner = mod
+            if parent:
+                try:
+                    owner = mod.path_resolve(parent, False)
+                except Exception as ex:
+                    unset[k] = f"no such property ({ex})"
+                    continue
+            if self._drv_idprop_key(leaf) is None and owner.bl_rna.properties.get(leaf) is None:
                 unset[k] = "no such property"
                 continue
-            try:
-                # Object references (e.g. BOOLEAN.object, SHRINKWRAP.target) come in by name
-                if isinstance(v, str) and isinstance(getattr(mod, k), (bpy.types.Object, type(None))) \
-                        and mod.bl_rna.properties[k].type == 'POINTER':
-                    target = bpy.data.objects.get(v)
-                    if target is None:
-                        unset[k] = f"object '{v}' not found"
-                        continue
-                    v = target
-                setattr(mod, k, v)
-            except Exception as ex:
-                unset[k] = str(ex)
+            prop = owner.bl_rna.properties.get(leaf)
+            if prop is not None and prop.type == 'POINTER' and isinstance(v, str) and not (v.startswith("#") or ":" in v) \
+                    and prop.fixed_type.identifier == "Object" and bpy.data.objects.get(v) is None:
+                unset[k] = f"object '{v}' not found"
+                continue
+            ex = self._drv_assign(owner, leaf, index, v)
+            if ex:
+                unset[k] = ex.get("rna_error") or ex["error"]
 
         result = {"success": True, "object": name, "modifier": mod.name, "type": modifier_type,
                   "set": [k for k in values if k not in unset]}
@@ -5065,11 +7684,15 @@ class BlenderMCPServer:
 
     @staticmethod
     def _glob_names(pattern_list, names):
-        """Expand globs (fnmatch) in pattern_list against names; returns (matched, unmatched_patterns)."""
+        """
+        Expand pattern_list against names; returns (matched, unmatched_patterns). R-B2-41: an item that IS
+        a name matches exactly and only itself ("Panel[1]", "Star*Prop"); fnmatch runs only when no name
+        equals the item.
+        """
         import fnmatch
         matched, unmatched = [], []
         for pat in pattern_list:
-            hits = [n for n in names if fnmatch.fnmatchcase(n, pat)]
+            hits = [pat] if pat in names else [n for n in names if fnmatch.fnmatchcase(n, pat)]
             if hits:
                 matched += [h for h in hits if h not in matched]
             else:
@@ -5261,7 +7884,7 @@ class BlenderMCPServer:
                                  "matrix_world_tail": [round(x, 5) for x in (mw @ pb.tail)]}
             bones.append(entry)
         ad = arm.animation_data
-        return {"success": True, "armature": arm.name, "bone_count": len(arm.data.bones), "bones": bones,
+        return {"success": True, "armature": arm.name, "uid": arm.session_uid, "bone_count": len(arm.data.bones), "bones": bones,
                 "space": sp, "pose_position": arm.data.pose_position, "display_type": arm.data.display_type,
                 "show_in_front": arm.show_in_front, "action": ad.action.name if ad and ad.action else None,
                 "bone_collections": self._bone_collections(arm.data)}
@@ -6224,6 +8847,1728 @@ class BlenderMCPServer:
                 "baked_range": [f0, f1], "step": int(step), "bake_types": sorted(types),
                 "fcurve_count": len(fcurves) if fcurves is not None else 0, "animated_bones": animated,
                 "bones": names if names is not None else "all"}
+
+    # ─── Generic driver (D1): ref grammar, encoding, coercion, describe ──────
+    # Contract: docs/PLAN.md 12.2 (D1.0) + rulings R16-R21. Every handler returns a dict and
+    # never raises on bad input; teaching errors carry closest / valid / tried and `rna_error`
+    # (Blender's own message, verbatim). Reads apply max_chars while building (chars + truncated).
+
+    _DRV_ROOTS = ("context", "data", "prefs")
+    # RNA members that crash the process when read headless (an access violation, not an exception, so
+    # it cannot be caught): never read or expanded by the encoder, refused in any ref path. Measured
+    # 2026-10-16 on Blender 4.3.2, factory file: scene.tool_settings.uv_sculpt is an uninitialised Paint
+    # struct (rna_Paint_eraser_brush_get, brush_asset_reference.*, cavity_curve.* all fault inside it);
+    # with it skipped a depth-3 walk of Scene (1482 reads, sculpt.eraser_brush included) completes.
+    _DRV_UNSAFE_PROPS = frozenset({"uv_sculpt"})
+
+    @staticmethod
+    def _drv_unsafe_struct(srna):
+        """True when srna or any struct in its base chain is in _DRV_UNSAFE_STRUCTS (R33)."""
+        while srna is not None:
+            if srna.identifier in _DRV_UNSAFE_STRUCTS:
+                return True
+            srna = srna.base
+        return False
+
+    @staticmethod
+    def _drv_cap_arg(max_chars):
+        """max_chars -> (cap, error dict | None): None = the default, otherwise a positive integer."""
+        if max_chars is None:
+            return _DRV_REPLY_MAX_DEFAULT, None
+        try:
+            cap = int(max_chars)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap < 1:
+            return None, {"error": f"max_chars must be a positive integer (default {_DRV_REPLY_MAX_DEFAULT}), got {max_chars!r}"}
+        return cap, None
+
+    @classmethod
+    def _drv_unsafe_path(cls, path):
+        """The first unsafe segment of an RNA path, else None."""
+        for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(path or "")):
+            if name in cls._DRV_UNSAFE_PROPS:
+                return name
+        return None
+    _DRV_WHERE_OPS = ("==", "!=", "<", "<=", ">", ">=", "in", "contains", "exists")
+    # Properties whose assignment must go through the API that triggers the update (12.2.2 rna_set)
+    _DRV_SETTERS = {("Scene", "frame_current"): lambda owner, value: owner.frame_set(int(value))}
+    # ID.id_type identifier -> ordered bpy.data collection candidates (R26; measured on 4.3.2 and
+    # 5.2.1, 2026-10-16: struct names are not stable across versions, so no derived rule). The first
+    # candidate that exists on this Blender wins (hasattr, never a version compare).
+    _DRV_IDTYPE_TABLE = (
+        ("ACTION", "actions"), ("ARMATURE", "armatures"), ("BRUSH", "brushes"), ("CACHEFILE", "cache_files"),
+        ("CAMERA", "cameras"), ("COLLECTION", "collections"), ("CURVE", "curves"), ("CURVES", "hair_curves"),
+        ("FONT", "fonts"), ("GREASEPENCIL", "annotations", "grease_pencils"),
+        ("GREASEPENCIL_V3", "grease_pencils_v3", "grease_pencils"), ("IMAGE", "images"), ("KEY", "shape_keys"),
+        ("LATTICE", "lattices"), ("LIBRARY", "libraries"), ("LIGHT", "lights"), ("LIGHT_PROBE", "lightprobes"),
+        ("LINESTYLE", "linestyles"), ("MASK", "masks"), ("MATERIAL", "materials"), ("MESH", "meshes"),
+        ("META", "metaballs"), ("MOVIECLIP", "movieclips"), ("NODETREE", "node_groups"), ("OBJECT", "objects"),
+        ("PAINTCURVE", "paint_curves"), ("PALETTE", "palettes"), ("PARTICLE", "particles"),
+        ("POINTCLOUD", "pointclouds"), ("SCENE", "scenes"), ("SCREEN", "screens"), ("SOUND", "sounds"),
+        ("SPEAKER", "speakers"), ("TEXT", "texts"), ("TEXTURE", "textures"), ("VOLUME", "volumes"),
+        ("WINDOWMANAGER", "window_managers"), ("WORKSPACE", "workspaces"), ("WORLD", "worlds"))
+
+    @staticmethod
+    def _drv_list(value):
+        """Comma string / JSON-list string / list / None -> list of str or None."""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.lstrip().startswith("["):
+            with suppress(Exception):
+                value = json.loads(value)
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return [str(v) for v in value]
+
+    @staticmethod
+    def _drv_closest(word, candidates, n=3):
+        import difflib
+        return difflib.get_close_matches(str(word), [str(c) for c in candidates], n=n, cutoff=0.5)
+
+    @staticmethod
+    def _drv_data_collections():
+        """bpy.data COLLECTION props minus the 5.x `all_ids` union view (it double-counts every ID)."""
+        return [p.identifier for p in bpy.data.bl_rna.properties
+                if p.type == 'COLLECTION' and p.identifier != "all_ids"]
+
+    @staticmethod
+    def _id_ref(idb):
+        """{uid, id_type, name}: every reply that mentions an ID carries this. An embedded ID (a scene's
+        master collection, a material's node tree) has no id_type value (4.3.2 warns and reads 0): its
+        type comes from the struct and the entry says embedded (it is not in any bpy.data collection)."""
+        if getattr(idb, "is_embedded_data", False):
+            base = idb.bl_rna.base
+            kind = base.identifier if base is not None and base.identifier != "ID" else idb.bl_rna.identifier
+            return {"uid": idb.session_uid, "id_type": kind.upper(), "name": idb.name, "embedded": True}
+        return {"uid": idb.session_uid, "id_type": idb.id_type, "name": idb.name}
+
+    @staticmethod
+    def _drv_name(struct):
+        if isinstance(struct, bpy.types.ID):
+            return f"{struct.id_type}:{struct.name}"
+        return struct.bl_rna.identifier if hasattr(struct, "bl_rna") else type(struct).__name__
+
+    @classmethod
+    def _id_type_map(cls):
+        """ID.id_type identifier -> bpy.data collection name on this Blender (R26): the static ordered
+        table resolved by hasattr at first use, limited to identifiers the running ID.id_type enum has."""
+        cached = getattr(cls, "_drv_idtype_cache", None)
+        if cached:
+            return cached
+        enum_ids = {i.identifier for i in bpy.types.ID.bl_rna.properties["id_type"].enum_items}
+        result = {}
+        for idt, *candidates in cls._DRV_IDTYPE_TABLE:
+            if idt not in enum_ids:
+                continue
+            for c in candidates:
+                if hasattr(bpy.data, c):
+                    result[idt] = c
+                    break
+        cls._drv_idtype_cache = result
+        return result
+
+    @classmethod
+    def _uid_lookup(cls, uid):
+        """The ID with that session_uid or None. Full bpy.data scan per call (R16: no cache; measured
+        0.27 ms worst case on 2000 IDs); uids are monotonic, never reused, survive rename and undo."""
+        for c in cls._drv_data_collections():
+            for idb in getattr(bpy.data, c):
+                if getattr(idb, "session_uid", None) == uid:
+                    return idb
+        return None
+
+    @staticmethod
+    def _split_path(path):
+        """
+        'modifiers["Bevel"].width' -> ('modifiers["Bevel"]', 'width', None); 'location[2]' ->
+        ('', 'location', 2); '["key"]' -> ('', '["key"]', None). Split at the LAST '.' outside
+        brackets; a trailing [<int>] on a plain leaf is the index.
+        """
+        depth, quote, cut = 0, None, -1
+        for i, ch in enumerate(path):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in "\"'":
+                quote = ch
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+            elif ch == "." and depth == 0:
+                cut = i
+        parent, leaf = (path[:cut], path[cut + 1:]) if cut >= 0 else ("", path)
+        index = None
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\[(-?\d+)\]$', leaf)
+        if m:
+            leaf, index = m.group(1), int(m.group(2))
+        return parent, leaf, index
+
+    @staticmethod
+    def _drv_idprop_key(leaf):
+        """'["key"]' -> 'key', else None."""
+        m = re.match(r'''^\[\s*(["'])(.*)\1\s*\]$''', leaf or "")
+        return m.group(2) if m else None
+
+    def _resolve_root(self, ref):
+        """ref -> (root struct, remaining path). Raises _DrvRefError({error, tried, closest, valid})."""
+        ref = str(ref).strip()
+        head, sep, path = ref.partition("/")
+        head = head.strip()
+        if len(ref) > 80:
+            ref = ref[:77] + "..."
+        if sep and not path:
+            raise _DrvRefError({"error": f"bad ref '{ref}': nothing after '/'; drop the slash or add an RNA path", "tried": []})
+        if head.startswith("#"):
+            try:
+                uid = int(head[1:])
+            except ValueError:
+                raise _DrvRefError({"error": f"bad uid in ref '{ref}': expected #<int>", "tried": []})
+            idb = self._uid_lookup(uid)
+            if idb is None:
+                raise _DrvRefError({"error": f"no ID with session_uid {uid} (uids are per session; use find or IDTYPE:Name)",
+                                    "tried": self._drv_data_collections()})
+            return idb, path
+        if head in self._DRV_ROOTS:
+            root = {"context": bpy.context, "data": bpy.data, "prefs": bpy.context.preferences}[head]
+            return root, path
+        if ":" in head:
+            idt, _, name = head.partition(":")
+            idmap = self._id_type_map()
+            key = idt.strip().upper()
+            coll = idmap.get(key)
+            if coll is None:
+                raise _DrvRefError({"error": f"unknown IDTYPE '{idt}' in ref '{ref}'", "valid": sorted(idmap),
+                                    "closest": self._drv_closest(key, idmap)})
+            idb = getattr(bpy.data, coll).get(name)
+            if idb is None:
+                raise _DrvRefError({"error": f"no {key} named '{name}' in bpy.data.{coll}", "tried": [coll],
+                                    "closest": self._drv_closest(name, [i.name for i in getattr(bpy.data, coll)])})
+            return idb, path
+        raise _DrvRefError({"error": f"bad ref '{ref}': expected #<uid>, IDTYPE:Name, context, data or prefs, optionally /<path>",
+                            "tried": [], "valid": ["#<uid>", "IDTYPE:Name", "context", "data", "prefs"]})
+
+    def _resolve_ref(self, ref, keep_prop=False):
+        """
+        ref -> (owner, leaf, index) per PLAN.md 12.2.1. leaf None = the ref ends on a struct;
+        leaf '["key"]' = an ID property. A POINTER / COLLECTION leaf resolves to the struct it
+        points at unless keep_prop (rna_set needs owner + leaf). Raises _DrvRefError on failure.
+        """
+        root, path = self._resolve_root(ref)
+        if not path:
+            return root, None, None
+        unsafe = self._drv_unsafe_path(path)
+        if unsafe:
+            raise _DrvRefError({"error": f"'{unsafe}' in '{ref}' is not read: that RNA member crashes Blender headless on some builds (4.3.2 tool_settings.uv_sculpt)",
+                                "tried": [path]})
+        parent, leaf, index = self._split_path(path)
+        owner = root
+        if parent:
+            try:
+                owner = root.path_resolve(parent, False)
+            except Exception as e:
+                raise _DrvRefError({"error": f"could not resolve '{parent}' under {self._drv_name(root)}: {e}",
+                                    "tried": [parent], "rna_error": str(e)})
+        if self._drv_idprop_key(leaf) is not None:
+            return owner, leaf, index
+        props = owner.bl_rna.properties if hasattr(owner, "bl_rna") else None
+        prop = props.get(leaf) if props is not None else None
+        if prop is None:
+            raw = leaf if index is None else f"{leaf}[{index}]"
+            try:
+                return root.path_resolve(path, False), None, None
+            except Exception as e:
+                raise _DrvRefError({"error": f"'{raw}' is not a property of {self._drv_name(owner)}: {e}", "tried": [path],
+                                    "rna_error": str(e), "count": len(props) if props is not None else 0,
+                                    "closest": self._drv_closest(leaf, [p.identifier for p in props]) if props is not None else []})
+        if prop.type in ('POINTER', 'COLLECTION') and index is None and not keep_prop:
+            target = getattr(owner, leaf)
+            if target is not None and prop.type == 'POINTER':
+                return target, None, None
+            if prop.type == 'COLLECTION':
+                return target, None, None
+        return owner, leaf, index
+
+    # -- encoding (12.2.4) --------------------------------------------------------------
+
+    @staticmethod
+    def _drv_path_from_id(struct):
+        with suppress(Exception):
+            return struct.path_from_id()
+        return None
+
+    @staticmethod
+    def _drv_is_rotation(prop):
+        return prop is not None and getattr(prop, "unit", None) == 'ROTATION'
+
+    @staticmethod
+    def _drv_enum_valid(prop, rna_error):
+        """The live enum tuple from Blender's own error text ("enum \"X\" not found in ('A', 'B')"), else
+        the static items: dynamic enums (render.engine, view transforms) read incomplete headless."""
+        m = re.search(r"not found in \((.*)\)", rna_error or "")
+        if m:
+            return [x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()]
+        return [i.identifier for i in prop.enum_items]
+
+    def _encode_idprop(self, value):
+        if hasattr(value, "to_dict"):
+            return value.to_dict()
+        if hasattr(value, "to_list"):
+            return value.to_list()
+        if isinstance(value, bpy.types.ID):
+            return self._id_ref(value)
+        return value
+
+    def _encode_value(self, value, prop=None, depth=0, fields=None, angles="RADIANS"):
+        """RNA value -> JSON per PLAN.md 12.2.4, on _rna_get's scalar rules; angles="DEGREES" scales
+        unit ROTATION properties."""
+        import math
+        if value is None:
+            return None
+        if isinstance(value, bpy.types.ID):
+            return self._id_ref(value)
+        if isinstance(value, mathutils.Matrix):
+            return [list(row) for row in value]
+        if isinstance(value, bpy.types.bpy_prop_collection):
+            return {"count": len(value)}
+        if isinstance(value, bpy.types.bpy_struct):
+            if depth > 0:
+                return self._encode_struct(value, depth - 1, fields, angles)
+            return {"struct": value.bl_rna.identifier, "path": self._drv_path_from_id(value)}
+        if isinstance(value, (set, frozenset)):
+            return sorted(value)
+        if isinstance(value, (bool, int, float, str)):
+            if angles == "DEGREES" and self._drv_is_rotation(prop) and isinstance(value, float):
+                return math.degrees(value)
+            return value
+        if isinstance(value, dict):
+            # R-B2-43 (F-B2-4): a plain dict round-trips (keys as str, values encoded); dicts only, an
+            # IDPropertyGroup is not a dict so driver replies are unchanged
+            return {str(k): self._encode_value(v, None, depth, None, angles) for k, v in value.items()}
+        if hasattr(value, "__len__") and not isinstance(value, (bytes, bytearray)):
+            try:
+                out = [self._encode_value(v, None, depth, None, angles) for v in value]
+            except TypeError:
+                return str(value)
+            if angles == "DEGREES" and self._drv_is_rotation(prop):
+                out = [math.degrees(v) if isinstance(v, float) else v for v in out]
+            return out
+        return str(value)
+
+    def _drv_skip_note(self):
+        """The R33 note for truncated[] when the walk met an unsafe struct, else None (reset per read handler)."""
+        skipped = getattr(self, "_drv_skips", None)
+        if not skipped:
+            return None
+        names = sorted(skipped)
+        shown = ", ".join(names[:3]) + (f" +{len(names) - 3} more" if len(names) > 3 else "")
+        return f"skipped unsafe structs: {shown} (pointers on ToolSettings / Paint-family structs are never dereferenced: 4.3.2 factory-file dangling brush)"
+
+    def _encode_struct(self, owner, depth=0, fields=None, angles="RADIANS"):
+        """
+        Struct -> {prop: value}. fields None = every non-COLLECTION property (pointers as refs, R23);
+        "all" = everything to depth; a name with [] (modifiers[]) lists that collection's items to depth.
+        ID properties go under "custom". Unknown field names are listed under "missing".
+        """
+        props = owner.bl_rna.properties
+        unsafe_owner = self._drv_unsafe_struct(owner.bl_rna)
+        skips = self.__dict__.setdefault("_drv_skips", set())
+        wanted = None if fields in (None, "all") else self._drv_list(fields)
+        expand = set()
+        if wanted is not None:
+            cleaned = []
+            for f in wanted:                      # RA-14: a plain loop, no set mutation inside a comprehension filter
+                if f.endswith("[]"):
+                    expand.add(f[:-2])
+                    cleaned.append(f[:-2])
+                else:
+                    cleaned.append(f)
+            wanted = cleaned
+        out, missing = {}, []
+        for ident in (wanted if wanted is not None else [p.identifier for p in props]):
+            if ident == "rna_type":
+                continue
+            prop = props.get(ident)
+            if prop is None:
+                if ident == "custom":
+                    out["custom"] = self._drv_custom(owner)
+                else:
+                    missing.append(ident)
+                continue
+            if ident in self._DRV_UNSAFE_PROPS:
+                if wanted is not None:
+                    out[ident] = {"read_error": f"'{ident}' is not read: that RNA member crashes Blender headless on some builds (4.3.2 tool_settings.uv_sculpt)"}
+                continue
+            if wanted is None and fields != "all" and prop.type == 'COLLECTION':
+                continue
+            if prop.type in ('POINTER', 'COLLECTION') and unsafe_owner:
+                # R33: no getattr at all on these owners; depth-0 shape from the descriptor
+                owner_path = self._drv_path_from_id(owner)
+                out[ident] = {"struct": prop.fixed_type.identifier, "path": f"{owner_path}.{ident}" if owner_path else None}
+                skips.add(owner_path or owner.bl_rna.identifier)
+                continue
+            try:
+                raw = getattr(owner, ident)
+            except Exception as e:
+                out[ident] = {"read_error": str(e)}
+                continue
+            if prop.type == 'COLLECTION':
+                if ident in expand or (fields == "all" and depth > 0):
+                    out[ident] = {"count": len(raw), "items": [self._encode_value(i, None, depth, None, angles) for i in raw]}
+                else:
+                    out[ident] = {"count": len(raw)}
+            elif prop.type == 'POINTER':
+                out[ident] = self._encode_value(raw, prop, depth, None, angles)
+            else:
+                out[ident] = self._encode_value(raw, prop, 0, None, angles)
+        if wanted is None:
+            custom = self._drv_custom(owner)
+            if custom:
+                out["custom"] = custom
+        if missing:
+            out["missing"] = missing
+        return out
+
+    def _drv_custom(self, owner):
+        custom = {}
+        with suppress(Exception):
+            for k in owner.keys():
+                with suppress(Exception):
+                    custom[k] = self._encode_idprop(owner[k])
+        return custom
+
+    def _drv_finish(self, reply, max_chars, droppable=(), items_key=None, items_hint="", stage1=None, order="largest", notes=()):
+        """
+        Fill chars + truncated. While the JSON exceeds max_chars (default _DRV_REPLY_MAX_DEFAULT):
+        first run stage1() once if given (returns the note for truncated[], R32: describe blanks its
+        description texts), then remove droppable entries (droppable = [(container dict, key, group,
+        hint)]; order "largest" first or from the "end"; one truncated line per group names every key
+        removed) or pop the last entry of reply[items_key]. chars counts the reply without the
+        chars key itself.
+        """
+        try:
+            cap = int(max_chars) if max_chars else _DRV_REPLY_MAX_DEFAULT
+        except (TypeError, ValueError):
+            cap = _DRV_REPLY_MAX_DEFAULT
+        reply["truncated"] = []
+        droppable = list(droppable)
+        groups = {}
+        notes = [n for n in notes if n]
+
+        def size():
+            # the final json including truncated[] and the chars key itself (R34): 12 = ', "chars": ' + the digits
+            return len(json.dumps(reply, default=str)) + 12 + len(str(cap))
+
+        dropped_items = 0
+
+        def lines():
+            out = list(notes)
+            for group, g in groups.items():
+                total = len(g["keys"]) + sum(len(c) for c in g["containers"].values())
+                out.append(f"{group}: {len(g['keys'])} of {total} dropped, e.g. {', '.join(g['keys'][:3])}; narrow with {g['hint']}")
+            if dropped_items:
+                out.append(f"{items_key}: {dropped_items} entries dropped, {len(reply[items_key])} kept; narrow with {items_hint}")
+            return out
+
+        while True:
+            reply["truncated"] = lines()
+            n = size()
+            if n <= cap:
+                break
+            if stage1 is not None:
+                note = stage1()
+                stage1 = None
+                if note:
+                    notes.append(note)
+                continue
+            if droppable:
+                if order == "end":
+                    biggest = droppable.pop()
+                else:
+                    biggest = max(droppable, key=lambda d: len(json.dumps(d[0].get(d[1]), default=str)))
+                    droppable.remove(biggest)
+                container, key, group, hint = biggest
+                was = len(json.dumps(container.pop(key), default=str))
+                g = groups.setdefault(group, {"keys": [], "chars": 0, "hint": hint, "containers": {}})
+                g["keys"].append(key)
+                g["chars"] += was
+                g["containers"][id(container)] = container
+            elif items_key and reply.get(items_key):
+                reply[items_key].pop()
+                dropped_items += 1
+            else:
+                break
+        reply["chars"] = len(json.dumps(reply, default=str)) + 12 + len(str(n))
+        return reply
+
+    # -- coercion (12.2.4, built on _rna_set_validated) ------------------------------------
+
+    def _drv_pointer_value(self, prop, value):
+        """'#uid' / 'IDTYPE:Name' / {'uid': n} / bare name -> the ID for a POINTER prop; (id, error)."""
+        want = prop.fixed_type.identifier
+        want_cls = getattr(bpy.types, want, bpy.types.ID)
+        if value is None:
+            return None, None
+        if isinstance(value, dict):
+            if "uid" not in value:
+                return None, {"error": f'pointer value for "{prop.identifier}" must be "#uid", "IDTYPE:Name" or {{"uid": n}}'}
+            value = f"#{value['uid']}"
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = f"#{value}"  # a bare uid, e.g. a "$mesh.uid" batch substitution
+        if isinstance(value, bpy.types.ID):
+            target = value
+        else:
+            text = str(value)
+            if text.startswith("#") or ":" in text:
+                try:
+                    target, rest = self._resolve_root(text)
+                except _DrvRefError as e:
+                    return None, e.reply
+                if rest:
+                    return None, {"error": f"pointer value '{text}' must name an ID, not a path"}
+            else:
+                # bare name: the bpy.data collection whose items are the pointer's fixed_type
+                target = None
+                for c in self._drv_data_collections():
+                    if bpy.data.bl_rna.properties[c].fixed_type.identifier == want:
+                        target = getattr(bpy.data, c).get(text)
+                        if target is not None:
+                            break
+                if target is None:
+                    return None, {"error": f"no {want} named '{text}' for \"{prop.identifier}\"; pass \"#uid\" or \"IDTYPE:Name\""}
+        if not isinstance(target, want_cls):
+            return None, {"error": f'"{prop.identifier}" expects a {want}, got {self._drv_name(target)}'}
+        return target, None
+
+    def _coerce_value(self, prop, value, angles="RADIANS"):
+        """
+        JSON value -> RNA-ready value for prop (12.2.4): refs -> pointers (via fixed_type), DEGREES ->
+        radians on unit ROTATION props, nested lists -> Matrix, enum case fix; read-only refused here
+        (and again by _rna_set_validated on assignment). Returns (value, error dict | None).
+        """
+        import math
+        if prop.is_readonly:
+            return None, {"error": f'property "{prop.identifier}" of {prop.srna.identifier if getattr(prop, "srna", None) else "struct"} is read-only'}
+        if prop.type == 'POINTER':
+            return self._drv_pointer_value(prop, value)
+        if prop.type == 'COLLECTION':
+            return None, {"error": f'"{prop.identifier}" is a collection; address its items by path'}
+        if prop.type == 'ENUM' and isinstance(value, str) and not prop.is_enum_flag:
+            # case fix only: the static list is a hint (render.engine reads one item headless); the
+            # assignment decides and its error text carries the live tuple (F7, R21)
+            ids = [i.identifier for i in prop.enum_items]
+            if ids and value not in ids:
+                value = next((i for i in ids if i.upper() == value.upper()), value)
+        if prop.type == 'FLOAT':
+            if isinstance(value, (list, tuple)) and value and isinstance(value[0], (list, tuple)):
+                try:
+                    return mathutils.Matrix([list(map(float, row)) for row in value]), None
+                except Exception as e:
+                    return None, {"error": f"not a matrix: {e}"}
+            if angles == "DEGREES" and self._drv_is_rotation(prop):
+                try:
+                    value = [math.radians(float(v)) for v in value] if isinstance(value, (list, tuple)) else math.radians(float(value))
+                except (TypeError, ValueError) as e:
+                    return None, {"error": f"angle must be a number or a list of numbers: {e}"}
+        return value, None
+
+    def _drv_assign(self, owner, leaf, index, value, angles="RADIANS"):
+        """Coerce + assign one property / array element / ID property. Returns error dict | None."""
+        key = self._drv_idprop_key(leaf)
+        if key is not None:
+            try:
+                owner[key] = value
+            except Exception as e:
+                return {"error": f"could not set ID property {leaf}: {e}", "rna_error": str(e)}
+            return None
+        prop = owner.bl_rna.properties.get(leaf)
+        if prop is None:
+            return {"error": f"'{leaf}' is not a property of {self._drv_name(owner)}",
+                    "closest": self._drv_closest(leaf, [p.identifier for p in owner.bl_rna.properties]),
+                    "count": len(owner.bl_rna.properties)}
+        setter = self._DRV_SETTERS.get((owner.bl_rna.identifier, leaf))
+        if index is not None:
+            if not (getattr(prop, "is_array", False) and prop.array_length):
+                return {"error": f'"{leaf}" is not an array; drop the [{index}]'}
+            if not (-prop.array_length <= index < prop.array_length):
+                return {"error": f"index {index} out of range for {leaf}[{prop.array_length}]"}
+            current = list(getattr(owner, leaf))
+            element, err = self._coerce_value(prop, [value] if prop.type == 'FLOAT' else value, angles)
+            if err:
+                return err
+            current[index] = element[0] if isinstance(element, list) else element
+            value = current
+        else:
+            value, err = self._coerce_value(prop, value, angles)
+            if err:
+                return err
+        try:
+            if setter is not None:
+                setter(owner, value)
+            elif prop.type == 'POINTER' or isinstance(value, mathutils.Matrix):
+                setattr(owner, leaf, value)
+            else:
+                reason = self._rna_set_validated(owner, leaf, value)
+                if reason is not None:
+                    err = {"error": f'could not set "{leaf}" on {self._drv_name(owner)}: {reason}', "rna_error": reason}
+                    if prop.type == 'ENUM':
+                        err["valid"] = self._drv_enum_valid(prop, reason)
+                        err["closest"] = self._drv_closest(value, err["valid"])
+                    return err
+        except Exception as e:
+            err = {"error": f'could not set "{leaf}" on {self._drv_name(owner)}: {e}', "rna_error": str(e)}
+            if prop.type == 'ENUM':
+                err["valid"] = self._drv_enum_valid(prop, str(e))
+            return err
+        return None
+
+    # -- describe (12.2.2) ------------------------------------------------------------------
+
+    def _describe_prop(self, prop):
+        """One property descriptor: the describe_settings entry shape plus unit, fixed_type, is_animatable,
+        enum_items [id, name, description], dynamic (ENUM with empty static items). Fields may be null."""
+        g = lambda name: getattr(prop, name, None)  # noqa: E731 (12.6 row 5: every field may be null)
+        entry = {"type": prop.type, "subtype": g("subtype"), "unit": g("unit"), "readonly": bool(prop.is_readonly),
+                 "description": g("description"), "is_animatable": g("is_animatable")}
+        if g("is_array") and (g("array_length") or 0) > 0:
+            entry["array_length"] = prop.array_length
+        if prop.type in ('INT', 'FLOAT', 'BOOLEAN', 'STRING', 'ENUM'):
+            entry["default"] = self._prop_default(prop)
+        if prop.type in ('INT', 'FLOAT'):
+            entry["min"], entry["max"] = g("hard_min"), g("hard_max")
+            entry["soft_min"], entry["soft_max"] = g("soft_min"), g("soft_max")
+        if prop.type == 'ENUM':
+            entry["enum_items"] = [[i.identifier, i.name, i.description] for i in prop.enum_items]
+            # dynamic = the enum has a generator. RNA gives no flag for it and enum_items_static mirrors
+            # enum_items; measured 2026-10-16 on both installs: generator enums expose a 0- or 1-entry
+            # fallback headless (render.engine 1, view_transform 1, length_unit 1) while static enums read
+            # their full list (Object.type 16/17, file_format 15/16). The live list is incomplete for these:
+            # only assignment validates (the error text carries the live tuple, R21).
+            entry["dynamic"] = len(entry["enum_items"]) <= 1
+            entry["is_enum_flag"] = bool(g("is_enum_flag"))
+        if prop.type == 'STRING':
+            entry["length_max"] = g("length_max")
+        if prop.type in ('POINTER', 'COLLECTION'):
+            ft = g("fixed_type")
+            entry["fixed_type"] = ft.identifier if ft is not None else None
+        return entry
+
+    def _describe_struct(self, srna, fields="all", include_functions=False, search=None):
+        """{identifier, base, description, count, properties{...}, functions?{...}} from an RNA struct type
+        (bl_rna). The full catalogue is cached per identifier for the session; filters apply per call."""
+        cache = self.__class__.__dict__.get("_drv_struct_cache")
+        if cache is None:
+            cache = {}
+            self.__class__._drv_struct_cache = cache
+        ident = srna.identifier
+        full = cache.get(ident)
+        if full is None:
+            props = {p.identifier: self._describe_prop(p) for p in srna.properties if p.identifier != "rna_type"}
+            funcs = {f.identifier: {"description": f.description,
+                                    "params": [[p.identifier, p.type, bool(p.is_output), bool(p.is_required)] for p in f.parameters]}
+                     for f in srna.functions}
+            full = {"identifier": ident, "base": srna.base.identifier if srna.base else None,
+                    "description": srna.description, "properties": props, "functions": funcs}
+            cache[ident] = full
+        wanted = None if fields in (None, "all") else self._drv_list(fields)
+        props = dict(full["properties"])  # a copy: _drv_finish may drop entries from the reply, never from the cache
+        if wanted is not None:
+            props = {k: props[k] for k in wanted if k in props}
+        if search:
+            s = str(search).lower()
+            props = {k: v for k, v in props.items()
+                     if s in k.lower() or s in str(v.get("description") or "").lower()}
+        reply = {"kind": "struct", "identifier": full["identifier"], "base": full["base"],
+                 "description": full["description"], "count": len(full["properties"]), "properties": props}
+        if wanted is not None:
+            missing = [k for k in wanted if k not in full["properties"]]
+            if missing:
+                reply["missing"] = missing
+        if include_functions:
+            reply["functions"] = dict(full["functions"])
+        return reply
+
+    @classmethod
+    def _drv_ops_catalogue(cls):
+        """[[idname, description], ...] over every operator (get_rna_type, never hasattr); cached per process."""
+        cached = getattr(cls, "_drv_ops_cache", None)
+        if cached:
+            return cached
+        out = []
+        for mod_name in dir(bpy.ops):
+            if mod_name.startswith("_"):
+                continue
+            mod = getattr(bpy.ops, mod_name)
+            for op_name in dir(mod):
+                with suppress(Exception):
+                    rt = getattr(mod, op_name).get_rna_type()
+                    out.append([f"{mod_name}.{op_name}", rt.description])
+        cls._drv_ops_cache = out
+        return out
+
+    def _describe_op(self, idname):
+        """{idname, name, description, properties, poll_now, refused} (no bl_options: unreachable for C operators, R19)."""
+        mod_name, _, op_name = str(idname).partition(".")
+        op = getattr(getattr(bpy.ops, mod_name, None), op_name, None) if mod_name and op_name else None
+        if op is None or not self._op_exists(op):
+            names = [o[0] for o in self._drv_ops_catalogue()]
+            return {"error": f"unknown operator '{idname}'", "closest": self._drv_closest(idname, names)}
+        rt = op.get_rna_type()
+        props = {p.identifier: self._describe_prop(p) for p in rt.properties if p.identifier != "rna_type"}
+        try:
+            poll_now = bool(op.poll())
+        except Exception:
+            poll_now = False
+        return {"kind": "operator", "idname": f"{mod_name}.{op_name}", "name": rt.name, "description": rt.description,
+                "properties": props, "poll_now": poll_now, "refused": f"{mod_name}.{op_name}" in _DRV_REFUSED_OPS}
+
+    # -- handlers ----------------------------------------------------------------------------
+
+    @_drv_handler
+    def drv_describe(self, what, fields="all", include_functions=False, search=None, max_chars=None):
+        """describe: a ref, a struct name ("Object"), an operator id ("mesh.bevel") or "ops" (+ search)."""
+        what = str(what or "").strip()
+        if not what:
+            return {"error": "what is required: a ref, a struct name, an operator id or \"ops\""}
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        if what.lower() == "ops":
+            ops = self._drv_ops_catalogue()
+            if search:
+                s = str(search).lower()
+                ops = [o for o in ops if s in o[0].lower() or s in (o[1] or "").lower()]
+            reply = {"success": True, "kind": "ops", "count": len(ops), "total": len(ops), "operators": list(ops)}
+            self._drv_finish(reply, cap, items_key="operators", items_hint="search= or raise max_chars=")
+            reply["count"] = len(reply["operators"])
+            return reply
+        if what.startswith("#") or ":" in what or "/" in what or what in self._DRV_ROOTS:
+            try:
+                owner, leaf, index = self._resolve_ref(what)
+            except _DrvRefError as e:
+                return e.reply
+            if leaf is not None and self._drv_idprop_key(leaf) is None:
+                prop = owner.bl_rna.properties[leaf]
+                reply = {"success": True, "kind": "property", "identifier": leaf, "owner": owner.bl_rna.identifier,
+                         **self._describe_prop(prop)}
+                if isinstance(owner, bpy.types.ID):
+                    reply.update(self._id_ref(owner))
+                return self._drv_finish(reply, cap)
+            if leaf is not None:
+                return {"error": f"{leaf} is an ID property; describe its owner instead"}
+            if isinstance(owner, bpy.types.bpy_prop_collection):
+                return {"error": "a collection has no descriptor; describe its item type (e.g. Modifier) or an item"}
+            reply = {"success": True, **self._describe_struct(owner.bl_rna, fields, include_functions, search)}
+            if isinstance(owner, bpy.types.ID):
+                reply.update(self._id_ref(owner))
+            elif hasattr(owner, "id_data") and isinstance(owner.id_data, bpy.types.ID):
+                reply["id"] = self._id_ref(owner.id_data)
+                reply["path"] = self._drv_path_from_id(owner)
+        elif "." in what:
+            reply = self._describe_op(what)
+            if "error" in reply:
+                return reply
+            reply = {"success": True, **reply}
+        else:
+            cls = getattr(bpy.types, what, None)
+            if cls is None or not hasattr(cls, "bl_rna"):
+                return {"error": f"unknown struct '{what}'",
+                        "closest": self._drv_closest(what, [n for n in dir(bpy.types) if not n.startswith("_")])}
+            reply = {"success": True, **self._describe_struct(cls.bl_rna, fields, include_functions, search)}
+        # R32 truncation order: (1) blank every description text (property + enum item, shape kept),
+        # (2) only then whole properties from the END of the dict, named in truncated[]
+        def blank_descriptions():
+            # replace, never mutate: the entry dicts are shared with the per-session catalogue cache
+            props = reply.get("properties", {})
+            for k, entry in list(props.items()):
+                if entry.get("description") or entry.get("enum_items"):
+                    copy = dict(entry)
+                    copy["description"] = ""
+                    if entry.get("enum_items"):
+                        copy["enum_items"] = [[i[0], i[1], ""] for i in entry["enum_items"]]
+                    props[k] = copy
+            if reply.get("description"):
+                reply["description"] = ""
+            return "descriptions dropped; pass max_chars= to keep them"
+        droppable = [(reply["properties"], k, "properties", "fields= or raise max_chars=") for k in list(reply.get("properties", {}))]
+        if "functions" in reply:
+            droppable.append((reply, "functions", "functions", "include_functions=False"))
+        reply["total"] = reply.get("count")
+        self._drv_finish(reply, cap, droppable, stage1=blank_descriptions, order="end")
+        reply["count"] = len(reply.get("properties", {}))  # R32b: count = kept entries, total = the struct's
+        return reply
+
+    @_drv_handler
+    def drv_get(self, refs, fields=None, depth=0, angles="RADIANS", max_chars=None):
+        """rna_get: many refs in one round trip; a bad ref lands in errors, the others still read."""
+        refs = self._drv_list(refs)
+        if not refs:
+            return {"error": "refs is required: a comma list or JSON list of refs"}
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        angles = str(angles or "RADIANS").upper()
+        if angles not in ("RADIANS", "DEGREES"):
+            return {"error": f"angles '{angles}' not valid", "valid": ["RADIANS", "DEGREES"]}
+        try:
+            depth = int(depth or 0)
+        except (TypeError, ValueError):
+            return {"error": "depth must be an integer"}
+        self._drv_skips = set()
+        results, errors, droppable = [], [], []
+        for ref in refs:
+            try:
+                owner, leaf, index = self._resolve_ref(ref)
+            except _DrvRefError as e:
+                errors.append({"ref": ref, **e.reply})
+                continue
+            entry = {"ref": ref}
+            try:
+                if leaf is None:
+                    if isinstance(owner, bpy.types.bpy_prop_collection):
+                        entry["value"] = {"count": len(owner),
+                                          "items": [self._encode_value(i, None, depth, None, angles) for i in owner]}
+                    else:
+                        if isinstance(owner, bpy.types.ID):
+                            entry.update(self._id_ref(owner))
+                        else:
+                            entry["struct"] = owner.bl_rna.identifier
+                            entry["path"] = self._drv_path_from_id(owner)
+                            if isinstance(getattr(owner, "id_data", None), bpy.types.ID):
+                                entry["id"] = self._id_ref(owner.id_data)
+                        entry["value"] = self._encode_struct(owner, depth, fields, angles)
+                else:
+                    if isinstance(owner, bpy.types.ID):
+                        entry.update(self._id_ref(owner))
+                    elif isinstance(getattr(owner, "id_data", None), bpy.types.ID):
+                        entry["id"] = self._id_ref(owner.id_data)
+                    key = self._drv_idprop_key(leaf)
+                    if key is not None:
+                        if key not in owner.keys():
+                            errors.append({"ref": ref, "error": f"no ID property '{key}' on {self._drv_name(owner)}",
+                                           "valid": list(owner.keys())})
+                            continue
+                        entry["value"] = self._encode_idprop(owner[key])
+                    else:
+                        prop = owner.bl_rna.properties[leaf]
+                        raw = getattr(owner, leaf)
+                        if index is not None:
+                            raw = raw[index]
+                        entry["value"] = self._encode_value(raw, prop, depth, fields, angles)
+            except Exception as e:
+                errors.append({"ref": ref, "error": f"{type(e).__name__}: {e}", "rna_error": str(e)})
+                continue
+            results.append(entry)
+            droppable.append((entry, "value", f"results[{len(results) - 1}] ({ref[:60]})", "fields= or depth= or raise max_chars="))
+        reply = {"success": True, "results": results, "errors": errors}
+        return self._drv_finish(reply, cap, droppable, notes=[self._drv_skip_note()])
+
+    def _drv_apply_sets(self, sets, angles="RADIANS", stop_on_error=True, publish=True, prefix=""):
+        """Shared by rna_set and data_new(set=): -> {results, applied, failed, stopped_at}."""
+        pairs = list(sets.items()) if isinstance(sets, dict) else [tuple(s) for s in sets]
+        results, applied, failed, stopped_at = [], 0, 0, None
+        for i, pair in enumerate(pairs):
+            if len(pair) != 2:
+                item = {"ref": str(pair), "set": False, "error": "each item must be [ref, value]"}
+            else:
+                ref, value = pair
+                ref = f"{prefix}{ref}" if prefix else str(ref)
+                item = {"ref": ref, "set": False}
+                try:
+                    owner, leaf, index = self._resolve_ref(ref, keep_prop=True)
+                except _DrvRefError as e:
+                    item.update(e.reply)
+                else:
+                    if leaf is None:
+                        item["error"] = f"'{ref}' ends on a struct; rna_set needs a property path"
+                    else:
+                        err = self._drv_assign(owner, leaf, index, value, angles)
+                        if err:
+                            item.update(err)
+                        else:
+                            item["set"] = True
+                            key = self._drv_idprop_key(leaf)
+                            with suppress(Exception):
+                                if key is not None:
+                                    item["value_after"] = self._encode_idprop(owner[key])
+                                else:
+                                    raw = getattr(owner, leaf)
+                                    item["value_after"] = self._encode_value(raw[index] if index is not None else raw,
+                                                                             owner.bl_rna.properties[leaf], 0, None, angles)
+                            if publish and key is None:
+                                with suppress(Exception):
+                                    bpy.msgbus.publish_rna(key=(getattr(bpy.types, owner.bl_rna.identifier), leaf))
+            results.append(item)
+            if item["set"]:
+                applied += 1
+            else:
+                failed += 1
+                if stop_on_error:
+                    stopped_at = i
+                    break
+        return {"results": results, "applied": applied, "failed": failed, "stopped_at": stopped_at}
+
+    @_drv_handler
+    def drv_set(self, sets, angles="RADIANS", stop_on_error=True, publish=True):
+        """rna_set: sets = [[ref, value], ...] or {ref: value}; success when failed == 0."""
+        sets, err = self._json_arg(sets, "sets")
+        if err:
+            return err
+        if not isinstance(sets, (list, dict)) or not sets:
+            return {"error": "sets must be a non-empty JSON list of [ref, value] pairs or an object {ref: value}"}
+        angles = str(angles or "RADIANS").upper()
+        if angles not in ("RADIANS", "DEGREES"):
+            return {"error": f"angles '{angles}' not valid", "valid": ["RADIANS", "DEGREES"]}
+        outcome = self._drv_apply_sets(sets, angles, bool(stop_on_error), bool(publish))
+        return {"success": outcome["failed"] == 0, **outcome}
+
+    @_drv_handler
+    def drv_new(self, collection, args=None, kwargs=None, link_to=None, set=None):
+        """data_new: bpy.data.<collection>.new(...) validated against the live RNA signature."""
+        collection = str(collection or "").strip()
+        cols = self._drv_data_collections()
+        with_new = [c for c in cols if bpy.data.bl_rna.properties[c].srna is not None
+                    and "new" in bpy.data.bl_rna.properties[c].srna.functions]
+        if collection not in cols:
+            return {"error": f"unknown bpy.data collection '{collection}'", "valid": with_new,
+                    "closest": self._drv_closest(collection, cols)}
+        if collection not in with_new:
+            return {"error": f"bpy.data.{collection} has no new(); IDs of this type come from import / load tools",
+                    "valid": with_new}
+        args, err = self._json_arg(args, "args")
+        if err:
+            return err
+        kwargs, err = self._json_arg(kwargs, "kwargs")
+        if err:
+            return err
+        args = list(args or [])
+        kwargs = dict(kwargs or {})
+        fn = bpy.data.bl_rna.properties[collection].srna.functions["new"]
+        params = [p for p in fn.parameters if not p.is_output]
+        names = [p.identifier for p in params]
+        if len(args) > len(params):
+            return {"error": f"{collection}.new takes {len(params)} arguments {names}, got {len(args)}", "valid": names}
+        call = dict(zip(names, args))
+        for k, v in kwargs.items():
+            if k not in names:
+                return {"error": f"unknown argument '{k}' for {collection}.new", "valid": names,
+                        "closest": self._drv_closest(k, names)}
+            call[k] = v
+        missing = [p.identifier for p in params if p.is_required and p.identifier not in call and p.type != 'POINTER']
+        if missing:
+            return {"error": f"{collection}.new is missing required argument(s) {missing}", "valid": names}
+        for p in params:
+            if p.type == 'POINTER' and p.identifier in call:
+                target, perr = self._drv_pointer_value(p, call[p.identifier])
+                if perr:
+                    return {"error": f"argument '{p.identifier}': {perr['error']}", **{k: v for k, v in perr.items() if k != 'error'}}
+                call[p.identifier] = target
+        try:
+            idb = getattr(bpy.data, collection).new(**call)
+        except Exception as e:
+            return {"error": f"{collection}.new failed: {e}", "rna_error": str(e),
+                    "params": [[p.identifier, p.type, bool(p.is_required)] for p in params]}
+        reply = {"success": True, **self._id_ref(idb), "linked_to": None}
+        if collection == "objects":
+            target = None
+            if link_to in (None, "", "scene"):
+                target = bpy.context.scene.collection
+            else:
+                try:
+                    root, rest = self._resolve_root(str(link_to))
+                except _DrvRefError as e:
+                    bpy.data.objects.remove(idb)
+                    return {"error": f"link_to: {e.reply['error']}", **{k: v for k, v in e.reply.items() if k != 'error'}}
+                if isinstance(root, bpy.types.Scene):
+                    target = root.collection
+                elif isinstance(root, bpy.types.Collection) and not rest:
+                    target = root
+                else:
+                    bpy.data.objects.remove(idb)
+                    return {"error": f"link_to must be \"scene\", \"COLLECTION:Name\" or \"#uid\" of a collection, got '{link_to}'"}
+            try:
+                target.objects.link(idb)
+                reply["linked_to"] = target.name
+            except Exception as e:
+                reply["linked_to"] = None
+                reply["link_error"] = str(e)
+        if set:
+            sets, err = self._json_arg(set, "set")
+            if err:
+                reply["set"] = {"applied": 0, "failed": 0, "results": [], **err}
+            else:
+                outcome = self._drv_apply_sets(sets, "RADIANS", False, True, prefix=f"#{idb.session_uid}/")
+                reply["set"] = {"applied": outcome["applied"], "failed": outcome["failed"], "results": outcome["results"]}
+        return reply
+
+    @_drv_handler
+    def drv_remove(self, refs, do_unlink=True, purge_orphans=False):
+        """data_remove: per ref {ref, removed, users_before, error?}; purge_orphans runs orphans_purge afterwards."""
+        refs = self._drv_list(refs)
+        if not refs:
+            return {"error": "refs is required: a comma list or JSON list of ID refs"}
+        idmap = self._id_type_map()
+        results = []
+        for ref in refs:
+            item = {"ref": ref, "removed": False, "users_before": None}
+            try:
+                root, rest = self._resolve_root(ref)
+            except _DrvRefError as e:
+                item.update(e.reply)
+                results.append(item)
+                continue
+            if rest or not isinstance(root, bpy.types.ID):
+                item["error"] = f"'{ref}' must name an ID (#uid or IDTYPE:Name), not a path"
+                results.append(item)
+                continue
+            item.update(self._id_ref(root))
+            item["users_before"] = int(root.users)
+            coll = idmap.get(root.id_type)
+            if coll is None:
+                item["error"] = f"no bpy.data collection known for id_type {root.id_type}"
+                results.append(item)
+                continue
+            if root.users and not do_unlink:
+                item["error"] = f"{self._drv_name(root)} has {root.users} user(s); pass do_unlink=True to remove it anyway"
+                results.append(item)
+                continue
+            try:
+                getattr(bpy.data, coll).remove(root, do_unlink=bool(do_unlink))
+                item["removed"] = True
+            except Exception as e:
+                item["error"] = f"remove failed: {e}"
+                item["rna_error"] = str(e)
+            results.append(item)
+        reply = {"success": all(r["removed"] for r in results), "results": results, "purged": None}
+        if purge_orphans:
+            before = sum(len(getattr(bpy.data, c)) for c in self._drv_data_collections())
+            try:
+                bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+                reply["purged"] = before - sum(len(getattr(bpy.data, c)) for c in self._drv_data_collections())
+            except Exception as e:
+                reply["purge_error"] = str(e)
+        return reply
+
+    def _drv_where_match(self, idb, path, op, value):
+        """One [path, op, value] clause; a path with [] means any item of that collection."""
+        if self._drv_unsafe_path(path):
+            return False
+        if "[]" in path:
+            head, _, tail = path.partition("[]")
+            try:
+                coll = idb.path_resolve(head, False)
+            except Exception:
+                return op == "exists" and value is False
+            tail = tail.lstrip(".")
+            return any(self._drv_where_match(item, tail, op, value) for item in coll) if tail else \
+                (len(coll) > 0 if op == "exists" else any(self._drv_compare(self._encode_value(i), op, value) for i in coll))
+        try:
+            raw = idb.path_resolve(path) if path else idb
+        except Exception:
+            return op == "exists" and value is False
+        if op == "exists":
+            # present = the path resolves to a non-None value; ["parent", "exists", False] = no parent
+            return (raw is not None) == (True if value is None else bool(value))
+        return self._drv_compare(self._encode_value(raw), op, value)
+
+    @staticmethod
+    def _drv_compare(actual, op, value):
+        try:
+            if op == "==":
+                return actual == value
+            if op == "!=":
+                return actual != value
+            if op == "<":
+                return actual < value
+            if op == "<=":
+                return actual <= value
+            if op == ">":
+                return actual > value
+            if op == ">=":
+                return actual >= value
+            if op == "in":
+                return actual in value
+            if op == "contains":
+                return value in actual
+        except Exception:
+            return False
+        return False
+
+    @_drv_handler
+    def drv_find(self, id_type="OBJECT", name=None, where=None, scope="SCENE", fields="name,type", limit=100, max_chars=None):
+        """find: glob on name + where clauses [[path, op, value], ...]; scope SCENE only for OBJECT."""
+        import fnmatch
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        self._drv_skips = set()
+        idmap = self._id_type_map()
+        idt = str(id_type or "OBJECT").upper()
+        coll = idmap.get(idt)
+        if coll is None:
+            return {"error": f"unknown id_type '{id_type}'", "valid": sorted(idmap), "closest": self._drv_closest(idt, idmap)}
+        where, err = self._json_arg(where, "where")
+        if err:
+            return err
+        clauses = []
+        for clause in (where or []):
+            if not isinstance(clause, (list, tuple)) or len(clause) != 3:
+                return {"error": f"where clause must be [path, op, value], got {clause!r}"}
+            path, op, value = clause
+            if op not in self._DRV_WHERE_OPS:
+                return {"error": f"where op '{op}' not valid", "valid": list(self._DRV_WHERE_OPS)}
+            clauses.append((str(path), op, value))
+        try:
+            limit = int(limit if limit is not None else 100)
+        except (TypeError, ValueError):
+            return {"error": "limit must be an integer"}
+        scope = str(scope or "SCENE").upper()
+        if scope not in ("SCENE", "DATA"):
+            return {"error": f"scope '{scope}' not valid", "valid": ["SCENE", "DATA"]}
+        if idt == "OBJECT" and scope == "SCENE":
+            candidates = list(bpy.context.scene.objects)
+        else:
+            candidates = list(getattr(bpy.data, coll))
+            scope = "DATA"
+        if name:
+            candidates = [i for i in candidates if fnmatch.fnmatchcase(i.name, str(name))]
+        matches = [i for i in candidates if all(self._drv_where_match(i, p, o, v) for p, o, v in clauses)]
+        items = []
+        for idb in matches[:max(limit, 0)]:
+            entry = self._id_ref(idb)
+            if fields:
+                entry.update(self._encode_struct(idb, 0, fields, "RADIANS"))
+            items.append(entry)
+        reply = {"success": True, "id_type": idt, "scope": scope, "count": len(items), "total": len(matches), "items": items}
+        self._drv_finish(reply, cap, items_key="items", items_hint="fields= or limit= or raise max_chars=", notes=[self._drv_skip_note()])
+        reply["count"] = len(reply["items"])
+        return reply
+
+    @_drv_handler
+    def drv_context(self, fields=None):
+        """context_info: what call_operator's context declaration is applied against (window AND background, R20)."""
+        ctx = bpy.context
+        ref = lambda ob: self._id_ref(ob) if ob is not None else None  # noqa: E731
+        win = ctx.window
+        screen = ctx.screen or (win.screen if win is not None else None)
+        info = {"mode": ctx.mode, "active_object": ref(ctx.view_layer.objects.active if ctx.view_layer else None),
+                "selected": [self._id_ref(o) for o in (ctx.selected_objects or [])],
+                "scene": ref(ctx.scene), "view_layer": ctx.view_layer.name if ctx.view_layer else None,
+                "window": win is not None, "background": bool(bpy.app.background),
+                "areas": [{"type": a.type, "regions": [r.type for r in a.regions]} for a in (screen.areas if screen else [])],
+                "frame_current": ctx.scene.frame_current if ctx.scene else None,
+                "edit_object": ref(getattr(ctx, "edit_object", None)), "pose_object": ref(getattr(ctx, "pose_object", None))}
+        wanted = self._drv_list(fields)
+        if wanted:
+            missing = [k for k in wanted if k not in info]
+            info = {k: info[k] for k in wanted if k in info}
+            if missing:
+                info["missing"] = missing
+        return {"success": True, **info}
+
+    # -- L2: context declaration, operators, methods, snapshots, diffs (12.2.3, R19, R20, R33) ---
+
+    # The 16 temp_override keys the driver accepts (R19: Blender takes ANY key silently, so the whitelist is ours)
+    _DRV_CONTEXT_KEYS = ("window", "screen", "area", "region", "scene", "view_layer", "object", "active_object",
+                         "selected_objects", "selected_editable_objects", "edit_object", "pose_object",
+                         "active_bone", "active_pose_bone", "modifier", "point_cache")
+    _DRV_DECL_KEYS = ("mode", "active", "selected", "area", "region", "scene", "keep", "extra")
+    _DRV_SNAPSHOT_FIELDS = "name,type,parent,location,rotation_euler,scale,hide_viewport,hide_render,users"
+    _DRV_SNAPSHOT_INCLUDE = ("modifiers", "constraints", "material_slots", "vertex_groups", "children")
+
+    def _drv_object_ref(self, ref, label):
+        """A context declaration ref -> the Object it names (error for anything else)."""
+        root, rest = self._resolve_root(str(ref))
+        if rest or not isinstance(root, bpy.types.Object):
+            raise _DrvRefError({"error": f"{label} must name an OBJECT (#uid or OBJECT:Name), got '{ref}'"})
+        return root
+
+    def _drv_context_value(self, value):
+        """An `extra` value: refs (str / {uid}) resolve to IDs or structs, lists element-wise, others pass through."""
+        if isinstance(value, dict) and "uid" in value:
+            value = f"#{value['uid']}"
+        if isinstance(value, str) and (value.startswith("#") or ":" in value or value.split("/")[0] in self._DRV_ROOTS):
+            owner, leaf, index = self._resolve_ref(value)
+            return owner if leaf is None else getattr(owner, leaf)
+        if isinstance(value, (list, tuple)):
+            return [self._drv_context_value(v) for v in value]
+        return value
+
+    @contextmanager
+    def _apply_context(self, decl):
+        """
+        Apply a call_operator context declaration (12.2.3) and yield `applied` = {mode, active, selected,
+        area, region, extra_keys}. active/selected -> real selection inside _selection_scope; mode ->
+        object.mode_set inside _mode_restore; area/region -> the first matching area of _gui_window() in a
+        temp_override (refused under bpy.app.background, R20); extra -> temp_override keys against the
+        R19 whitelist. keep=True skips every restore. Resolution happens BEFORE any side effect: a bad
+        declaration raises _DrvRefError and nothing was touched.
+        """
+        from contextlib import ExitStack
+        decl = dict(decl or {})
+        unknown = [k for k in decl if k not in self._DRV_DECL_KEYS]
+        if unknown:
+            raise _DrvRefError({"error": f"unknown context key(s) {unknown}", "valid": list(self._DRV_DECL_KEYS),
+                                "closest": self._drv_closest(unknown[0], self._DRV_DECL_KEYS)})
+        applied = {"mode": None, "active": None, "selected": [], "area": None, "region": None, "extra_keys": []}
+        keep = bool(decl.get("keep"))
+        active = self._drv_object_ref(decl["active"], "active") if decl.get("active") else None
+        selected = [self._drv_object_ref(r, "selected[]") for r in self._drv_list(decl.get("selected")) or []]
+        scene = None
+        if decl.get("scene"):
+            scene, rest = self._resolve_root(str(decl["scene"]))
+            if rest or not isinstance(scene, bpy.types.Scene):
+                raise _DrvRefError({"error": f"scene must name a SCENE, got '{decl['scene']}'"})
+        extra = decl.get("extra") or {}
+        if not isinstance(extra, dict):
+            raise _DrvRefError({"error": "extra must be a JSON object of temp_override keys", "valid": list(self._DRV_CONTEXT_KEYS)})
+        for key in extra:
+            if key not in self._DRV_CONTEXT_KEYS:
+                raise _DrvRefError({"error": f"unknown temp_override key '{key}' in extra", "valid": list(self._DRV_CONTEXT_KEYS),
+                                    "closest": self._drv_closest(key, self._DRV_CONTEXT_KEYS)})
+        override = {k: self._drv_context_value(v) for k, v in extra.items()}
+        mode = str(decl["mode"]).upper() if decl.get("mode") else None
+        area = region = None
+        if decl.get("area") or decl.get("region"):
+            if bpy.app.background:
+                raise _DrvRefError({"error": "Viewport context needs a GUI session: area/region were declared under --background",
+                                    "background": True})
+            win = self._gui_window()
+            screen = win.screen if win is not None else None
+            want_area = str(decl.get("area") or "VIEW_3D").upper()
+            area = next((a for a in (screen.areas if screen else []) if a.type == want_area), None)
+            if area is None:
+                raise _DrvRefError({"error": f"no {want_area} area in the current screen",
+                                    "valid": sorted({a.type for a in (screen.areas if screen else [])})})
+            want_region = str(decl.get("region") or "WINDOW").upper()
+            region = next((r for r in area.regions if r.type == want_region), None)
+            if region is None:
+                raise _DrvRefError({"error": f"no {want_region} region in the {want_area} area",
+                                    "valid": sorted({r.type for r in area.regions})})
+            override.update({"window": win, "screen": screen, "area": area, "region": region})
+            applied["area"], applied["region"] = want_area, want_region
+        if scene is not None:
+            override["scene"] = scene
+        applied["extra_keys"] = sorted(extra)
+        with ExitStack() as stack:
+            if not keep:
+                stack.enter_context(self._selection_scope())
+                if mode:
+                    stack.enter_context(self._mode_restore())
+            if active is not None or selected:
+                view_layer = bpy.context.view_layer
+                for o in view_layer.objects:
+                    if o.select_get():
+                        o.select_set(False)
+                for o in selected:
+                    with suppress(Exception):
+                        o.select_set(True)
+                target = active if active is not None else (selected[0] if selected else None)
+                if target is not None:
+                    view_layer.objects.active = target
+                    applied["active"] = target.session_uid
+                applied["selected"] = [o.session_uid for o in selected]
+                override.setdefault("object", target)
+                override.setdefault("active_object", target)
+                override.setdefault("selected_objects", list(selected) or ([target] if target else []))
+                override.setdefault("selected_editable_objects", override["selected_objects"])
+            if mode:
+                if bpy.context.view_layer.objects.active is None:
+                    raise _DrvRefError({"error": f"mode {mode} needs an active object: declare active"})
+                try:
+                    bpy.ops.object.mode_set(mode=mode)
+                except Exception as e:
+                    raise _DrvRefError({"error": f"could not enter mode {mode}: {e}", "rna_error": str(e),
+                                        "valid": self._drv_enum_valid(bpy.ops.object.mode_set.get_rna_type().properties["mode"], str(e))})
+                applied["mode"] = mode
+            with bpy.context.temp_override(**override):
+                yield applied
+
+    @_drv_handler
+    def drv_op(self, op, params=None, context=None, exec_context="EXEC_DEFAULT", undo=True):
+        """call_operator: refused list, INVOKE gate, context declaration, poll first, teaching errors, reports."""
+        t0 = time.perf_counter()
+        op = str(op or "").strip()
+        mod_name, _, op_name = op.partition(".")
+        params, err = self._json_arg(params, "params")
+        if err:
+            return err
+        context, err = self._json_arg(context, "context")
+        if err:
+            return err
+        params = dict(params or {})
+        if not isinstance(context, (dict, type(None))):
+            return {"error": "context must be a JSON object (12.2.3)", "valid": list(self._DRV_DECL_KEYS)}
+        if op in _DRV_REFUSED_OPS and (op != "preferences.addon_disable" or str(params.get("module", "")) in (__name__, __name__.split(".")[0])):
+            return {"error": f"operator '{op}' is refused by the driver: it would end the session or hang headless "
+                             f"(use the dedicated tool: quit_blender, set_frame/playblast, load_blend/save_blend)", "refused": True}
+        fn = getattr(getattr(bpy.ops, mod_name, None), op_name, None) if mod_name and op_name else None
+        if fn is None or not self._op_exists(fn):
+            return {"error": f"unknown operator '{op}'", "closest": self._drv_closest(op, [o[0] for o in self._drv_ops_catalogue()])}
+        exec_context = str(exec_context or "EXEC_DEFAULT").upper()
+        if exec_context != "EXEC_DEFAULT" and (bpy.app.background or not (context or {}).get("area")):
+            return {"error": f"exec_context {exec_context} is refused: INVOKE_* needs a GUI session and context.area; use EXEC_DEFAULT",
+                    "background": bool(bpy.app.background), "valid": ["EXEC_DEFAULT"]}
+        rt = fn.get_rna_type()
+        known = [p.identifier for p in rt.properties if p.identifier != "rna_type"]
+        unknown = [k for k in params if k not in known]
+        buf = io.StringIO()
+        try:
+            with self._apply_context(context) as applied:
+                if unknown:
+                    reply = {"error": f"unknown parameter(s) {unknown} for {op}", "closest": self._drv_closest(unknown[0], known),
+                             "valid": known, "context_applied": applied}
+                    try:
+                        fn(exec_context, **params)  # conversion (or the poll) fails before anything runs: the RNA text, verbatim
+                    except Exception as e:
+                        reply["rna_error"] = str(e)
+                    return reply
+                if not fn.poll():
+                    reply = {"error": f"operator {op} cannot run in this context (poll failed)", "context_applied": applied}
+                    try:
+                        fn(exec_context, **params)
+                    except Exception as e:
+                        reply["rna_error"] = str(e)
+                        reply["poll_message"] = str(e).partition("failed, ")[2] or str(e)
+                    else:
+                        reply["poll_message"] = "poll() returned False"
+                    return reply
+                if undo:
+                    with suppress(Exception):
+                        bpy.ops.ed.undo_push(message=f"mcp:{op}")
+                try:
+                    with redirect_stdout(buf):
+                        res = fn(exec_context, **params)
+                except Exception as e:
+                    reply = {"error": f"{op} failed: {e}", "rna_error": str(e), "context_applied": applied,
+                             "reports": [l for l in buf.getvalue().splitlines() if l.strip()]}
+                    text = str(e)
+                    if "not found in (" in text:
+                        m = re.search(r'enum "([^"]*)"', text)
+                        prop = next((p for p in rt.properties if p.type == 'ENUM' and m and str(params.get(p.identifier)) == m.group(1)), None)
+                        reply["valid"] = self._drv_enum_valid(prop, text) if prop else self._drv_enum_valid(rt.properties["rna_type"], text)
+                    if "unrecognized" in text:
+                        m = re.search(r'keyword "([^"]*)"', text)
+                        reply["closest"] = self._drv_closest(m.group(1) if m else "", known)
+                    return reply
+                result = sorted(res)
+        except _DrvRefError as e:
+            reply = dict(e.reply)
+            reply.setdefault("context_applied", {"mode": None, "active": None, "selected": [], "area": None, "region": None, "extra_keys": []})
+            return reply
+        reply = {"success": True, "result": result, "reports": [l for l in buf.getvalue().splitlines() if l.strip()],
+                 "context_applied": applied, "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2),
+                 "modal": "RUNNING_MODAL" in result or "PASS_THROUGH" in result}
+        if reply["modal"]:
+            reply["warning"] = "the operator is modal: nothing waits for it, the reply carries its first return value only"
+        return reply
+
+    @_drv_handler
+    def drv_call(self, ref, method, args=None, kwargs=None, depsgraph=False, max_chars=None):
+        """call_method: an RNA function (validated against bl_rna.functions) or a plain Python method of the struct."""
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        args, err = self._json_arg(args, "args")
+        if err:
+            return err
+        kwargs, err = self._json_arg(kwargs, "kwargs")
+        if err:
+            return err
+        args = list(args or [])
+        kwargs = dict(kwargs or {})
+        method = str(method or "").strip()
+        owner, leaf, index = self._resolve_ref(ref)
+        if leaf is not None:
+            return {"error": f"'{ref}' ends on a property; call_method needs an ID, struct or collection ref"}
+        rna = getattr(owner, "bl_rna", None)
+        funcs = rna.functions if rna is not None else {}
+        fn_rna = funcs.get(method) if rna is not None else None
+        target = getattr(owner, method, None)
+        if fn_rna is None and not callable(target):
+            names = [f.identifier for f in funcs] + [n for n in dir(owner) if not n.startswith("_") and callable(getattr(owner, n, None))]
+            return {"error": f"'{method}' is not a method of {self._drv_name(owner)}", "closest": self._drv_closest(method, names),
+                    "valid": [f.identifier for f in funcs]}
+        call = dict(kwargs)
+        if fn_rna is not None:
+            params = [p for p in fn_rna.parameters if not p.is_output]
+            names = [p.identifier for p in params]
+            if len(args) > len(params):
+                return {"error": f"{method} takes {len(params)} argument(s) {names}, got {len(args)}", "valid": names}
+            call.update(zip(names, args))
+            for k in kwargs:
+                if k not in names:
+                    return {"error": f"unknown argument '{k}' for {method}", "valid": names, "closest": self._drv_closest(k, names)}
+            for p in params:
+                if p.type == 'POINTER':
+                    if p.identifier not in call and p.fixed_type.identifier == "Depsgraph" and depsgraph:
+                        call[p.identifier] = bpy.context.evaluated_depsgraph_get()
+                    elif p.identifier in call and isinstance(call[p.identifier], (str, dict)):
+                        # RA-12: the same ref grammar and fixed_type check as drv_new / drv_set
+                        target_id, perr = self._drv_pointer_value(p, call[p.identifier])
+                        if perr:
+                            return perr
+                        call[p.identifier] = target_id
+            missing = [p.identifier for p in params if p.is_required and p.identifier not in call]
+            if missing:
+                hint = "; pass depsgraph=True" if any(p.fixed_type.identifier == "Depsgraph" for p in params if p.type == 'POINTER' and p.identifier in missing) else ""
+                return {"error": f"{method} is missing required argument(s) {missing}{hint}", "valid": names,
+                        "params": [[p.identifier, p.type, bool(p.is_required)] for p in params]}
+            args = []
+        try:
+            value = target(*args, **call)
+        except Exception as e:
+            reply = {"error": f"{method} failed: {e}", "rna_error": str(e)}
+            if fn_rna is not None:
+                reply["params"] = [[p.identifier, p.type, bool(p.is_required)] for p in fn_rna.parameters if not p.is_output]
+            return reply
+        self._drv_skips = set()
+        reply = {"success": True, "value": self._encode_value(value, None, 0)}
+        return self._drv_finish(reply, cap, [(reply, "value", "value", "raise max_chars=")], notes=[self._drv_skip_note()])
+
+    @staticmethod
+    def _drv_snapshot_store():
+        """Named scene snapshots, kept in driver_namespace so an add-on reload does not drop them."""
+        return bpy.app.driver_namespace.setdefault("blendermcp_driver_snapshots", {})
+
+    def _drv_capture(self, scope, types, fields, include, depth, angles):
+        """The snapshot body: {captured_at, scope, count, ids: {uid: {...}}, tree: [...]}."""
+        if scope == "SCENE":
+            ids = list(bpy.context.scene.objects)
+        else:
+            ids = [i for c in self._drv_data_collections() for i in getattr(bpy.data, c)]
+        if types:
+            ids = [i for i in ids if i.id_type in types]
+        entries = {}
+        for idb in ids:
+            entry = self._id_ref(idb)
+            values = self._encode_struct(idb, 0, fields, angles)
+            values.pop("missing", None)
+            entry.update(values)
+            for name in include or []:
+                coll = getattr(idb, name, None)
+                if coll is None or not hasattr(coll, "__len__"):
+                    continue
+                items = []
+                for item in coll:
+                    if isinstance(item, bpy.types.ID):
+                        items.append(self._id_ref(item))
+                    elif item is None:
+                        items.append(None)
+                    else:
+                        items.append(self._encode_struct(item, 0, "name,type", angles))
+                        items[-1].pop("missing", None)
+                entry[name] = items
+            entries[str(idb.session_uid)] = entry
+        parents = {}
+        for idb in ids:
+            p = getattr(idb, "parent", None)
+            parents[idb.session_uid] = p.session_uid if p is not None and str(p.session_uid) in entries else None
+        children = {}
+        for uid, pu in parents.items():
+            children.setdefault(pu, []).append(uid)
+
+        def node(uid, level):
+            kids = children.get(uid, []) if level < depth else []
+            return {"uid": uid, "children": [node(k, level + 1) for k in kids]}
+
+        tree = [node(uid, 0) for uid in parents if parents[uid] is None]
+        return {"captured_at": round(time.time(), 3), "scope": scope, "count": len(entries), "ids": entries, "tree": tree}
+
+    @_drv_handler
+    def drv_snapshot(self, name, scope="SCENE", types=None, fields=None, include=None, depth=1, return_tree=True,
+                     angles="RADIANS", max_chars=None):
+        """scene_snapshot: a uid-keyed tree stored under driver_namespace['blendermcp_driver_snapshots'][name]."""
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        name = str(name or "").strip()
+        if not name:
+            return {"error": "name is required (the snapshot is addressed by it in scene_diff)"}
+        scope = str(scope or "SCENE").upper()
+        if scope not in ("SCENE", "DATA"):
+            return {"error": f"scope '{scope}' not valid", "valid": ["SCENE", "DATA"]}
+        enum_ids = sorted(self._id_type_map())
+        types = [str(t).upper() for t in self._drv_list(types) or []]
+        bad = [t for t in types if t not in enum_ids]
+        if bad:
+            return {"error": f"unknown id_type(s) {bad} in types", "valid": enum_ids}
+        include = self._drv_list(include) or []
+        bad = [i for i in include if i not in self._DRV_SNAPSHOT_INCLUDE]
+        if bad:
+            return {"error": f"unknown include(s) {bad}", "valid": list(self._DRV_SNAPSHOT_INCLUDE)}
+        fields = ",".join(self._drv_list(fields) or []) or self._DRV_SNAPSHOT_FIELDS
+        angles = str(angles or "RADIANS").upper()
+        if angles not in ("RADIANS", "DEGREES"):
+            return {"error": f"angles '{angles}' not valid", "valid": ["RADIANS", "DEGREES"]}
+        try:
+            depth = int(depth if depth is not None else 1)
+        except (TypeError, ValueError):
+            return {"error": "depth must be an integer"}
+        self._drv_skips = set()
+        params = {"scope": scope, "types": types, "fields": fields, "include": include, "depth": depth, "angles": angles}
+        data = self._drv_capture(scope, types, fields, include, depth, angles)
+        self._drv_snapshot_store()[name] = {"params": params, "data": data}
+        if not return_tree:
+            reply = {"success": True, "name": name, "count": data["count"]}
+            reply["chars"] = len(json.dumps(reply)) + 12 + len(str(len(json.dumps(reply))))
+            return reply
+        reply = {"success": True, "name": name, **json.loads(json.dumps(data, default=str))}
+        droppable = [(reply["ids"], k, "ids", "fields= or types= or raise max_chars=") for k in list(reply["ids"])]
+        droppable.append((reply, "tree", "tree", "return_tree=False or raise max_chars="))
+        return self._drv_finish(reply, cap, droppable, notes=[self._drv_skip_note()])
+
+    @_drv_handler
+    def drv_diff(self, a, b="NOW", max_chars=None):
+        """scene_diff: added / removed / renamed (by uid) / changed between two snapshots (b="NOW" = the live scene)."""
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        store = self._drv_snapshot_store()
+        a = str(a or "").strip()
+        if a not in store:
+            return {"error": f"no snapshot named '{a}'", "valid": sorted(store), "closest": self._drv_closest(a, store)}
+        b = str(b or "NOW").strip()
+        if b.upper() == "NOW":
+            b = "NOW"
+            p = store[a]["params"]
+            self._drv_skips = set()
+            bdata = self._drv_capture(p["scope"], p["types"], p["fields"], p["include"], p["depth"], p["angles"])
+        elif b in store:
+            bdata = store[b]["data"]
+        else:
+            return {"error": f"no snapshot named '{b}'", "valid": sorted(store) + ["NOW"], "closest": self._drv_closest(b, store)}
+        ia, ib = store[a]["data"]["ids"], bdata["ids"]
+        ref = lambda e: {"uid": e["uid"], "id_type": e["id_type"], "name": e["name"]}  # noqa: E731
+        added = [ref(ib[k]) for k in ib if k not in ia]
+        removed = [ref(ia[k]) for k in ia if k not in ib]
+        renamed, changed = [], {}
+        for k in ia:
+            if k not in ib:
+                continue
+            ea, eb = ia[k], ib[k]
+            if ea["name"] != eb["name"]:
+                renamed.append({"uid": ea["uid"], "before": ea["name"], "after": eb["name"]})
+            diff = {}
+            for field in set(ea) | set(eb):
+                if field in ("uid", "id_type", "name", "embedded"):
+                    continue
+                va, vb = ea.get(field), eb.get(field)
+                if json.dumps(va, sort_keys=True, default=str) != json.dumps(vb, sort_keys=True, default=str):
+                    diff[field] = [va, vb]
+            if diff:
+                changed[k] = diff
+        reply = {"success": True, "a": a, "b": b, "added": added, "removed": removed, "renamed": renamed, "changed": changed}
+        # one group: a tiny cap must still leave a <= 200-char envelope with ONE truncated line
+        droppable = [(reply["changed"], k, "diff", "raise max_chars=") for k in list(changed)]
+        droppable += [(reply, k, "diff", "raise max_chars=") for k in ("added", "removed", "renamed")]
+        return self._drv_finish(reply, cap, droppable, notes=[self._drv_skip_note()])
+
+    # -- L3: transactions and batches (R22 marker sequence, R27 wall cap, R30 item rule, G9 dispatch) ---
+
+    _DRV_TXN_KEY = "blendermcp_driver_txn"
+
+    @staticmethod
+    def _drv_undo_available():
+        try:
+            return bool(bpy.ops.ed.undo.poll())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _drv_next_seq():
+        ns = bpy.app.driver_namespace
+        ns["blendermcp_driver_seq"] = int(ns.get("blendermcp_driver_seq", 0)) + 1
+        return ns["blendermcp_driver_seq"]
+
+    @staticmethod
+    def _drv_mark(marker, label):
+        """R22 three-step BEGIN: push the pre-state, set the Scene idprop marker, push the marked state. Returns seq.
+        The pre push is what stops a rollback from walking into edits made before BEGIN."""
+        seq = BlenderMCPServer._drv_next_seq()
+        bpy.ops.ed.undo_push(message=f"mcp:{label}:pre")
+        bpy.context.scene[marker] = seq
+        bpy.ops.ed.undo_push(message=f"mcp:{label}")
+        return seq
+
+    @staticmethod
+    def _drv_unwind(marker, seq, label="txn"):
+        """
+        ed.undo while the marker still reads seq (cap = prefs undo_steps). Returns (undo_calls, marker_present).
+        R-B2-42 (F-B2-3): a closing undo_push first, so Python-only mutations made since the last push
+        (drv_set, set_origin, ...) are captured and the unwind reverts them too; both callers route here.
+        """
+        with suppress(Exception):
+            bpy.ops.ed.undo_push(message=f"mcp:{label}:rollback")
+        cap = max(int(bpy.context.preferences.edit.undo_steps), 1)
+        n = 0
+        while bpy.context.scene.get(marker) == seq and n < cap:
+            if not BlenderMCPServer._drv_undo_available():
+                break
+            bpy.ops.ed.undo()
+            n += 1
+        present = bpy.context.scene.get(marker) == seq
+        if present:  # undo could not reach it: drop the marker so the scene is not left tagged
+            with suppress(Exception):
+                del bpy.context.scene[marker]
+        return n, present
+
+    @_drv_handler
+    def drv_transaction(self, action, name=None):
+        """transaction: BEGIN / COMMIT / ROLLBACK / STATUS on the Scene marker _mcp_txn (R22)."""
+        action = str(action or "").strip().upper()
+        valid = ["BEGIN", "COMMIT", "ROLLBACK", "STATUS"]
+        if action not in valid:
+            return {"error": f"action '{action}' not valid", "valid": valid}
+        ns = bpy.app.driver_namespace
+        state = ns.get(self._DRV_TXN_KEY)
+        marker_present = state is not None and bpy.context.scene.get("_mcp_txn") == state.get("seq")
+        base = {"success": True, "action": action, "name": state["name"] if state else None,
+                "undo_calls": state["undo_calls"] if state else 0, "marker_present": marker_present,
+                "undo_available": self._drv_undo_available(), "open": state is not None}
+        if action == "STATUS":
+            return base
+        if action == "BEGIN":
+            if state is not None:
+                return {"error": f"transaction '{state['name']}' is open; COMMIT or ROLLBACK it first", "open": True,
+                        "name": state["name"]}
+            name = str(name or "").strip() or f"txn{int(ns.get('blendermcp_driver_seq', 0)) + 1}"
+            seq = self._drv_mark("_mcp_txn", name)
+            ns[self._DRV_TXN_KEY] = {"name": name, "seq": seq, "undo_calls": 0}
+            return {**base, "name": name, "undo_calls": 0, "marker_present": True, "open": True,
+                    "undo_available": self._drv_undo_available()}
+        if state is None:
+            return {"error": "no transaction is open; BEGIN one first", "open": False}
+        if action == "COMMIT":
+            with suppress(Exception):
+                del bpy.context.scene["_mcp_txn"]
+            ns.pop(self._DRV_TXN_KEY, None)
+            return {**base, "marker_present": False, "open": False}
+        # ROLLBACK
+        if not marker_present:
+            # RA-9: the marker is already gone (deleted or undone past): nothing can be reverted, say so
+            ns.pop(self._DRV_TXN_KEY, None)
+            return {"error": "transaction marker not found; nothing reverted", "success": False, "undo_calls": 0,
+                    "marker_present": False, "open": False, "name": state["name"],
+                    "undo_available": self._drv_undo_available()}
+        n, present = self._drv_unwind("_mcp_txn", state["seq"], state["name"])
+        ns.pop(self._DRV_TXN_KEY, None)
+        reply = {**base, "undo_calls": n, "marker_present": False, "open": False, "undo_available": self._drv_undo_available()}
+        if present:
+            reply = {"error": "undo is not available in this session; the transaction marker is dropped, nothing was reverted",
+                     "undo_available": False, "undo_calls": n, "marker_present": False, "open": False, "name": state["name"]}
+        return reply
+
+    @staticmethod
+    def _drv_json_path(value, path):
+        """'results[0].value.name' over a JSON-like value; raises KeyError / IndexError / TypeError on a miss."""
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\[-?\d+\]", path):
+            if token.startswith("["):
+                value = value[int(token[1:-1])]
+            elif isinstance(value, dict):
+                value = value[token]
+            else:
+                value = getattr(value, token)
+        return value
+
+    def _drv_substitute(self, value, results):
+        """Replace "$<id>.<path>" / "$<id>" strings by that earlier command's result (recursively)."""
+        if isinstance(value, str) and value.startswith("$") and len(value) > 1:
+            ident, _, path = value[1:].partition(".")
+            if ident not in results:
+                raise KeyError(f"'{value}': no earlier command with id '{ident}'" + (f" (known: {sorted(results)})" if results else ""))
+            try:
+                return self._drv_json_path(results[ident], path) if path else results[ident]
+            except Exception as e:
+                raise KeyError(f"'{value}': path '{path}' not found in the result of '{ident}' ({type(e).__name__}: {e})")
+        if isinstance(value, list):
+            return [self._drv_substitute(v, results) for v in value]
+        if isinstance(value, dict):
+            return {k: self._drv_substitute(v, results) for k, v in value.items()}
+        return value
+
+    @_drv_handler
+    def drv_batch(self, commands, stop_on_error=True, undo="AUTO", refs=True, max_chars=None):
+        """batch: many commands in one round trip through _execute_command_internal (G9), $id.path substitution,
+        undo=AUTO marker rollback on the first error when stop_on_error (R22), wall cap between commands (R27)."""
+        cap, cerr = self._drv_cap_arg(max_chars)
+        if cerr:
+            return cerr
+        commands, err = self._json_arg(commands, "commands")
+        if err:
+            return err
+        if not isinstance(commands, list) or not commands:
+            return {"error": "commands must be a non-empty JSON list of {\"type\": ..., \"params\": {...}, \"id\": ...} objects"}
+        if len(commands) > _DRV_BATCH_MAX:
+            return {"error": f"batch has {len(commands)} commands; the limit is {_DRV_BATCH_MAX}; split the batch"}
+        for i, c in enumerate(commands):
+            if not isinstance(c, dict) or not isinstance(c.get("type"), str) or not c.get("type"):
+                return {"error": f"commands[{i}] must be an object with a string \"type\" (handler key)"}
+            if c.get("params") is not None and not isinstance(c["params"], dict):
+                return {"error": f"commands[{i}].params must be a JSON object"}
+        undo = str(undo or "AUTO").upper()
+        if undo not in ("AUTO", "NONE"):
+            return {"error": f"undo '{undo}' not valid", "valid": ["AUTO", "NONE"]}
+        stop_on_error = bool(stop_on_error)
+        t0 = time.perf_counter()
+        seq = self._drv_mark("_mcp_batch", "batch") if undo == "AUTO" else None
+        results, by_id, stopped_at, errored, wall_hit = [], {}, None, False, None
+        for i, c in enumerate(commands):
+            cid = str(c.get("id") or f"c{i}")
+            ctype = c["type"]
+            if stopped_at is None and i > 0 and time.perf_counter() - t0 > _DRV_BATCH_WALL_S:
+                # R27/R39: the wall cap is checked BETWEEN commands and counts as an error for the rollback decision
+                stopped_at, wall_hit, errored = i, i, True
+            if stopped_at is not None:
+                results.append({"id": cid, "type": ctype, "status": "skipped", "elapsed_ms": 0})
+                continue
+            t1 = time.perf_counter()
+            item = {"id": cid, "type": ctype}
+            params = dict(c.get("params") or {})
+            if ctype == "drv_batch":
+                item.update(status="error", error="nested batch refused: flatten the commands into this batch")
+            else:
+                try:
+                    if refs:
+                        params = self._drv_substitute(params, by_id)
+                except KeyError as e:
+                    item.update(status="error", error=str(e.args[0]))
+                else:
+                    out = self._execute_command_internal({"type": ctype, "params": params})
+                    if out.get("status") != "success":
+                        item.update(status="error", error=str(out.get("message", "error")))
+                    else:
+                        res = out.get("result")
+                        bad = isinstance(res, dict) and ("error" in res or res.get("success") is False)  # R30
+                        item.update(status="error" if bad else "ok", result=res)
+                        if bad:
+                            item["error"] = str(res.get("error") or "the command reported success: false")
+                        else:
+                            by_id[cid] = res
+            item["elapsed_ms"] = round((time.perf_counter() - t1) * 1000, 2)
+            results.append(item)
+            if item["status"] == "error":
+                errored = True
+                if stop_on_error:
+                    stopped_at = i
+        rolled_back = False
+        if seq is not None:
+            if errored and stop_on_error:
+                n, present = self._drv_unwind("_mcp_batch", seq, "batch")
+                rolled_back = n > 0 and not present
+            else:
+                with suppress(Exception):
+                    del bpy.context.scene["_mcp_batch"]
+        reply = {"success": not errored, "results": results, "rolled_back": rolled_back,
+                 "undo_available": self._drv_undo_available(), "stopped_at": stopped_at,
+                 "elapsed_ms": round((time.perf_counter() - t0) * 1000, 2)}
+        if wall_hit is not None:
+            skipped = sum(1 for r in results if r["status"] == "skipped")
+            reply["error"] = f"wall cap {_DRV_BATCH_WALL_S:g} s reached after command {wall_hit - 1}; {skipped} skipped"
+        droppable = [(r, "result", "results", "raise max_chars=") for r in results if "result" in r]
+        return self._drv_finish(reply, cap, droppable)
 
     # ─── PolyHaven handlers (begin) ──────────────────────────────────────────
 
@@ -8130,10 +12475,11 @@ class BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey(bpy.types.Operator):
 
     def execute(self, context):
         prefs = _prefs()
-        if prefs is not None:
-            prefs.hyper3d_api_key = RODIN_FREE_TRIAL_KEY
-        else:
-            context.scene.blendermcp_hyper3d_api_key = RODIN_FREE_TRIAL_KEY
+        if prefs is None:
+            # 2.4.0: the legacy Scene secret property is gone; the key lives in preferences only
+            self.report({'ERROR'}, "Add-on preferences unavailable; set the key under Preferences > Add-ons")
+            return {'CANCELLED'}
+        prefs.hyper3d_api_key = RODIN_FREE_TRIAL_KEY
         context.scene.blendermcp_hyper3d_mode = 'MAIN_SITE'
         self.report({'INFO'}, "API Key set successfully!")
         return {'FINISHED'}
@@ -8168,9 +12514,9 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 # Registration functions
 def register():
     # Port, autostart and API keys are add-on preferences (BLENDERMCP_AddonPreferences).
-    # The four legacy Scene secret properties below stay registered but undrawn through
-    # 2.1.x so pre-2.1 files load and migrate silently; they are removed in 2.2.0.
-    _LEGACY = "Legacy pre-2.1 storage; migrated to the add-on preferences, removed in 2.2.0"
+    # The four legacy Scene secret StringProperties (pre-2.1 storage) are no longer registered
+    # as of 2.4.0 (H15): a pre-2.1 file still migrates because _migrate_legacy_secrets reads
+    # the orphaned ID properties directly (user group on 4.x files, system group on 5.x files).
 
     bpy.types.Scene.blendermcp_use_polyhaven = bpy.props.BoolProperty(
         name="Use Poly Haven",
@@ -8194,14 +12540,6 @@ def register():
         default="MAIN_SITE"
     )
 
-    bpy.types.Scene.blendermcp_hyper3d_api_key = bpy.props.StringProperty(
-        name="Hyper3D API Key (legacy)",
-        subtype="PASSWORD",
-        description=_LEGACY,
-        default="",
-        options={'HIDDEN'}
-    )
-
     bpy.types.Scene.blendermcp_use_hunyuan3d = bpy.props.BoolProperty(
         name="Use Hunyuan 3D",
         description="Enable Hunyuan asset integration",
@@ -8216,22 +12554,6 @@ def register():
             ("OFFICIAL_API", "official api", "official api"),
         ],
         default="LOCAL_API"
-    )
-
-    bpy.types.Scene.blendermcp_hunyuan3d_secret_id = bpy.props.StringProperty(
-        name="Hunyuan 3D SecretId (legacy)",
-        subtype="PASSWORD",
-        description=_LEGACY,
-        default="",
-        options={'HIDDEN'}
-    )
-
-    bpy.types.Scene.blendermcp_hunyuan3d_secret_key = bpy.props.StringProperty(
-        name="Hunyuan 3D SecretKey (legacy)",
-        subtype="PASSWORD",
-        description=_LEGACY,
-        default="",
-        options={'HIDDEN'}
     )
 
     bpy.types.Scene.blendermcp_hunyuan3d_api_url = bpy.props.StringProperty(
@@ -8274,14 +12596,6 @@ def register():
         name="Use Sketchfab",
         description="Enable Sketchfab asset integration",
         default=False
-    )
-
-    bpy.types.Scene.blendermcp_sketchfab_api_key = bpy.props.StringProperty(
-        name="Sketchfab API Key (legacy)",
-        subtype="PASSWORD",
-        description=_LEGACY,
-        default="",
-        options={'HIDDEN'}
     )
 
     # Register preferences class
@@ -8348,13 +12662,9 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_polyhaven
     del bpy.types.Scene.blendermcp_use_hyper3d
     del bpy.types.Scene.blendermcp_hyper3d_mode
-    del bpy.types.Scene.blendermcp_hyper3d_api_key
     del bpy.types.Scene.blendermcp_use_sketchfab
-    del bpy.types.Scene.blendermcp_sketchfab_api_key
     del bpy.types.Scene.blendermcp_use_hunyuan3d
     del bpy.types.Scene.blendermcp_hunyuan3d_mode
-    del bpy.types.Scene.blendermcp_hunyuan3d_secret_id
-    del bpy.types.Scene.blendermcp_hunyuan3d_secret_key
     del bpy.types.Scene.blendermcp_hunyuan3d_api_url
     del bpy.types.Scene.blendermcp_hunyuan3d_octree_resolution
     del bpy.types.Scene.blendermcp_hunyuan3d_num_inference_steps

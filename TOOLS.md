@@ -1,6 +1,8 @@
 # Blender MCP — Tool Reference
 
-169 tools exposed via `@mcp.tool()` in `src/blender_mcp/server.py` (92 in 2.0.0 + 56 in 2.1.0 + 21 in 2.2.0; the list is `tests/baseline_tools_2.2.txt`, cut at the B1 test gate from server hash `6f249049`, harness 185/185 on Blender 4.3.2 and 185/185 on 5.2.1). Blender 4.3 – 5.2 (tested on 4.3.2 and 5.2.1 LTS); version 2.2.0 on branch `blender-5.2`.
+204 tools exposed via `@mcp.tool()` in `src/blender_mcp/server.py` (92 in 2.0.0 + 56 in 2.1.0 + 21 in 2.2.0 + 13 in 2.3.0 + 22 in 2.4.0; the list is `tests/baseline_tools_2.4.txt`, cut at the B2-G3 test gate from the frozen server; every 2.3.0 name keeps its position and schema, additive parameters only, with one relaxation: `apply_modifier.modifier_name` is optional since 2.4.0; the 2.3.0 list stays in `tests/baseline_tools_2.3.txt`). Blender 4.3 – 5.2 (tested on 4.3.2 and 5.2.1 LTS); version 2.4.0 on branch `blender-5.2`.
+
+**Object names in list parameters (2.4.0, R-B2-41).** Every `objects` / `meshes` / `collision` / `sockets` / `lods` parameter is a comma list. Each entry is tried as an EXACT object name first, so `Panel[1]`, `Q?Mark` and `Star*Prop` are addressable as themselves; only when nothing matches exactly is the entry read as an fnmatch glob (`Prop*`, `UCX_?`). A name that itself contains a comma cannot be passed in a comma list: use `collection=` where the tool offers it, or the generic driver's `#uid` ref (section 35).
 
 ---
 
@@ -40,20 +42,30 @@
 32. [Rigging: Armatures & Bones](#32-rigging-armatures--bones)
 33. [Rigging: Skinning & Weights](#33-rigging-skinning--weights)
 34. [Rigging: Pose & Constraints](#34-rigging-pose--constraints)
+35. [Generic Driver](#35-generic-driver)
+36. [Validation](#36-validation)
+37. [Optimisation & LODs](#37-optimisation--lods)
+38. [Collision](#38-collision)
+39. [Sockets, Pivots & Hierarchy](#39-sockets-pivots--hierarchy)
+40. [Engine Export](#40-engine-export)
 
 ---
 
 ## 1. Scene & Object Info
 
-### `get_scene_info()`
-Get detailed information about the current Blender scene (objects, materials, render settings). The object list is capped at the first 10 objects (`object_count` carries the real total); use `find_objects_by_type` for a full listing. Since 2.1.0 the reply also carries `file` (the `get_file_state` summary) and `settings_summary` (engine, resolution, samples, frame range, units).
+### `get_scene_info(limit)`
+Get detailed information about the current Blender scene (objects, materials, render settings). The object list is capped at the first 10 objects unless `limit` says otherwise (`object_count` carries the real total). Since 2.1.0 the reply also carries `file` (the `get_file_state` summary) and `settings_summary` (engine, resolution, samples, frame range, units). Since 2.3.0 every object entry carries `uid` (the `session_uid`, usable as `#<uid>` in the generic driver, section 35). Since 2.4.0 the reply carries `total_triangles` and `total_vertices` (mesh objects, modifiers evaluated) and every object entry adds `triangles` (evaluated; 0 for an object in EDIT mode, a Blender limit), `hidden` (`not visible_get()`, so collection-level hiding counts), `parent` (name or null) and `collections` (the names of the collections the object is linked to). `batch_export` (section 40) resolves its roots from this reply with `limit=0`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | int | None | Object entries to return; omitted = the add-on default of 10, `0` = every object (2.4.0). Not sent on the wire when omitted. Non-integers are refused by the add-on |
 
 **Returns:** JSON string
 
 ---
 
 ### `get_object_info(object_name)`
-Get detailed information about a specific object. Reply (2.2.0): every object gains `parent`, `parent_type` and `parent_bone`; a MESH adds `vertex_groups`, `shape_keys` and `armature` (the Armature modifier's target); an ARMATURE adds `bones`, `pose_position`, `display_type`, `action` and `bone_collections`.
+Get detailed information about a specific object. Reply (2.2.0): every object gains `parent`, `parent_type` and `parent_bone`; a MESH adds `vertex_groups`, `shape_keys` and `armature` (the Armature modifier's target); an ARMATURE adds `bones`, `pose_position`, `display_type`, `action` and `bone_collections`. Since 2.3.0 the reply carries `uid` (the `session_uid`, usable as `#<uid>` in the generic driver, section 35).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -84,14 +96,15 @@ Auto-detection order: `blender_exe` argument (if the file exists) → `BLENDER_E
 
 ---
 
-### `close_blender(force)`
-Close the Blender instance started by `start_blender()`.
+### `close_blender(force, save)`
+Close Blender: the instance started by `start_blender()`, or, over the add-on socket, one the user launched by hand.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `force` | bool | False | Kill immediately; if False, asks Blender to quit gracefully first |
+| `force` | bool | False | Kill a process this server started immediately instead of asking it to quit; for a Blender the user launched by hand there is no process to kill, so `force` still asks it to quit over the socket and the reply says so (2.4.0, R-B2-45) |
+| `save` | bool | False | Save the current .blend (if it has a path) before quitting |
 
-**Returns:** Status message
+**Returns:** Status message: `Blender closed (gracefully).`, `Blender closed (process terminated).` (only after a real terminate / kill of a managed process), `Blender closed (no running instance found).`, or `Blender asked to quit (not a process this server started; force applies only to managed processes).`
 
 ---
 
@@ -253,13 +266,16 @@ Rename an object and its mesh data block.
 
 ---
 
-### `set_origin(name, origin_type)`
-Set an object's origin point.
+### `set_origin(name, origin_type, location)`
+Set an object's origin point. The mesh stays where it is in the world: the mesh data is offset (shape keys move with the Basis) and the object location compensated; children keep their world transform (`children_kept` counts them). A mesh shared by several objects gets its own copy first (`isolated: true` in the reply), so the sharing objects never jump.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | str | — | Object name |
-| `origin_type` | str | "ORIGIN_GEOMETRY" | `ORIGIN_GEOMETRY`, `ORIGIN_CURSOR`, `ORIGIN_CENTER_OF_MASS`, `ORIGIN_CENTER_OF_VOLUME` |
+| `origin_type` | str | "ORIGIN_GEOMETRY" | `ORIGIN_GEOMETRY`, `ORIGIN_CURSOR`, `ORIGIN_CENTER_OF_MASS`, `ORIGIN_CENTER_OF_VOLUME`; since 2.4.0 also `BOTTOM_CENTER` (bounding-box bottom centre, the game-prop standard), `TOP_CENTER` and `CUSTOM` |
+| `location` | str | None | `"x,y,z"` world point, required for `CUSTOM` (refused before Blender is contacted when missing); sent as a list (2.4.0) |
+
+**Reply (2.4.0):** `origin_type` echoed, `new_location`, `offset_applied` (local-space offset applied to the mesh), `children_kept`, `isolated`.
 
 ---
 
@@ -527,24 +543,28 @@ Subdivide all faces of a mesh (equivalent to Subdivide in Edit Mode).
 
 ---
 
-### `apply_modifier(name, modifier_name)`
-Apply a named modifier on an object, collapsing it into the mesh data.
+### `apply_modifier(name, modifier_name, apply_all, keep)`
+Apply a named modifier on an object, collapsing it into the mesh data, or every modifier in stack order with `apply_all` (2.4.0).
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `name` | str | Object name |
-| `modifier_name` | str | Exact modifier name as shown in Blender's Properties panel |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | — | Object name |
+| `modifier_name` | str | None | Exact modifier name as shown in Blender's Properties panel. Optional since 2.4.0 (the only 2.3.0 required parameter relaxed this stage); without `apply_all` it is still required and the server answers `Error: modifier_name required unless apply_all` before contacting Blender |
+| `apply_all` | bool | False | Apply every modifier in order; one failure does not stop the rest (2.4.0) |
+| `keep` | str | None | Comma list of modifier NAMES or TYPES to skip with `apply_all`, e.g. `ARMATURE` (2.4.0) |
+
+**Reply (2.4.0):** `applied` (names), `kept`, `failed` (`{name: reason}`), `remaining`; the single-modifier form returns `{error}` on failure. The wire payload is unchanged from 2.2.0 when neither new parameter is used.
 
 ---
 
 ### `get_mesh_stats(name)`
-Return detailed topology statistics for a mesh object (vertex/edge/face counts, etc.).
+Return detailed topology statistics for a mesh object (vertex/edge/face counts, etc.). A pure read: it never changes the mode or the active object (an EDIT-mode mesh is flushed first).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | str | Mesh object name |
 
-**Returns:** JSON
+**Returns:** JSON. Since 2.4.0: `triangles` is the evaluated loop-triangle count (modifiers applied; the 2.2.0 formula is kept as `triangles_simple`), `ngons`, `quads`, `tris`, `loose_verts`, `loose_edges`, `non_manifold_edges` (Blender's definition, boundary edges included), `boundary_edges`, `has_custom_normals`, `uv_layers` (names), `color_attributes` (names), `material_slots` (`[{index, material}]`), `dimensions`, `unapplied_transform` (`{rotation, scale, negative_scale}`), `origin_offset` (`{to_bbox_center, to_bbox_bottom}`, local space).
 
 ---
 
@@ -784,14 +804,14 @@ Normal maps are automatically connected through a Normal Map node.
 ## 16. Modifiers
 
 ### `add_modifier(name, modifier_type, modifier_name, params)`
-Add a modifier to an object with optional parameters.
+Add a modifier to an object with optional parameters. Since 2.3.0 `params` go through the generic driver's coercer (section 35): dotted keys reach nested settings, pointer properties (`object`, `target`, `mirror_object`, ...) accept `#uid`, `IDTYPE:Name` or a plain object name, enum values are validated, and an out-of-range number is REFUSED under `unset` with `outside [min, max]` where 2.2.0 silently clamped it. The `set` / `unset` reply shape is unchanged.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | str | — | Object name |
 | `modifier_type` | str | — | `MIRROR`, `BEVEL`, `ARRAY`, `SOLIDIFY`, `SUBSURF`, `DECIMATE`, `DISPLACE`, `SHRINKWRAP`, `WIREFRAME`, `SKIN`, etc. |
 | `modifier_name` | str | None | Display name (auto-generated if omitted) |
-| `params` | str | None | JSON string of modifier properties |
+| `params` | str | None | JSON string of modifier properties (validated and coerced since 2.3.0; out-of-range values are refused, not clamped) |
 
 **Common params examples:**
 ```
@@ -926,12 +946,23 @@ Move objects into a collection (removes them from all other collections).
 
 ## 19. Export / Import / Save / Load
 
-### `export_object(name, filepath, file_format, include_hierarchy, bake_anim, add_leaf_bones, use_armature_deform_only, bake_anim_simplify_factor, mesh_smooth_type, primary_bone_axis, secondary_bone_axis, apply_scale_options, export_animations, export_skins, export_morph)`
-Export an object (or the full scene) to a 3D file. A skinned mesh exports WITH its armature, children and animation by default (include_hierarchy). Reply (2.2.0): `exported_objects` (names, or "all" for a scene export), `include_hierarchy`, the `fbx_options` or `gltf_options` actually used, and `ignored` (parameters that do not apply to the chosen format).
+### `export_object(name, filepath, file_format, include_hierarchy, bake_anim, add_leaf_bones, use_armature_deform_only, bake_anim_simplify_factor, mesh_smooth_type, primary_bone_axis, secondary_bone_axis, apply_scale_options, export_animations, export_skins, export_morph, objects, apply_modifiers, axis_forward, axis_up, global_scale, use_tspace, use_triangles, use_custom_props, colors_type, export_apply, export_tangents, export_extras, export_yup, export_attributes, export_vertex_color, export_animation_mode)`
+Export an object (or the full scene) to a 3D file. A skinned mesh exports WITH its armature, children and animation by default (include_hierarchy). The low-level exporter under `export_for_engine` (section 40), which applies an engine preset on top of it. Reply (2.2.0): `exported_objects` (names, or "all" for a scene export), `include_hierarchy`, the `fbx_options` / `gltf_options` / `export_options` actually used, and `ignored` (parameters that do not apply to the chosen format). Reply (2.4.0): `size_bytes`, `object_count`, `vertices_written`, `triangles_written` (evaluated when modifiers were applied, `modifiers_applied` says which), `warnings` (`unapplied scale on <obj>`, `no UV layer on <obj>`, `ngons on <obj> with use_triangles off`, `material <m> has no nodes`) and `transform_baked` (True only for OBJ on Blender 4.x, which always bakes the object transform into the vertices).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `name` | str | None | Object to export; exports entire scene if omitted |
+| `objects` | str | None | Comma list of objects to export (2.4.0), alternative to `name`; both given is refused before Blender is contacted |
+| `apply_modifiers` | bool | True | Export the evaluated mesh (2.4.0); glTF `export_apply` defaults to this |
+| `axis_forward` / `axis_up` | str | None | Exporter axes (FBX, OBJ), e.g. `-Z` / `Y` for Unity, `-Y` / `Z` for Unreal (2.4.0) |
+| `global_scale` | float | None | Exporter scale (2.4.0) |
+| `use_tspace` / `use_triangles` / `use_custom_props` | bool | None | FBX tangent space, triangulation, custom properties (2.4.0) |
+| `colors_type` | str | None | FBX colour export type (2.4.0) |
+| `export_apply` / `export_tangents` / `export_extras` / `export_yup` / `export_attributes` | bool | None | glTF switches (2.4.0) |
+| `export_vertex_color` | str | None | glTF `MATERIAL` / `ACTIVE` / `NONE` (Blender 5.2 adds `NAME`) (2.4.0) |
+| `export_animation_mode` | str | None | glTF `ACTIONS` / `ACTIVE_ACTIONS` / `BROADCAST` / `NLA_TRACKS` / `SCENE` (2.4.0) |
+
+All 2.4.0 parameters default to None = the exporter's own default; enum values are validated against this Blender's live enum and a kwarg the live exporter lacks is dropped with a `warnings` entry.
 | `filepath` | str | None | Output file path. If omitted: <server output_dir>/<name or scene>.<format> when the output_dir setting is set, else a temp-dir path. |
 | `file_format` | str | "glb" | glb, gltf, fbx, obj, stl, ply (default glb) |
 | `include_hierarchy` | bool | True | Also select the parent armature and all children (default True) FBX only (ignored for other formats, reported): |
@@ -949,12 +980,18 @@ Export an object (or the full scene) to a 3D file. A skinned mesh exports WITH i
 
 ---
 
-### `import_file(filepath)`
-Import a 3D file into the current Blender scene. Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend, .bvh (needs the io_anim_bvh add-on; the error names enable_addon when it is off) Reply (2.2.0): `imported_objects`, `armatures`, `actions`, `new_actions` and `bone_shape_objects` (empty since the glTF importer is called with `disable_bone_shape=True`).
+### `import_file(filepath, axis_forward, axis_up, global_scale, use_custom_normals, use_image_search, ignore_leaf_bones, import_shading, merge_vertices)`
+Import a 3D file into the current Blender scene. Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend, .bvh (needs the io_anim_bvh add-on; the error names enable_addon when it is off) Reply (2.2.0): `imported_objects`, `armatures`, `actions`, `new_actions` and `bone_shape_objects` (empty since the glTF importer is called with `disable_bone_shape=True`). Reply (2.4.0): `objects` with one entry per imported object (`name`, `type`, `vertices`, `triangles`, `has_custom_normals`, `uv_layers`, `materials`) and `ignored` (importer kwargs this Blender's importer lacks).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `filepath` | str | — | Absolute path to the file to import Reply lists the new objects and, for rigged files, the armatures, the new actions and any bone-shape helper objects the importer added. |
+| `axis_forward` / `axis_up` | str | None | Importer axes (FBX, OBJ) (2.4.0) |
+| `global_scale` | float | None | Importer scale (2.4.0) |
+| `use_custom_normals` | bool | True | Keep the file's custom normals (2.4.0) |
+| `use_image_search` / `ignore_leaf_bones` | bool | None | FBX importer switches (2.4.0) |
+| `import_shading` | str | None | glTF `NORMALS` / `FLAT` / `SMOOTH` (2.4.0) |
+| `merge_vertices` | bool | None | glTF vertex merge (2.4.0) |
 
 **Supported formats:** `.glb`, `.gltf`, `.fbx`, `.obj`, `.stl`, `.ply`, `.blend`
 
@@ -993,7 +1030,7 @@ Open a .blend file, replacing the current Blender scene.
 ## 20. Scene Analysis
 
 ### `find_objects_by_type(obj_type)`
-List all objects in the scene matching a given type.
+List all objects in the scene matching a given type. Since 2.3.0 every entry carries `uid` (the `session_uid`, usable as `#<uid>` in the generic driver, section 35); `find` (section 35) is the query tool with name globs and property conditions.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -1242,12 +1279,13 @@ Import the asset generated by Hunyuan3D after the task completes.
 
 ## 26. Scripting
 
-### `execute_blender_code(code)`
-Execute arbitrary Python code inside Blender. Break complex operations into smaller chunks.
+### `execute_blender_code(code, result_expr)`
+Execute arbitrary Python code inside Blender. Break complex operations into smaller chunks. Since 2.3.0 prefer `describe` and the driver tools (section 35) for anything they cover; keep this for BMesh / numpy loops. The reply is `Code executed successfully: <stdout>`, plus a `value:` line when `result_expr` is given (encoded like `rna_get`: an ID as `{uid, id_type, name}`). An exception no longer surfaces as a raw error: the add-on answers `{error: "<type>: <msg>", traceback: [last 3 frames], line}` and the server prints `Error: <type>: <msg> (line n)` followed by the frames and, since 2.4.0, a `stdout:` line with whatever the code printed before it failed.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `code` | str | Python code to execute in Blender's Python environment |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `code` | str | — | Python code to execute in Blender's Python environment |
+| `result_expr` | str | None | Expression evaluated after the code in the same namespace; its value is returned under `value` (2.3.0) |
 
 ---
 
@@ -1261,7 +1299,7 @@ Report the server version, the Blender add-on version (asked over the socket), b
 ---
 
 ### `get_server_settings()`
-Show the Python server's own settings (not Blender's) with the source of each value: env, file or default. Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir, presets_dir, image_max_pixels, log_level, img_to_3d_port. File: <settings dir>/settings.json where the settings dir is ~/.blender_mcp or BLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST, BLENDER_PORT, BLENDER_EXE and IMG_TO_3D_PORT override the file.
+Show the Python server's own settings (not Blender's) with the source of each value: env, file or default. Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir, presets_dir, image_max_pixels, log_level, img_to_3d_port, driver_reply_max_chars, driver_batch_max. File: <settings dir>/settings.json where the settings dir is ~/.blender_mcp or BLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST, BLENDER_PORT, BLENDER_EXE, IMG_TO_3D_PORT, BLENDER_DRIVER_REPLY_MAX and BLENDER_DRIVER_BATCH_MAX override the file.
 
 ---
 
@@ -1270,7 +1308,7 @@ Change the Python server's own settings and persist them to settings.json.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `values` | str | — | JSON object of key -> value, e.g. '{"port": 9877, "output_dir": "D:/renders"}'. Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir, presets_dir, image_max_pixels, log_level, img_to_3d_port. A null value resets a key to its default. Unknown keys and wrong types are reported as rejected. host and port take effect on the next connection (the current one is dropped); the other keys apply immediately. A key set by an environment variable keeps the environment value until that variable is unset (reported as overridden). |
+| `values` | str | — | JSON object of key -> value, e.g. '{"port": 9877, "output_dir": "D:/renders"}'. Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir, presets_dir, image_max_pixels, log_level, img_to_3d_port, driver_reply_max_chars (reply cap of the generic driver's reading tools, default 24000; env BLENDER_DRIVER_REPLY_MAX), driver_batch_max (commands per batch, default 200; env BLENDER_DRIVER_BATCH_MAX; since 2.4.0 the setting can only LOWER the limit, the add-on caps at 200). A null value resets a key to its default. A driver_reply_max_chars of 0 or less falls back to 24000 (2.4.0). Unknown keys and wrong types are reported as rejected. host and port take effect on the next connection (the current one is dropped); the other keys apply immediately. A key set by an environment variable keeps the environment value until that variable is unset (reported as overridden). |
 
 ---
 
@@ -1866,7 +1904,7 @@ Add bones to an armature in one edit-mode session.
 ---
 
 ### `get_armature_info(armature, include_pose, space, bone_filter)`
-THE perceive tool for a rig: every bone in hierarchy order with parent, children, head, tail, length, roll (degrees), connected, deform, bone collections and constraints, plus pose_position, display_type, action and the bone-collection summary.
+THE perceive tool for a rig: every bone in hierarchy order with parent, children, head, tail, length, roll (degrees), connected, deform, bone collections and constraints, plus pose_position, display_type, action and the bone-collection summary. Since 2.3.0 the reply carries the armature's `uid` (usable as `#<uid>` in the generic driver, section 35).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -2063,6 +2101,646 @@ Remove a constraint by name from an object or a pose bone.
 | `owner` | str | — | Object name (the armature when bone is given) |
 | `name` | str | — | Constraint name (see get_constraints) |
 | `bone` | str | None | Pose bone name (default: the object) |
+
+---
+
+## 35. Generic Driver
+
+13 tools (2.3.0) that address Blender's RNA and operator layer directly, CDP-style, instead of one hand-written tool per question. Wire handler keys: `drv_describe`, `drv_get`, `drv_set`, `drv_new`, `drv_remove`, `drv_find`, `drv_context`, `drv_op`, `drv_call`, `drv_snapshot`, `drv_diff`, `drv_batch`, `drv_transaction` (these are the `type` values inside `batch`; any legacy key such as `add_modifier` works there too). Contract: `docs/PLAN.md` section 12 (D1.3) and `docs/LEAD-RULINGS-C.md`; wire protocol stays 1. JSON-typed parameters are strings over MCP and parsed by the server before anything is sent: an object parameter that is not a JSON object answers `Error: <name> must be a JSON object, e.g. '{"key": value}'`, a list-or-object parameter that decodes to a scalar answers `Error: <name> must be a JSON object or list`, malformed JSON answers `Error: <name> is not valid JSON (<msg> at position N)`; none of these contacts Blender.
+
+### Refs
+
+Every driver tool addresses data by ref; none takes `object_name`.
+
+| Form | Resolves to | Example |
+|---|---|---|
+| `#<uid>` | the ID with that `session_uid` (monotonic, never reused, survives rename and undo; found by a full `bpy.data` scan on every call, no cache) | `#127` |
+| `<IDTYPE>:<name>` | `bpy.data.<collection>[name]`; IDTYPE is the `ID.id_type` identifier, case-insensitive, mapped to its collection by a static table (unknown -> `{error, valid}`) | `OBJECT:Cube`, `mesh:Cube`, `NODETREE:Geometry Nodes` |
+| `<id ref>/<path>` | an RNA path under that ID in `path_resolve` syntax: dotted props, `[index]`, `["key"]` collection items, `["prop"]` ID properties | `OBJECT:Cube/modifiers["Bevel"].width`, `#127/location[2]`, `#127/["my_prop"]` |
+| `context` / `context/<path>` | `bpy.context` as root | `context/scene.frame_current`, `context/active_object` |
+| `data` / `data/<path>` | `bpy.data` as root | `data/objects`, `data/materials["Red"]` |
+| `prefs` / `prefs/<path>` | `bpy.context.preferences` as root | `prefs/edit.undo_steps` |
+
+The path is split at the last `.` outside brackets into parent and leaf; a trailing `[<int>]` on the leaf is an index; a leaf of the form `["key"]` alone is an ID-property access. A ref ending on a struct (no leaf, or a POINTER / COLLECTION leaf) resolves to that struct. A root followed by `/` and an empty path (`context/`, `#127/`) is refused. A ref that resolves to nothing answers `{error, tried: [the collection or path searched], closest: [up to 3 difflib matches]}`. Every reply that mentions an ID carries `{uid, id_type, name}`; an embedded ID (a material's node tree, shape keys) adds `embedded: true` and is reachable by path only, never by `#uid`. **Unsafe structs (R33).** Pointer and collection members of `ToolSettings`, of every struct whose base chain reaches `Paint` (Sculpt, VertexPaint, ImagePaint, UvSculpt, GpPaint, ...) and of `CurveMapping` are never dereferenced by the depth walk: `scene.tool_settings.uv_sculpt` is an uninitialised `Paint` in the Blender 4.3.2 factory file and its getters crash the process (uncatchable). The walk reports such a member at its depth-0 shape (`{struct, path}`) and names the skip once in `truncated`; a ref whose path contains `uv_sculpt` is refused outright.
+
+### Value encoding (`rna_get`, `call_method`, `scene_snapshot`, `batch` results, `execute_blender_code` value)
+
+| RNA | JSON |
+|---|---|
+| INT / FLOAT / BOOLEAN scalar | number / bool |
+| arrays (vectors, colors, bool arrays) | list; rotation properties (`unit == 'ROTATION'`) scaled when `angles="DEGREES"` |
+| matrices | list of row lists |
+| STRING | string |
+| ENUM | identifier string; enum flags -> sorted list of identifiers |
+| POINTER to an ID | `{uid, id_type, name}` or `null` |
+| POINTER to a non-ID struct | `{struct, path}` at depth 0; expanded to `depth` |
+| COLLECTION | `{count}`; `{count, items: [...]}` when named with `[]` in `fields` (`modifiers[]`) or with `fields="all"` and `depth > 0` |
+| ID properties | under `custom: {}` (JSON as stored) |
+| anything else | `str(value)` with `encoded: "str"` on the entry |
+
+`rna_get` at depth 0 reads every non-COLLECTION property of a struct, pointers included (an ID pointer as `{uid, id_type, name}`, a non-ID struct as `{struct, path}`); collections report `{count}`; `depth >= 1` expands. Coercion on the way in (`rna_set`, `data_new` `set`, operator `params`): list -> vector / color / matrix; string -> enum (validated; `valid` lists the identifiers); `"#uid"`, `"IDTYPE:Name"` or `{"uid": n}` -> pointer resolved against the property's `fixed_type`; int -> float; 0/1 -> bool; `["key"]` ID-property paths accept any JSON value; a read-only property is refused with Blender's own message under `rna_error`. Angles are RADIANS by default: `angles="DEGREES"` converts on the way in (`rna_set`) and out (`rna_get`, `scene_snapshot`). The hand-written tools (`rotate_object`, `set_pose`, `add_keyframe`, `set_bone_properties`) keep taking degrees.
+
+### Replies, teaching errors and the reply cap
+
+Success replies carry `success: true`; reading replies add `chars` (length of the JSON reply, including `truncated` and the `chars` key itself) and `truncated` (compact one-line notes naming what was dropped and which filter narrows it; `[]` when nothing was dropped). Error replies carry `error` plus the teaching keys that apply: `closest` (misspelt struct, property, operator, method or IDTYPE), `valid` (enum identifiers, collections with `new`, snapshot names, context keys, actions), `tried` (where a ref was searched), `rna_error` (Blender's own error text, verbatim, never re-worded), `poll_message`, `context_applied`, `undo_available`, `background`, `refused`. The server prints an error as `Error: <text>` followed by one `<key>: <json>` line per teaching key, and a success reply as pretty-printed JSON. Handlers never raise for a bad input; a transport failure surfaces as `Error: <socket text>`.
+
+Every reading command sends `max_chars`: the tool's own argument when given, else the server setting `driver_reply_max_chars` (default 24000; env `BLENDER_DRIVER_REPLY_MAX`; an older add-on without the key assumes 24000). The add-on builds the reply under that cap. `describe` first blanks every description text (property and enum-item descriptions; the shape is kept), and only then drops whole properties from the end of the list and names them in `truncated`; `count` is the number of entries kept and `total` the struct's full count. The envelope (`success`, `chars`, `truncated`) stays under 400 chars. A flat `Object` dump is about 4.5-4.8 KB, so the default cap holds most single-struct reads; raise `max_chars` (for example 60000) for `fields="all"` with `depth >= 2` or to read the dropped descriptions back.
+
+---
+
+### `describe(what, fields, include_functions, search, max_chars)`
+Describe an RNA struct, one property, or an operator from Blender's own definitions (`bl_rna`), so you can learn the API before driving it.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `what` | str | — | A ref (describes the struct it resolves to, or the single property when the path ends on one), a struct name (`"Object"`, `"BooleanModifier"`, `"RenderSettings"`), an operator id (`"mesh.bevel"`), or `"ops"` to list operators |
+| `fields` | str | `all` | `all` or a comma list of property identifiers |
+| `include_functions` | bool | False | Also list the struct's functions (`{name: {description, params: [[id, type, is_output, is_required]]}}`) |
+| `search` | str | None | Substring over identifier, name and description of the struct's properties; with `what="ops"`, over every operator id and description |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Reply.** Struct: `{success, kind: "struct", identifier, base, description, count, total, properties: {id: {type, subtype, unit, readonly, array_length, default, min, max, soft_min, soft_max, enum_items: [[id, name, description]], dynamic, fixed_type, is_animatable, description, is_enum_flag, length_max}}, functions?, chars, truncated}`. A `dynamic` enum (render engine, view transforms, Cycles devices: static items empty or a single entry headless) must be validated by assignment; `rna_set` then reports the live `valid` list. A property ref adds `owner` and `kind: "property"`. Operator: `{success, kind: "operator", idname, name, description, properties (same shape), poll_now (evaluated in the current context), refused}` (no `bl_options`: unreachable for C operators). `what="ops"` + `search`: `{success, kind: "ops", count, operators: [[idname, description]]}`. Not found -> `{error, closest}` over struct names or operator ids.
+
+---
+
+### `rna_get(refs, fields, depth, angles, max_chars)`
+Read properties of one or more refs in one round trip.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `refs` | str | — | Comma list or JSON list of refs (`"#127, OBJECT:Cube/location"` or `'["#127"]'`); must name at least one |
+| `fields` | str | None | Comma list (or JSON list) of property identifiers; `all` expands pointers to `depth`; a collection named with `[]` (`modifiers[]`) lists its items; default = every non-collection property |
+| `depth` | int | 0 | Pointer expansion depth |
+| `angles` | str | `RADIANS` | `RADIANS` (raw) or `DEGREES` for rotation properties |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Reply:** `{success, results: [{ref, uid?, id_type?, name?, value}], errors: [{ref, error, tried?, closest?}], chars, truncated}`. A bad ref lands in `errors`; the other refs still read. A non-ID struct result carries `struct` / `path` (and `id`); unknown field names are listed under `value.missing`.
+
+---
+
+### `rna_set(sets, angles, stop_on_error, publish)`
+Set properties by ref. Each value is coerced and validated against the property's RNA definition (enum membership, range, type, read-only) before it is written.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sets` | str | — | JSON list of `[ref, value]` pairs, or a JSON object `{ref: value}` (normalised to pairs by the server), e.g. `'[["#127/location", [1, 2, 3]], ["SCENE:Scene/render.engine", "CYCLES"]]'`; must be non-empty |
+| `angles` | str | `RADIANS` | `RADIANS` (raw) or `DEGREES` for rotation properties |
+| `stop_on_error` | bool | True | Stop at the first refused item (earlier items stay applied); `False` applies every valid item and reports the rest |
+| `publish` | bool | True | Call `msgbus.publish_rna` for each change. In a GUI session RNA updates publish property changes themselves, so subscribers fire with `publish=False` too and this flag adds nothing observable there; headless it is the only path, and even then msgbus delivery does not happen in a `--background` session (E21, measured on 4.3.2 and 5.2.1) |
+
+**Reply:** `{success, results: [{ref, set, value_after?, error?, valid?, closest?, rna_error?}], applied, failed, stopped_at}`; `success` is true when `failed == 0`. Properties with side effects go through their API (`frame_current` -> `scene.frame_set`).
+
+---
+
+### `data_new(collection, args, kwargs, link_to, set)`
+Create an ID through `bpy.data.<collection>.new(...)` and return its uid.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `collection` | str | — | A `bpy.data` collection with `new()`: `objects`, `meshes`, `materials`, `lights`, `cameras`, `collections`, `armatures`, `images`, `node_groups`, `actions`, `curves`, `texts`, ... |
+| `args` | str | None | JSON list of positional arguments for `new()`, matched to the live signature; a ref is accepted where an ID is expected (`'["Cube2", "MESH:Cube"]'` for `objects`) |
+| `kwargs` | str | None | JSON object of keyword arguments for `new()` |
+| `link_to` | str | None | For objects: `"scene"` (the active scene's root collection, the default), `"COLLECTION:Name"` or `"#uid"`; non-object IDs are never linked |
+| `set` | str | None | Initial properties as for `rna_set` (paths relative to the new ID) |
+
+**Reply:** `{success, uid, id_type, name (final, after Blender's dedupe), linked_to, set: {applied, failed, results}}`. A collection without `new()` -> `{error, valid: [collections with new]}`.
+
+---
+
+### `data_remove(refs, do_unlink, purge_orphans)`
+Remove IDs by ref (`bpy.data.<collection>.remove`).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `refs` | str | — | Comma list or JSON list of ID refs (`"#127, MESH:Cube"`); must name at least one |
+| `do_unlink` | bool | True | Unlink from every user first; `False` refuses an ID that still has users (per item, with `users_before`) |
+| `purge_orphans` | bool | False | Run `orphans_purge(do_recursive=True)` afterwards; `purged` = ID count delta |
+
+**Reply:** `{success, results: [{ref, removed, users_before, error?}], purged}`; `success` = every ref removed. A removed uid afterwards answers the not-found error with `tried`.
+
+---
+
+### `find(id_type, name, where, scope, fields, limit, max_chars)`
+Query IDs by type, name glob and property conditions; returns uids.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `id_type` | str | `OBJECT` | `ID.id_type` identifier (`OBJECT`, `MESH`, `MATERIAL`, ...) |
+| `name` | str | None | Glob pattern (`fnmatch`), e.g. `"Cube*"` |
+| `where` | str | None | JSON list of `[path, op, value]` conditions, `op` in `==, !=, <, <=, >, >=, in, contains, exists`; `[]` in a path means "any item": `'[["type", "==", "MESH"], ["modifiers[].type", "contains", "ARMATURE"]]'` |
+| `scope` | str | `SCENE` | `SCENE` (objects of the active scene) or `DATA` (all of `bpy.data`); non-OBJECT types always search `bpy.data` and the reply says `scope: "DATA"` |
+| `fields` | str | `name,type` | Comma list of properties reported per hit |
+| `limit` | int | 100 | Maximum hits (`count` = kept, `total` = matches) |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Reply:** `{success, count, total, items: [{uid, id_type, name, <fields>}], chars, truncated}`. A bad `op` -> `{error, valid}`; `exists` is true when the path resolves to a non-None value.
+
+---
+
+### `context_info(fields)`
+What `call_operator`'s context declaration is applied against.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `fields` | str | None | Comma list of keys to report; omit for all |
+
+**Reply:** `{success, mode, active_object: {uid, ...} or null, selected: [{uid, ...}], scene, view_layer, window, background, areas: [{type, regions: [str]}], frame_current, edit_object, pose_object}`. Headless under `--factory-startup` Blender still reports `window: true` and 4 areas; `background: true` is the signal that viewport operators cannot run.
+
+---
+
+### `call_operator(op, params, context, exec_context, undo)`
+Run a Blender operator under a declared context. Parameters are validated against the operator's RNA before the call; the operator is polled first and a poll failure returns the reason without running anything.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `op` | str | — | Operator id, e.g. `"object.modifier_add"`, `"mesh.bevel"` |
+| `params` | str | None | JSON object of operator properties, e.g. `'{"type": "BEVEL"}'` (unknown key -> `closest`; bad enum -> `valid`; Blender's text under `rna_error`) |
+| `context` | str | None | JSON object, the context declaration below |
+| `exec_context` | str | `EXEC_DEFAULT` | `EXEC_DEFAULT`; `INVOKE_*` is refused headless and allowed only with `context.area` in a GUI session |
+| `undo` | bool | True | `undo_push("mcp:<op>")` before the call, so `transaction` / `batch` rollback covers it |
+
+**Context declaration:** `{"mode": "EDIT", "active": "#127", "selected": ["#127", "OBJECT:Cutter"], "area": "VIEW_3D", "region": "WINDOW", "scene": "SCENE:Scene", "keep": false, "extra": {"edit_object": "#127"}}`. `active` / `selected` set the real selection and are restored afterwards; `mode` uses `object.mode_set` on the active object and is restored; `area` / `region` pick the first matching area of the GUI window under `temp_override`, and headless (`bpy.app.background`) answer `{error: "Viewport context needs a GUI session: ...", background: true}` (never keyed on the window being None); `extra` keys are passed to `temp_override` and WHITELISTED: `window, screen, area, region, scene, view_layer, object, active_object, selected_objects, selected_editable_objects, edit_object, pose_object, active_bone, active_pose_bone, modifier, point_cache` (an unknown key -> `{error, valid: [the 16 keys]}` before anything runs, because `temp_override` would accept it silently); `keep: true` leaves mode and selection as the operator left them. `context_applied` echoes `{mode, active: uid, selected: [uid], area, region, extra_keys}`.
+
+**Refused operators** (the session must stay alive): `wm.quit_blender` (use `close_blender`), `wm.console_toggle`, `wm.window_new`, `wm.window_fullscreen_toggle`, `screen.animation_play` (modal, never returns headless: use `set_frame` / `playblast`), `wm.read_factory_settings` (kills the socket server), `preferences.addon_disable` when `module` names this add-on, `script.reload`. `describe("ops")` marks them `refused`. `wm.open_mainfile` / `wm.save_mainfile` run, but `load_blend` / `save_blend` carry the safety checks.
+
+**Reply:** `{success, result: ["FINISHED"], reports: [captured print / report lines], context_applied, elapsed_ms, modal}`; `RUNNING_MODAL` / `PASS_THROUGH` are returned verbatim with `modal: true` and a `warning` that nothing waits for the operator. Poll failure: `{error, poll_message, context_applied, rna_error}`. Refused: `{error, refused: true}`.
+
+---
+
+### `call_method(ref, method, args, kwargs, depsgraph, max_chars)`
+Call an RNA function (or a plain Python method) on an ID or struct.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ref` | str | — | The ID or struct (`"#127"`, `"MESH:Cube"`, `"OBJECT:Cube/modifiers[\"Bevel\"]"`) |
+| `method` | str | — | Function name: `from_pydata`, `validate`, `calc_tangents`, `evaluated_get`, `to_mesh`, `to_mesh_clear`, `new_from_object` (on `data/meshes`), `path_from_id`, ... |
+| `args` | str | None | JSON list of positional arguments; refs accepted where an ID is expected |
+| `kwargs` | str | None | JSON object of keyword arguments |
+| `depsgraph` | bool | False | Pass `context.evaluated_depsgraph_get()` as the first `Depsgraph` parameter (`evaluated_get`, `to_mesh`) |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+An RNA function is validated against `bl_rna.functions` (missing required parameters are named); a callable that is not an RNA function (`Mesh.from_pydata`, `path_from_id`) is called directly. Unknown method -> `{error, closest}`.
+
+**Reply:** `{success, value, chars, truncated}`; an ID return value is `{uid, id_type, name}`, a struct return `{struct, path}` when `path_from_id` works.
+
+---
+
+### `scene_snapshot(name, scope, types, fields, include, depth, return_tree, angles, max_chars)`
+Capture the scene (or all of `bpy.data`) keyed by uid, for a later `scene_diff`. Lives in the Blender session (`driver_namespace["blendermcp_driver_snapshots"]`), dies with it.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | — | Snapshot name (non-empty) |
+| `scope` | str | `SCENE` | `SCENE` (IDs reachable from the active scene) or `DATA` (every ID collection) |
+| `types` | str | None | Comma list or JSON list of `id_type` filters, e.g. `"OBJECT,MESH"` |
+| `fields` | str | `name,type,parent,location,rotation_euler,scale,hide_viewport,hide_render,users` | Comma list (or JSON list) of per-ID properties captured; a field an ID lacks is omitted, never an error |
+| `include` | str | None | Comma list or JSON list of per-object expansions: `modifiers`, `constraints`, `material_slots`, `vertex_groups`, `children` |
+| `depth` | int | 1 | Parent / child tree depth |
+| `return_tree` | bool | True | `False` returns only `{success, name, count, chars}` (capture without paying for the reply) |
+| `angles` | str | `RADIANS` | `RADIANS` or `DEGREES` for rotation fields |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Reply:** `{success, name, captured_at, scope, count, ids: {"<uid>": {id_type, name, <fields>, <include lists>}}, tree: [{uid, children: [...]}], chars, truncated}`.
+
+---
+
+### `scene_diff(a, b, max_chars)`
+Diff two snapshots, or a snapshot against the live scene.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `a` | str | — | Snapshot name |
+| `b` | str | `NOW` | Snapshot name, or `NOW` = the live scene captured with `a`'s stored parameters (not stored) |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Reply:** `{success, a, b, added: [{uid, id_type, name}], removed: [...], renamed: [{uid, before, after}], changed: {"<uid>": {field: [before, after]}}, chars, truncated}`. A rename appears only under `renamed` (`name` is never a `changed` field). Unknown name -> `{error, valid: [snapshot names]}`.
+
+---
+
+### `batch(commands, stop_on_error, undo, refs, max_chars)`
+Run many commands in one round trip and one main-thread slot (no other client command interleaves). Every command goes through the add-on's normal dispatch, so gate checks and errors are identical to the single tools.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `commands` | str | — | JSON list of `{"id"?: str, "type": handler key, "params"?: object}`; e.g. `'[{"id": "m", "type": "drv_new", "params": {"collection": "meshes", "args": ["M"]}}, {"type": "drv_new", "params": {"collection": "objects", "args": ["O", "$m.uid"]}}]'` |
+| `stop_on_error` | bool | True | Stop at the first failing command; the rest are reported `skipped` |
+| `undo` | str | `AUTO` | `AUTO` = one undo step for the batch, rolled back when a command fails and `stop_on_error` is set (Scene marker `_mcp_batch`); `NONE` for read-only batches |
+| `refs` | bool | True | Replace `"$<id>.<path>"` strings in later params with that earlier result (`path` = dotted keys and `[index]`; a missing id or path is that command's error) |
+| `max_chars` | int | None | Reply cap (default: `driver_reply_max_chars`) |
+
+**Rules.** The server refuses a batch above the `driver_batch_max` setting (default 200, env `BLENDER_DRIVER_BATCH_MAX`; the setting can only lower the limit, since 2.4.0 it is clamped to 200) with `Error: batch has N commands; the limit is M ...` without contacting Blender; the add-on caps at 200 as well. Every 2.4.0 tool (sections 36-40 except `batch_export`, which is a server loop) is a valid batch item by its handler key and is covered by `undo=AUTO` and by `transaction` rollback (harness step B2-G8). A command whose reply has an `error` key OR `success: false` counts as an error (an `rna_set` whose items all failed trips `stop_on_error`). The 60 s wall cap (add-on constant `_DRV_BATCH_WALL_S`) is checked BETWEEN commands, never inside one: a single long command is never interrupted, and once the elapsed time exceeds the cap the next command is not run. On a wall stop the reply is `success: false`, `stopped_at` = the index of the first command not run, the remaining commands are `skipped`, `rolled_back` follows the undo mode (`AUTO` + `stop_on_error` rolls back, `NONE` keeps what ran) and `error` = `"wall cap <N> s reached after command <i>; <k> skipped"`; `elapsed_ms` reports the truth. `drv_batch` inside a batch -> `{error: "nested batch refused ..."}`.
+
+**Reply:** one head line `batch: N commands, a ok, b error, c skipped; rolled_back=.., undo_available=.., stopped_at=.., elapsed_ms=..` followed by the JSON `{success, results: [{id, type, status: "ok"|"error"|"skipped", result?, error?, elapsed_ms}], rolled_back, undo_available, stopped_at, elapsed_ms, chars, truncated}`; `success` = no command errored.
+
+---
+
+### `transaction(action, name)`
+Group driver changes into one undo step.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `action` | str | — | `BEGIN`, `COMMIT`, `ROLLBACK` or `STATUS` (case-insensitive) |
+| `name` | str | None | Transaction name (`BEGIN`); shown in Blender's undo history as `mcp:<name>` |
+
+**Semantics.** `BEGIN` pushes `mcp:<name>:pre`, sets the Scene ID property `_mcp_txn` to a sequence number, then pushes `mcp:<name>`; `ROLLBACK` pushes a closing `mcp:<name>:rollback` step first (2.4.0 fix: Python-only mutations made after BEGIN, such as an `rna_set` or a `set_origin`, were not on the undo stack and survived a ROLLBACK that followed an exhausted stack; `batch(undo=AUTO)` shares the fix) and then calls `ed.undo` until the marker is gone (the state before the transaction), capped at `prefs.edit.undo_steps`; `COMMIT` deletes the marker. A `ROLLBACK` whose marker is already gone answers `{error: "transaction marker not found; nothing reverted", undo_calls: 0}`. Declared side effects: one Scene ID property while a transaction is open, and `is_dirty`. Interleaved GUI edits are undone by a ROLLBACK too, so keep transactions short. Undo works in `--background` Blender on both supported versions.
+
+**Reply:** `{success, action, name, undo_calls, marker_present, undo_available, open}`. Nested `BEGIN` -> `{error: "transaction '<open>' is open; COMMIT or ROLLBACK it first", open: true, name}`; `COMMIT` / `ROLLBACK` without an open transaction -> `{error, open: false}`; `ROLLBACK` when `ed.undo` cannot run -> `{error: "undo is not available in this session; the transaction marker is dropped, nothing was reverted", undo_available: false, ...}`.
+
+---
+
+### Changes to existing tools in 2.3.0 (additive)
+- `get_scene_info`, `get_object_info`, `find_objects_by_type`, `get_armature_info`: every object entry carries `uid` (the `session_uid`), so the friendly views and the driver share one identity.
+- `execute_blender_code(code, result_expr=None)`: `value` for the expression, structured error dict instead of a raw exception (section 26).
+- `get_version`: the add-on's reply gains `registries: {name: count}` over every `blendermcp_*` registry in `bpy.app.driver_namespace` (reference images, settings snapshots, session states, driver snapshots, transactions). The server's `get_version` text lines are unchanged.
+- `add_modifier`: `params` go through the driver's coercer (pointer values accept a ref or a plain object name); the `set` / `unset` reply is unchanged.
+- Server settings `driver_reply_max_chars` and `driver_batch_max` (section 27).
+- A JSON string value passed to any list-or-object parameter (`sets`, `bones`, `weights`, `keys`, ...) is now refused with `Error: <name> must be a JSON object or list`; before 2.3.0 the 2.2.0 rigging tools echoed it back as the reply.
+
+---
+
+## 36. Validation
+
+Engine-readiness pre-flight (2.4.0, stage 1 of the game-dev requests; contract `docs/PLAN.md` section 13, rulings `docs/LEAD-RULINGS-B2.md`). Every tool in sections 36-40 is an add-on handler of the same name; the server validates enums, XOR rules and csv shapes BEFORE contacting Blender (a refusal lists the valid values and sends nothing), forwards comma lists as typed (the add-on resolves exact names first, then globs, R-B2-41), and renders the add-on's reply as JSON or `Error: <text>`. Angles are DEGREES. Pure reads (`get_mesh_stats`, `validate_asset(fix=False)`, `compare_meshes`, most `find_mesh_issues` kinds) never change the mode or the active object (R-B2-36); every mutating tool restores OBJECT mode and the selection. Profiles: `GENERIC`, `UNITY`, `UNREAL`, `GODOT`, `BEVY`, `TIMBERMESH`.
+
+### `validate_asset(objects, collection, profile, max_triangles, require_uv, require_uv2, max_bone_influences, fix)`
+THE pre-flight tool: 22 fixed checks per mesh, each `PASS` / `WARN` / `FAIL` with a detail, a count and up to 20 sample indices, plus an overall verdict. `fix=True` applies only the safe fixes and re-checks; `fix=False` is read-only and lists `fixes_available`. Collision-typed meshes (wire-displayed + hidden from render, or named by a profile's collision rule) are skipped; non-mesh objects report `PASS` with `checks: {}`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | None | Comma list of object names (exact first, then globs); or |
+| `collection` | str | None | Collection name (exactly one of the two; both or neither is refused before Blender is contacted) |
+| `profile` | str | "GENERIC" | `GENERIC`, `UNITY`, `UNREAL`, `GODOT`, `BEVY` or `TIMBERMESH` |
+| `max_triangles` | int | None | Budget for `triangle_budget` (None = PASS) |
+| `require_uv` | bool | True | `missing_uv` is FAIL when set |
+| `require_uv2` | bool | False | `missing_uv2` is FAIL when set |
+| `max_bone_influences` | int | 4 | `bone_influences` WARNs above this many groups with weight > 0 on a vertex |
+| `fix` | bool | False | Apply the safe fixes in order and re-run the checks |
+
+**Check ids (22, every one present per mesh):** `unapplied_transform` FAIL, `negative_scale` FAIL, `origin_bottom_center` WARN, `dimensions` WARN (max extent x `scale_length` above 100 m or below 1 cm; a flat plane never WARNs), `ngons` (FAIL when the profile exports tangents: UNITY / UNREAL / GODOT / BEVY; else WARN), `non_manifold` WARN (edges with more than two faces, wire edges and opposed-winding edges; boundary edges are PASS and counted in `detail` as `boundary: <n>`), `loose` WARN, `degenerate` FAIL, `doubles` WARN (1e-5), `inconsistent_normals` FAIL (faces a recalc dry-run on a copy would flip), `missing_uv`, `uv_out_of_bounds` WARN, `missing_uv2`, `vertex_count_16bit` WARN (> 65535 vertices before export splitting), `triangle_budget`, `material_slots` WARN (empty or unused slot), `materials_without_nodes` WARN, `images_missing` FAIL (file absent and not packed), `bone_influences` WARN, `illegal_names` WARN (space, `.` or non-ASCII in an object or material name for UNITY / UNREAL / GODOT / BEVY; PASS for GENERIC / TIMBERMESH), `name_collisions` WARN (names equal after stripping `.NNN`, across the whole file), `hierarchy` (FAIL when a collision-typed child does not follow the profile's rule: UNREAL `UCX_<mesh>_NN`, GODOT `-col` / `-convcol`; TIMBERMESH without a `#` root; else PASS).
+
+**Safe fixes (`fix=True`, in order):** apply rotation + scale (normals recalculated after a negative-scale apply), `fix_normals(OUTSIDE)`, remove doubles (1e-5), delete loose, triangulate ngons only, rename illegal characters to `_`.
+
+**Reply:** `{success, profile, verdict, summary: {pass, warn, fail} (objects by verdict), objects: {name: {verdict, type, checks: {<id>: {status, detail, count, sample_indices}}}}, fixes_available: [{object, check, fix}], fixes_applied: [{object, check, fix, detail}]}` (both fix lists always present). Errors: `{error, valid}` for a bad profile, `{error, unknown}` for unknown names.
+
+---
+
+### `find_mesh_issues(mesh, issue, render, angle, max_indices)`
+Element indices for one issue class (validate says what, this says where). `render=True` returns a PNG of those elements selected in edit mode from a named viewport angle (mode and selection restored; needs a GUI session: headless it answers the `needs a GUI session` error with `background: true`).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh` | str | — | Mesh object name |
+| `issue` | str | — | `NON_MANIFOLD`, `NGONS`, `LOOSE`, `DEGENERATE`, `DOUBLES`, `FLIPPED`, `INTERIOR_FACES` or `BOUNDARY` |
+| `render` | bool | False | Return an image instead of the indices |
+| `angle` | str | "iso_front_right" | `front`, `back`, `left`, `right`, `top`, `bottom`, `iso_front_right`, `iso_front_left` |
+| `max_indices` | int | 500 | Cap on the indices returned (`truncated` says when it bit); must be at least 1 |
+
+**Reply (render=False):** `{mesh, issue, element: VERT|EDGE|FACE, count, indices, truncated}`. `NON_MANIFOLD` here keeps Blender's full definition (boundary edges included; `BOUNDARY` is its own issue). All kinds except `INTERIOR_FACES` are pure reads.
+
+---
+
+### `compare_meshes(mesh_a, mesh_b, tolerance, compare)`
+Numeric diff for round-trip safety: counts, positions beyond `tolerance`, vertex ORDER, custom normals (max angle), UV layers (max delta), tangents, material slots, vertex groups. `same` is Blender's own `unit_test_compare == "Same"`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh_a` / `mesh_b` | str | — | Mesh object names |
+| `tolerance` | float | 1e-5 | Position tolerance |
+| `compare` | str | "ALL" | `ALL` or a comma list of `VERTS`, `ORDER`, `NORMALS`, `UVS`, `TANGENTS`, `MATERIALS`, `GROUPS` |
+
+**Reply:** `mesh_a`, `mesh_b`, `same`, `unit_test_compare`, `vertices: {a, b, delta}`, `triangles: {a, b, delta}` are always present; the other sections appear only when requested (`positions: {differing, max_delta}` or `null` when counts differ, `order_match`, `custom_normals: {a, b, max_angle_deg}`, `uvs: {layers_a, layers_b, max_delta}`, `tangents: {a, b}`, `materials: {a, b, same}`, `vertex_groups: {a, b, same}`); `null` means requested but not computable. `order_match` holds when every B[i] is as close to A[i] as B's nearest vertex (exporters split vertices on UV seams and sharp edges, so assert it on unsplit meshes).
+
+---
+
+### `apply_transforms(objects, location, rotation, scale, keep_children_world)`
+`object.transform_apply` on several objects. Shared mesh data gets its own copy first (`isolated`), a negative scale is applied anyway and reported, and on Blender 5.x its normals are flipped back (`flip_corrected`; empty on 4.3.2).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names |
+| `location` | bool | False | Apply location |
+| `rotation` | bool | True | Apply rotation |
+| `scale` | bool | True | Apply scale |
+| `keep_children_world` | bool | True | Children keep their world transform (their `matrix_world` is restored after the apply); False leaves them where the operator puts them |
+
+**Reply:** `{objects, applied: {location, rotation, scale}, isolated, negative_scale, flip_corrected}`.
+
+---
+
+### `fix_normals(objects, mode, also_sharp_by_angle)`
+Recalculate face normals `OUTSIDE` / `INSIDE`, `FLIP` them, or `CLEAR_CUSTOM` split normals so a re-export carries none.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names (the whole list is validated before anything is touched) |
+| `mode` | str | "OUTSIDE" | `OUTSIDE`, `INSIDE`, `FLIP` or `CLEAR_CUSTOM` |
+| `also_sharp_by_angle` | float | None | Also mark edges sharper than this angle (degrees) |
+
+**Reply:** `{objects, mode, faces_flipped: {name: n}, custom_normals_cleared, sharp_edges_marked: {name: n}}` (the last key only with an angle).
+
+---
+
+### `cleanup_mesh(objects, remove_doubles, delete_loose, dissolve_degenerate, fill_holes, limited_dissolve)`
+One BMesh pass per mesh: degenerate faces are dissolved BEFORE doubles are merged (a zero-area face's coincident vertices are not doubles), then loose elements, holes and a limited dissolve.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names (the whole list is validated first) |
+| `remove_doubles` | float | 0.0001 | Merge distance; `0` skips |
+| `delete_loose` | bool | True | Remove loose vertices and edges |
+| `dissolve_degenerate` | bool | True | Remove zero-area faces and zero-length edges |
+| `fill_holes` | int | 0 | Fill holes with up to this many sides; `0` skips |
+| `limited_dissolve` | float | None | Dissolve flat regions below this angle (degrees) |
+
+**Reply:** `{objects, per_object: {name: {doubles_removed, loose_verts_removed, loose_edges_removed, degenerate_dissolved, faces_dissolved, holes_filled, faces_before, faces_after}}}`.
+
+---
+
+## 37. Optimisation & LODs
+
+### `decimate_mesh(mesh, ratio, target_triangles, mode, angle_limit, iterations, symmetry_axis, vertex_group, vertex_group_factor, keep_uv_seams, triangulate, apply, new_object)`
+A Decimate modifier configured and applied (or left live). `target_triangles` reads the modifier's `face_count` back after each pass (at most 6, within 5 %) without applying per pass. `new_object` works on a copy and leaves the source untouched; on an error the copy is removed.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh` | str | — | Mesh object name |
+| `ratio` | float | None | Fraction of faces to keep (0..1); or |
+| `target_triangles` | int | None | Triangle target (exactly one of the two, refused before Blender is contacted otherwise) |
+| `mode` | str | "COLLAPSE" | `COLLAPSE`, `PLANAR` / `DISSOLVE`, `UNSUBDIVIDE` / `UNSUBDIV` (the reply names the enum id) |
+| `angle_limit` | float | 5.0 | PLANAR angle (degrees) |
+| `iterations` | int | 2 | UNSUBDIVIDE passes |
+| `symmetry_axis` | str | None | `X`, `Y` or `Z` |
+| `vertex_group` / `vertex_group_factor` | str / float | None / 1.0 | Weight the reduction by a group |
+| `keep_uv_seams` | bool | True | Delimit by UV and seam edges |
+| `triangulate` | bool | True | Collapse to triangles |
+| `apply` | bool | True | Apply the modifier; False leaves it live (`modifier` names it) |
+| `new_object` | str | None | Name for a decimated copy |
+
+**Reply:** `{mesh, result_object, mode, ratio_used, triangles_before, triangles_after, passes, applied, modifier}`.
+
+---
+
+### `generate_lods(mesh, ratios, triangle_targets, naming, collection, parent_to_lod0, mode, symmetry_axis, keep_uv_seams, preserve_silhouette_group, transfer_normals)`
+Build an LOD chain: the source becomes `<name>_LOD0` (an existing `_LOD<n>` suffix is stripped first) and each level is a decimated mesh copy sharing the materials. Every target name is checked before anything changes; a collision returns `{error, existing}` with the scene untouched.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh` | str | — | Source mesh object name |
+| `ratios` | str | None | Comma list of face ratios per level; or |
+| `triangle_targets` | str | None | Comma list of triangle counts per level (both given is refused before Blender is contacted; neither = the add-on uses `0.5,0.25,0.1`) |
+| `naming` | str | "{name}_LOD{level}" | Pattern with `{name}` and `{level}` |
+| `collection` | str | None | Put the levels in this collection |
+| `parent_to_lod0` | bool | False | Parent the levels to LOD0 |
+| `mode` / `symmetry_axis` / `keep_uv_seams` | | | As `decimate_mesh` |
+| `preserve_silhouette_group` | str | None | Vertex group that weights the reduction |
+| `transfer_normals` | bool | False | Data Transfer custom normals from LOD0 to each level |
+
+**Reply:** `{source, lod0, levels: [{level, name, triangles, ratio}] (LOD0 included at ratio 1.0), collection, custom_normals_transferred}`.
+
+---
+
+### `set_normals(objects, mode, angle, keep_sharp, source_object, apply)`
+Shading normals for export. `AUTO_SMOOTH` uses `shade_smooth_by_angle` on both Blender versions (marks sharp edges, no modifier); `AUTO_SMOOTH_MODIFIER` is the 5.x Smooth by Angle modifier (a teaching error on 4.3.2); `WEIGHTED` applies a Weighted Normal modifier; `FROM_OBJECT` transfers custom normals from a high-poly source; `CLEAR_CUSTOM` drops them.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names |
+| `mode` | str | "AUTO_SMOOTH" | `AUTO_SMOOTH`, `AUTO_SMOOTH_MODIFIER`, `WEIGHTED`, `SMOOTH`, `FLAT`, `FROM_OBJECT`, `CLEAR_CUSTOM` |
+| `angle` | float | 30.0 | Smoothing angle (degrees) |
+| `keep_sharp` | bool | True | Keep marked sharp edges |
+| `source_object` | str | None | Required for `FROM_OBJECT` (refused before Blender is contacted when missing) |
+| `apply` | bool | True | Apply the modifier used |
+
+**Reply:** `{objects, mode, method, modifier_used, has_custom_normals: {name: bool}, sharp_edges: {name: n}}`.
+
+---
+
+### `triangulate_for_export(objects, quad_method, ngon_method, keep_custom_normals, min_vertices, as_modifier)`
+A Triangulate modifier (it keeps custom normals, unlike the BMesh operator), applied, or left live with `as_modifier=True` so the source stays quads.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names |
+| `quad_method` | str | "SHORTEST_DIAGONAL" | `BEAUTY`, `FIXED`, `FIXED_ALTERNATE`, `SHORTEST_DIAGONAL`, `LONGEST_DIAGONAL` |
+| `ngon_method` | str | "BEAUTY" | `BEAUTY` or `CLIP` |
+| `keep_custom_normals` | bool | True | Preserve custom split normals |
+| `min_vertices` | int | 4 | Only faces with at least this many vertices |
+| `as_modifier` | bool | False | Leave the modifier live |
+
+**Reply:** `{objects, as_modifier, per_object: {name: {triangles_before, triangles_after, modifier}}}`.
+
+---
+
+### `get_triangle_budget(objects, budget, group_by)`
+Triangle counts with modifiers evaluated (depsgraph), sorted descending, with each item's share of `budget`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | None | Comma list; None = every mesh in the scene |
+| `budget` | int | None | Triangle budget (sets `over_budget`) |
+| `group_by` | str | "OBJECT" | `OBJECT`, `COLLECTION` or `MATERIAL` |
+
+**Reply:** `{group_by, budget, total, items: [{name, triangles, share}], over_budget}`.
+
+---
+
+## 38. Collision
+
+### `create_collision(mesh, shape, profile, count, axis, decimate_ratio, padding, display_wire, parent, collection)`
+A collision proxy built from the evaluated mesh and named by the engine's convention: UNREAL `UCX_<mesh>_NN`, GODOT `<mesh>-convcol` (convex) or `<mesh>-col`, UNITY `<mesh>_Collider`, GENERIC / BEVY / TIMBERMESH `<mesh>_COL` (NN = next free two-digit index). The proxy is wire-displayed, hidden from render, without material, parented under the mesh. `CONVEX` and `SLICED_CONVEX` hulls are closed manifold meshes (interior and unused geometry removed); on the 24x12 torus fixture the hull volume ratio is about 1.9.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh` | str | — | Source mesh object name |
+| `shape` | str | "CONVEX" | `CONVEX`, `BOX`, `SPHERE`, `CAPSULE`, `CYLINDER`, `MESH_DECIMATED`, `SLICED_CONVEX` |
+| `profile` | str | "UNREAL" | `UNREAL`, `UNITY`, `GODOT`, `BEVY`, `TIMBERMESH` or `GENERIC` |
+| `count` | int | 1 | `SLICED_CONVEX` slabs along `axis` (1..32) |
+| `axis` | str | "Z" | Slicing axis `X`, `Y` or `Z` |
+| `decimate_ratio` | float | 0.1 | `MESH_DECIMATED` ratio |
+| `padding` | float | 0.0 | Grow fitted shapes by this distance |
+| `display_wire` | bool | True | Wire display |
+| `parent` | bool | True | Parent under the mesh |
+| `collection` | str | None | Put the proxy in this collection |
+
+**Reply:** `{mesh, shape, profile, proxies: [{name, triangles, volume_ratio}], parent, collection}`. Errors: `{error, valid}` for shape / profile; `{error}` for a count out of range.
+
+---
+
+### `get_collision_info(mesh)`
+Lists a mesh's collision proxies by every profile's naming rule, with triangle counts and whether each is a child of the mesh.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `mesh` | str | Mesh object name |
+
+**Reply:** `{mesh, proxies: [{name, profile, triangles, is_child}]}`.
+
+---
+
+### `check_collision_fit(mesh, samples)`
+How well the proxies cover the mesh: area-weighted surface samples (deterministic seed), the fraction inside any proxy and the largest distance outside.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mesh` | str | — | Mesh object name |
+| `samples` | int | 2000 | Surface sample points (1..20000) |
+
+**Reply:** `{mesh, samples, proxies, covered_fraction, max_outside_distance, inside_samples}`; `{error: "no collision proxies found for <mesh>"}` when there are none.
+
+---
+
+## 39. Sockets, Pivots & Hierarchy
+
+### `add_socket(parent, name, location, rotation, space, profile, bone, display_size, snap_to, vertex_index)`
+An attach-point Empty under an object (or one of its bones), named for the engine: UNREAL `SOCKET_<name>`, TIMBERMESH `#<name>` (the parent chain must contain a `#` root, else an error), UNITY / GENERIC `<name>`. A duplicate name gets Blender's `.001` suffix.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `parent` | str | — | Parent object name |
+| `name` | str | — | Socket name (the profile prefix is added) |
+| `location` / `rotation` | str | "0,0,0" | `"x,y,z"` (rotation in degrees) in `space` |
+| `space` | str | "LOCAL" | `LOCAL` (relative to the parent) or `WORLD` |
+| `profile` | str | "UNREAL" | `UNREAL`, `TIMBERMESH`, `UNITY` or `GENERIC` |
+| `bone` | str | None | Parent to this bone (armature parents only) |
+| `display_size` | float | 0.1 | Empty display size |
+| `snap_to` | str | "NONE" | `NONE`, `SURFACE` (closest point on the parent from the given location) or `VERTEX` (`vertex_index`); either overrides `space` |
+| `vertex_index` | int | None | Required with `VERTEX` |
+
+**Reply:** `{name, parent, bone, profile, location_world, rotation_world, matrix_world}`.
+
+---
+
+### `list_sockets(parent)`
+Read-only: Empties named `SOCKET_*` or `#*` (so a `#` root lists too), or with `parent` every Empty child of that object, with local and world transforms and the bone each follows.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `parent` | str | None | Restrict to this object's Empty children |
+
+**Reply:** `{parent, count, sockets: [{name, profile, parent, bone, location_local, location_world, rotation_local}]}`.
+
+---
+
+### `set_pivot(objects, mode, location, keep_world)`
+Batch `set_origin` in one round trip. With `keep_world=True` the meshes stay where they are in the world; with `keep_world=False` the geometry moves and the origin stays.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names (bbox modes need meshes) |
+| `mode` | str | "BOTTOM_CENTER" | `BOTTOM_CENTER`, `CENTER`, `TOP_CENTER`, `WORLD_ORIGIN`, `CURSOR` or `CUSTOM` |
+| `location` | str | None | `"x,y,z"` world point for `CUSTOM` (refused before Blender is contacted when missing) |
+| `keep_world` | bool | True | Keep the mesh in place |
+
+**Reply:** `{objects, mode, keep_world, per_object: {name: {new_location}}}`.
+
+---
+
+### `snap_to_grid(objects, grid, axes, what)`
+Modular-kit placement: the origin, the world bounding-box minimum corner or its centre lands on a grid point; the move goes through `matrix_world.translation`, so parented objects are safe.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `objects` | str | — | Comma list of object names |
+| `grid` | float | 1.0 | Grid step (> 0) |
+| `axes` | str | "XYZ" | Any subset of `X`, `Y`, `Z` |
+| `what` | str | "ORIGIN" | `ORIGIN`, `BOUNDS_MIN` or `BOUNDS_CENTER` |
+
+**Reply:** `{objects, grid, axes, what, per_object: {name: {before, after}}}`.
+
+---
+
+### `build_export_hierarchy(root_name, meshes, collision, sockets, lods, profile)`
+Parents meshes, LODs, collision proxies and sockets under a root Empty (reused when it exists) in the layout the engine's importer expects: UNREAL LODs under the root with a `lod_group` custom property and `UCX_` children under their mesh; GODOT `-col` siblings; UNITY / BEVY / GENERIC LOD siblings. Collision and socket targets are matched by name prefix, else the first mesh.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `root_name` | str | — | Root Empty name |
+| `meshes` | str | — | Comma list of mesh names |
+| `collision` / `sockets` / `lods` | str | None | Comma lists |
+| `profile` | str | "UNREAL" | `UNREAL`, `UNITY`, `GODOT`, `BEVY`, `TIMBERMESH` or `GENERIC` |
+
+**Reply:** `{root, profile, created_root, tree: {name, type, children: [...]}, custom_props_set: {object: {key: value}}}`.
+
+---
+
+## 40. Engine Export
+
+Engines: `UNITY`, `UNREAL`, `GODOT`, `BEVY`, `TIMBERMESH`, `GENERIC_GLTF`, `GENERIC_FBX` (an unknown engine is refused before Blender is contacted). The preset table lives in the add-on (`_ENGINE_PRESETS`); `get_export_preset` prints it and `export_for_engine` applies the same entry. The add-on writes `<file>.manifest.json` beside every export; `batch_export` is a server loop that writes `batch_manifest.json`.
+
+**Preset table (2.4.0):**
+- `UNITY`: FBX, `axis_forward='-Z'`, `axis_up='Y'`, `apply_scale_options='FBX_SCALE_ALL'`, `global_scale=1.0`, `use_tspace=True`, `mesh_smooth_type='FACE'`, `add_leaf_bones=False`, `bake_space_transform=False`, `use_custom_props=True`; units 1.0 METERS.
+- `UNREAL`: FBX, `axis_forward='-Y'`, `axis_up='Z'`, `global_scale=1.0`, `apply_scale_options='FBX_SCALE_NONE'`, `use_tspace=True`, `mesh_smooth_type='FACE'`, `add_leaf_bones=False`, `use_custom_props=True`; units 0.01 CENTIMETERS, with a warning naming `set_scene_units(UNREAL)` when the scene's `scale_length` is not 0.01.
+- `GODOT`, `BEVY`: GLB, `export_yup=True`, `export_apply=True`, `export_tangents=True`, `export_extras=True`, `export_attributes=True`, `export_vertex_color='MATERIAL'`, `export_image_format='AUTO'`; units 1.0 METERS.
+- `TIMBERMESH`: the Timbermesh exporter class called directly on a collection, `merge_meshes=True`, `single_animation=True`, `use_vertex_animations=False`; needs the `timbermesh_blender_plugin` add-on (enabled for the export and restored after); the set must contain a `#` root.
+- `GENERIC_FBX`: FBX with Blender's defaults. `GENERIC_GLTF`: GLB with Blender's defaults.
+- Naming per profile: collision `UCX_<mesh>_NN` / `<mesh>-convcol` / `<mesh>-col` / `<mesh>_Collider` / `<mesh>_COL`; sockets `SOCKET_<name>` / `#<name>` / `<name>`; LODs `{name}_LOD{level}`.
+
+### `get_export_preset(engine)`
+The exact exporter settings `export_for_engine` applies for an engine. One round trip, no change to the scene.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `engine` | str | One of the seven engines |
+
+**Reply:** `{engine, format, exporter, kwargs, axis: {forward, up}, units: {scale_length, length_unit}, naming: {collision, socket, lod}, notes}`.
+
+---
+
+### `export_for_engine(engine, objects, collection, filepath, include_hierarchy, include_collision, include_sockets, include_lods, include_animation, apply_modifiers, triangulate, validate, textures, overrides)`
+Export roots with their hierarchy, LODs, collision proxies and sockets using the engine preset, after `validate_asset` on the renderable meshes: a FAIL verdict refuses the export (no file, no manifest) unless `overrides` carries `"force": true`. `triangulate=True` adds a temporary Triangulate modifier (custom normals kept) that the exporter evaluates and removes afterwards, so the file is triangulated while the scene mesh keeps its polygons; it requires `apply_modifiers=True` (refused before Blender is contacted otherwise). Exporter kwargs the live Blender lacks are dropped with a warning; enum values are checked against the live enum.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `engine` | str | — | One of the seven engines |
+| `objects` | str | None | Comma list of root objects (exact first, then globs); or |
+| `collection` | str | None | Collection to export (exactly one of the two) |
+| `filepath` | str | None | Output file; default `<output_dir>/<first root>.<ext>` (stem sanitised) when the `output_dir` server setting is set, else a temp path chosen by the add-on |
+| `include_hierarchy` | bool | True | Children of the roots |
+| `include_collision` | bool | True | Collision-typed meshes (wire + hidden from render, or a profile collision name) |
+| `include_sockets` | bool | True | Socket Empties |
+| `include_lods` | bool | True | `_LOD<n>` siblings (n >= 1) |
+| `include_animation` | bool | False | Animation export |
+| `apply_modifiers` | bool | True | Export the evaluated mesh |
+| `triangulate` | bool | True | Temporary Triangulate modifier for the file only |
+| `validate` | bool | True | Run `validate_asset` first |
+| `textures` | str | "COPY" | `COPY` (files copied beside the export; basename collisions become `<parentfolder>_<basename>`), `EMBED`, `NONE` or `KEEP_PATHS` |
+| `overrides` | str | None | JSON object of exporter kwargs merged over the preset (`"force": true` exports despite FAIL); a scalar or list is refused before Blender is contacted |
+
+**Reply text:** `Exported <engine> -> <filepath> (<size> bytes, N objects, T tris); manifest: <path>; validation: <verdict>; warnings: ...`. The add-on's reply (and the manifest, plus `manifest_version`, `written_at`, `blender`, `preset`) carries `filepath, engine, format, exporter, size_bytes, manifest_path, objects, triangles, materials, textures_copied, validation: {verdict, fail, warn}, warnings, exporter_kwargs, timbermesh_root`. Known Blender fact: the FBX exporter with `use_triangles` drops one face of Suzanne-like meshes in any round trip (968 -> 967), so a manifest triangle count can read one higher than an engine import; not add-on behaviour.
+
+---
+
+### `batch_export(engine, objects, collection, output_dir, naming, one_file_per, skip_hidden, continue_on_error)`
+A server loop: one `get_scene_info(limit=0)` call resolves the roots (every parent-less mesh, or the `objects` list with exact names first and globs expanded against the scene; hidden roots dropped when `skip_hidden`; the `collection` filter applies in both forms), then one `export_for_engine` call per root; a failed root is a `FAIL` row and the loop continues unless `continue_on_error=False`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `engine` | str | — | One of the seven engines |
+| `objects` | str | None | Comma list of roots; default every parent-less mesh in the scene |
+| `collection` | str | None | Only roots in this collection (needs a 2.4.0 add-on, whose scene entries carry `collections`) |
+| `output_dir` | str | None | Folder for the files; default the `output_dir` server setting, else `<temp>/blender_batch_export` |
+| `naming` | str | "{name}" | File stem pattern with `{name}` (stems sanitised) |
+| `one_file_per` | str | "OBJECT" | `OBJECT` = one file per object WITHOUT its children; `ROOT` = one file per root WITH its hierarchy; `COLLECTION` = all roots in one file named after the collection (requires `collection`) |
+| `skip_hidden` | bool | True | Skip roots hidden in the viewport |
+| `continue_on_error` | bool | True | Keep going after a failed root |
+
+**Reply text:** one line per root, `PASS <name> -> <file> (<tris> tris)` or `FAIL <name>: <error>`, then `manifest: <output_dir>/batch_manifest.json` (`{engine, output_dir, written_at, rows: [{object, status, filepath, triangles, error}]}`).
+
+---
+
+### Changes to existing tools in 2.4.0 (additive)
+- `get_scene_info(limit=None)`: `0` = every object; entries gain `triangles`, `hidden`, `parent` and `collections`; the reply gains `total_triangles` / `total_vertices` (section 1).
+- `set_origin`: `BOTTOM_CENTER`, `TOP_CENTER`, `CUSTOM` + `location`; reply `offset_applied`, `children_kept`, `isolated`; shape keys move with the mesh; a shared mesh gets its own copy first (section 11).
+- `apply_modifier(apply_all, keep)`: `modifier_name` optional with `apply_all` (the only 2.3.0 required parameter relaxed); reply `applied`, `kept`, `failed`, `remaining` (section 16).
+- `get_mesh_stats`: evaluated `triangles` (+ `triangles_simple`), topology counts, `has_custom_normals`, `uv_layers`, `color_attributes`, `material_slots`, `dimensions`, `unapplied_transform`, `origin_offset`, `boundary_edges` (section 10).
+- `export_object`: `objects` + 15 engine parameters; reply `size_bytes`, `object_count`, `vertices_written`, `triangles_written`, `warnings`, `transform_baked`, `modifiers_applied` (section 19).
+- `import_file`: 8 importer parameters; reply `objects` per imported object and `ignored` for kwargs the live importer lacks (section 19).
+- `execute_blender_code`: the error block also prints the stdout captured before the exception (section 26).
+- `driver_batch_max` can only LOWER the add-on's hard limit of 200 (section 27 / 35); a `driver_reply_max_chars` setting of 0 or less falls back to 24000.
+- Driver fix (2.3.0 code, found by the 2.4.0 interop step): `transaction` ROLLBACK and `batch(undo=AUTO)` push a closing undo step before unwinding, so Python-only mutations made after BEGIN are reverted too; a ROLLBACK whose marker is already gone answers `{error: "transaction marker not found; nothing reverted"}` (section 35).
+- Every 2.4.0 tool is batchable and transactional through the generic driver (`batch` with `"$id.path"` references across `validate_asset` -> `decimate_mesh` -> `create_collision`, `transaction` ROLLBACK over `set_pivot` + `add_socket`, `rna_get` on a `UCX_` proxy by `#uid`); `batch_export` is a server loop, so it is a tool call, never a batch item.
+- The legacy Scene properties for API keys (`blendermcp_hyper3d_api_key`, `blendermcp_sketchfab_api_key`, `blendermcp_hunyuan3d_secret_id`, `blendermcp_hunyuan3d_secret_key`) are no longer registered; a file saved by 1.6.0-2.3.0 still migrates its values into the add-on preferences on load and the keys are deleted from every ID-property group holding them.
+- Object names containing `,` cannot be addressed through a comma-list parameter: use `collection=` or the driver's `#uid` (R-B2-41).
 
 ---
 

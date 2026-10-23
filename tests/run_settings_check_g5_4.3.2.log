@@ -1,0 +1,145 @@
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '0' matches no enum in 'ColorManagedInputColorspaceSettings', '(null)', 'name'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '4' matches no enum in 'EnumProperty', 'denoiser', 'default'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '0' matches no enum in 'EnumProperty', 'preview_denoiser', 'default'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '458752' matches no enum in 'FloatProperty', 'time_limit', 'subtype'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '458752' matches no enum in 'FloatProperty', 'time_limit', 'subtype'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '5' matches no enum in 'EnumProperty', 'sampling_pattern', 'default'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '65536' matches no enum in 'FloatProperty', 'distance_cull_margin', 'subtype'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '65536' matches no enum in 'FloatProperty', 'distance_cull_margin', 'subtype'
+WARN (bpy.rna): C:\Users\blender\git\blender-v430\blender.git\source\blender\python\intern\bpy_rna.cc:1373 pyrna_enum_to_py: current value '0' matches no enum in 'ColorManagedInputColorspaceSettings', '(null)', 'name'
+BlenderMCP addon registered
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+SETTINGS_BASELINE {"mode": "check", "blender": "4.3.2", "match": true, "calls": 64, "differing": []}
+Blender 4.3.2 (hash 32f5fdce0a0a built 2024-12-17 03:35:23)
+
+Blender quit
+EXIT 0

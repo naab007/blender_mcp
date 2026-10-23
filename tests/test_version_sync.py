@@ -9,8 +9,10 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-# Phase A = 2.0.0; Phase B0 landing = 2.1.0 (run with BLENDER_MCP_EXPECTED_VERSION=2.1.0 until the default flips)
-EXPECTED = os.environ.get("BLENDER_MCP_EXPECTED_VERSION", "2.0.0")
+# Phase B2 (engine readiness) = 2.4.0, the default since T0 2026-10-21 (PLAN.md 13.1 H1, Lead GO T0); RED on the
+# 2.3.0 tree until the L1 landing bumps all three sources. Older trees run with
+# BLENDER_MCP_EXPECTED_VERSION=<their version>
+EXPECTED = os.environ.get("BLENDER_MCP_EXPECTED_VERSION", "2.4.0")
 
 
 def _pyproject_version():

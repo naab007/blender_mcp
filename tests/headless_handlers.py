@@ -372,7 +372,8 @@ step("M12 numpy.array sites carry dtype", s0_m12, readonly=True, tag="M12")
 def s0_m7b():
     lines = ADDON_SRC.decode("utf-8", "replace").splitlines()
     sites = [i for i, l in enumerate(lines) if "import_scene.obj" in l or "export_scene.obj" in l or "import_mesh.stl" in l or "export_mesh.stl" in l]
-    unguarded = [i + 1 for i in sites if not any("_op_exists" in lines[j] for j in range(max(0, i - 4), i))]
+    # the guard may sit on the same line (`a if self._op_exists(a) else b`, the 2.4.0 export/import idiom) or within 4 lines above
+    unguarded = [i + 1 for i in sites if not any("_op_exists" in lines[j] for j in range(max(0, i - 4), i + 1))]
     assert not unguarded, "legacy OBJ/STL operator without _op_exists guard at lines %s" % unguarded
     return "%d legacy obj/stl operator sites, all under an _op_exists guard" % len(sites)
 
@@ -754,7 +755,10 @@ def s7_stats():
     c = make_cube("Stat", 2.0, (1, 1, 1))
     c.modifiers.new("Bev", "BEVEL")
     r = ok(call("get_mesh_stats", name="Stat"))
-    assert r["triangles"] == 12 and r["polygons"] == 6 and r["modifiers"] == ["Bev"], r
+    # PLAN.md 13.2.2 (2.4.0): `triangles` = evaluated loop triangles (the Bevel counts), the 2.2 formula = triangles_simple
+    assert r.get("triangles_simple", r["triangles"]) == 12 and r["polygons"] == 6 and r["modifiers"] == ["Bev"], r
+    if "triangles_simple" in r:
+        assert r["triangles"] > 12, "evaluated count must include the unapplied Bevel: %s" % r["triangles"]
     assert close(r["bounding_box"][0], (0, 0, 0)) and close(r["bounding_box"][1], (2, 2, 2)), r["bounding_box"]
     bpy.data.objects.remove(c, do_unlink=True)
     return "12 tris, bbox (0..2), modifier listed"
@@ -1586,7 +1590,9 @@ step("create_collection + move_to_collection", s18_coll)
 def s19_code():
     r = ok(call("execute_code", code="print('hello', len(bpy.data.objects))"))
     assert r["result"].startswith("hello "), r
-    err(call("execute_code", code="1/0"), "Code execution error")
+    # R25 (2.3.0): the handler returns {error, traceback, line} instead of raising; the substring holds for both
+    # the old raise ("Code execution error: division by zero") and the new dict ("ZeroDivisionError: division by zero")
+    err(call("execute_code", code="1/0"), "division by zero")
     return "stdout captured; exception surfaced"
 
 
@@ -1613,8 +1619,18 @@ def s19_status():
     assert ok(call("get_hunyuan3d_status"))["enabled"] is False
     sc.blendermcp_use_hyper3d = True
     assert ok(call("get_hyper3d_status"))["enabled"] is False  # no key
-    sc.blendermcp_hyper3d_api_key = "x"
-    assert ok(call("get_hyper3d_status"))["enabled"] is True
+    if "blendermcp_hyper3d_api_key" in sc.bl_rna.properties.keys():
+        sc.blendermcp_hyper3d_api_key = "x"                     # <= 2.3: legacy Scene StringProperty
+        assert ok(call("get_hyper3d_status"))["enabled"] is True
+    else:
+        # 2.4.0 (PLAN.md 13.1 H15): the secret lives in the add-on preferences only; make them real for the check
+        _entry = bpy.context.preferences.addons.new(); _entry.module = "addon"
+        try:
+            addon._prefs().hyper3d_api_key = "x"
+            assert ok(call("get_hyper3d_status"))["enabled"] is True
+            addon._prefs().hyper3d_api_key = ""
+        finally:
+            bpy.context.preferences.addons.remove(_entry)
     sc.blendermcp_use_hunyuan3d = True; sc.blendermcp_hunyuan3d_mode = "OFFICIAL_API"
     assert ok(call("get_hunyuan3d_status"))["enabled"] is False
     sc.blendermcp_hunyuan3d_mode = "LOCAL_API"
@@ -1624,7 +1640,8 @@ def s19_status():
     err(call("get_polyhaven_categories", asset_type="junk"), "Invalid asset type")
     for k in ("blendermcp_use_hyper3d", "blendermcp_use_hunyuan3d", "blendermcp_use_polyhaven"):
         setattr(sc, k, False)
-    sc.blendermcp_hyper3d_api_key = ""
+    if "blendermcp_hyper3d_api_key" in sc.bl_rna.properties.keys():
+        sc.blendermcp_hyper3d_api_key = ""              # <= 2.3 only; at 2.4.0 the pref was cleared above
     return "status handlers follow toggles/keys; polyhaven bad asset_type rejected without network"
 
 
@@ -1710,6 +1727,19 @@ if "--b1" in _argv:
     P("HARNESS b1 steps from %s" % _b1_path)
     exec(compile(open(_b1_path, encoding="utf-8").read(), _b1_path, "exec"))
 
+# Phase D1 (generic driver) steps, opt-in with `-- --drv` (PLAN.md section 12; usually together with --b0 --b1)
+if "--drv" in _argv:
+    _drv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drv_steps.py")
+    P("HARNESS drv steps from %s" % _drv_path)
+    exec(compile(open(_drv_path, encoding="utf-8").read(), _drv_path, "exec"))
+
+# Phase B2 (engine readiness) steps, opt-in with `-- --b2` (PLAN.md section 13; usually together with --b0 --b1 --drv).
+# tests/b2_steps.py always exists (T0 created it empty on purpose): a missing file is a harness error, never a silent skip.
+if "--b2" in _argv:
+    _b2_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b2_steps.py")
+    P("HARNESS b2 steps from %s" % _b2_path)
+    exec(compile(open(_b2_path, encoding="utf-8").read(), _b2_path, "exec"))
+
 B0_TABLE = set("""get_file_state new_file revert_file recover_file save_copy save_version list_versions append_from_blend
 link_from_blend set_autosave make_paths_relative make_paths_absolute find_missing_files pack_all unpack_all describe_settings
 get_settings set_settings settings_snapshot settings_restore list_settings_snapshots delete_settings_snapshot set_output_settings
@@ -1721,6 +1751,16 @@ ensure_server_running""".split())
 B1_TABLE = set("""create_armature add_bones get_armature_info set_bone_properties delete_bones bind_armature get_vertex_groups
 get_vertex_weights set_vertex_weights render_weight_map find_unweighted_vertices set_pose get_pose reset_pose add_constraint
 get_constraints remove_constraint set_keyframes get_animation_info playblast bake_action mirror_bones""".split())
+# PLAN.md 12.2.2: the 13 driver handler keys (L4 events keys drv_sub/drv_poll/drv_unsub join when the Lead pulls L4 in)
+DRV_TABLE = set("""drv_describe drv_get drv_set drv_op drv_call drv_new drv_remove drv_snapshot drv_diff drv_batch
+drv_transaction drv_find drv_context""".split())
+# PLAN.md 13.3 (B2.2): the 21 engine-readiness handler keys (batch_export is a server loop, no handler); L1 = the first
+# six, L2 = the next eight, L3 = the last seven (R-B2-13). Events keys join DRV_TABLE only if the Lead pulls L4 in.
+B2_TABLE = set("""validate_asset find_mesh_issues compare_meshes apply_transforms fix_normals cleanup_mesh
+decimate_mesh generate_lods set_normals triangulate_for_export get_triangle_budget create_collision get_collision_info
+check_collision_fit add_socket list_sockets set_pivot snap_to_grid build_export_hierarchy export_for_engine
+get_export_preset""".split())
+assert len(B2_TABLE) == 21, len(B2_TABLE)
 
 
 def s21_coverage():
@@ -1731,6 +1771,10 @@ def s21_coverage():
         expected |= B0_TABLE
     if "--b1" in _argv:
         expected |= B1_TABLE
+    if "--drv" in _argv:
+        expected |= DRV_TABLE
+    if "--b2" in _argv:
+        expected |= B2_TABLE
     missing = sorted((set(HANDLERS) - CALLED) & expected)
     unflagged = sorted(set(HANDLERS) - CALLED - expected)
     assert not missing, "handlers never exercised: %s" % missing

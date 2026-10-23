@@ -20,6 +20,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(REPO, "src"))
 sys.path.insert(0, TESTS)
+from test_f6_connection import RELAXED_REQUIRED_24   # R-B2-22: defined once, imported here
 
 BASELINE_21 = os.path.join(TESTS, "baseline_tools_2.1.txt")
 SNAPSHOT_21 = os.path.join(TESTS, "baselines", "tools_list_2.1.json")
@@ -89,7 +90,8 @@ def test_k14_superset_of_2_1_baseline(server):
         for p, spec in old.items():
             if p not in new:
                 problems.append("%s.%s removed" % (name, p))
-            elif spec != new[p]:
+            elif spec != new[p] and p not in RELAXED_REQUIRED_24.get(name, []):
+                # R-B2-20/22: a field listed in RELAXED_REQUIRED_24 may become optional (type/default change); nothing else may change
                 problems.append("%s.%s changed" % (name, p))
         if set(row["inputSchema"].get("required", [])) < set(live[name]["inputSchema"].get("required", [])):
             problems.append("%s gained required params" % name)

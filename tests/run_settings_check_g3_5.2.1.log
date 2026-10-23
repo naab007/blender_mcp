@@ -1,0 +1,145 @@
+00:14.312  bpy.rna          | WARNING current value '-1' matches no enum in 'ColorManagedInputColorspaceSettings', '(null)', 'name'
+00:14.781  bpy.rna          | WARNING current value '4' matches no enum in 'EnumProperty', 'denoiser', 'default'
+00:14.797  bpy.rna          | WARNING current value '0' matches no enum in 'EnumProperty', 'preview_denoiser', 'default'
+00:14.797  bpy.rna          | WARNING current value '458752' matches no enum in 'FloatProperty', 'time_limit', 'subtype'
+00:14.797  bpy.rna          | WARNING current value '458752' matches no enum in 'FloatProperty', 'time_limit', 'subtype'
+00:14.797  bpy.rna          | WARNING current value '5' matches no enum in 'EnumProperty', 'sampling_pattern', 'default'
+00:14.797  bpy.rna          | WARNING current value '65536' matches no enum in 'FloatProperty', 'distance_cull_margin', 'subtype'
+00:14.797  bpy.rna          | WARNING current value '65536' matches no enum in 'FloatProperty', 'distance_cull_margin', 'subtype'
+00:14.859  bpy.rna          | WARNING current value '-1' matches no enum in 'ColorManagedInputColorspaceSettings', '(null)', 'name'
+BlenderMCP addon registered
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for get_settings
+Handler execution complete
+Executing handler for describe_settings
+Handler execution complete
+Executing handler for set_settings
+Handler execution complete
+SETTINGS_BASELINE {"mode": "check", "blender": "5.2.1", "match": true, "calls": 64, "differing": []}
+Blender 5.2.1 LTS (hash 9e2066aef7ef built 2026-08-25 02:38:20)
+
+Blender quit
+EXIT 0

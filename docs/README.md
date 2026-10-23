@@ -25,6 +25,7 @@ points) and 7 (deploy). Read that doc first whichever request you are building.
 | 15 | Update notification | One-time new-release notice to agents (installed vs latest GitHub release), version sync across the three version sources, addon/server mismatch detection | `FEATURE-REQUEST-update-notification.md` |
 | 16 | Node-graph programming | Tree-agnostic driver for geometry, shader and compositor trees (create, inspect, link, set, group, layout, render, diff, validate), modifier binding, evaluation readback, realize, bakes, zones, geometry-nodes recipes | `FEATURE-REQUEST-node-graphs.md` |
 | 17 | Simulation and VFX | Fluids, particles, force fields, cloth, soft body, rigid bodies, dynamic paint, ocean, quick effects, and the game outputs: flipbooks with passes, vertex animation textures, baked keyframes, shape keys, Alembic/USD caches, realized frames | `FEATURE-REQUEST-simulation-and-vfx.md` |
+| 18 | Generic driver (CDP-style) | Eleven generic tools over one add-on dispatcher: `describe` (RNA schema for any struct, property or operator), `rna_get` / `rna_set` by ref (`#uid`, `OBJECT:Name`, `/path`), `call_operator` with a declared context, `call_method`, `data_new` / `data_remove`, `scene_snapshot` / `scene_diff` keyed by `session_uid`, `batch` with `$id` references and undo rollback, `transaction`; Tier 2 events (app handlers + msgbus by cursor), `find`, `context_info`. Most convenience tools in docs 1-17 become server-side recipes on it | `FEATURE-REQUEST-generic-driver.md` |
 
 ## Engines and pipelines these are written against
 
@@ -67,9 +68,10 @@ the evidence line; until then build against the 5.2.1 diff in the migration doc.
 0. Settings, save and load: DONE headless 2026-09-11 as 2.1.0 (addon `81038008`, server
    `598a765d`; harness 165/165 on 4.3.2 and 5.2.1; live L7-L9 pending in the user's batch).
    Its `_settings_scope` helper and secrets migration are used by everything after it.
-1. Rigging and animation Tier 1: IN PROGRESS as 2.2.0 (`PLAN.md` section 10, started 2026-09-11)
-2. Engine readiness Tier 1 (validation, LODs, collision, export presets)
-3. UV and texturing Tier 1
+1. Rigging and animation Tier 1: DONE as 2.2.0 (`PLAN.md` section 10; committed `3459566`, deployed 2026-09-11, unreleased)
+2. Engine readiness Tier 1 (validation, LODs, collision, sockets, export presets): DONE headless as 2.4.0 (team lohjud, B2-G3 passed 2026-10-22; `PLAN.md` section 13; frozen pair addon `ee9b9dc0` / server `a2cdd77f`, 204 tools, harness 252/252 on 4.3.2 and 5.2.1; G5 live pass pending; Tier 2 set deferred, `PLAN.md` 13.10). Uncommitted with 2.3.0 (one commit, user's call).
+   2a. Generic driver Tier 1 + `find` / `context_info`: DONE headless as 2.3.0 (`PLAN.md` section 12, team nosubl, 2026-10-16); events (Tier 2) = their own later stage (user directive 2026-10-21: one feature request per stage).
+3. UV and texturing Tier 1: NEXT stage, 2.5.0, starts only on the user's explicit go (stage plan `PLAN.md` 13.1 H24)
 4. Presentation and library Tier 1 (perception tools pay back immediately)
 5. Asset construction
 6. Node graphs Tier 1 (the driver; the shader tools in texturing become aliases)

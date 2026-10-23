@@ -2,25 +2,27 @@
 
 BlenderMCP connects Blender to AI assistants through the Model Context Protocol (MCP), letting Claude directly control Blender for prompt-assisted 3D modelling, scene creation, rendering, and automation.
 
-This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) with **169 tools**, Blender 4.3 – 5.2 support (tested on 4.3.2 and 5.2.1 LTS), and telemetry removed.
+This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp) with **204 tools**, Blender 4.3 – 5.2 support (tested on 4.3.2 and 5.2.1 LTS), and telemetry removed.
 
 ---
 
 ## What's new in this fork
 
+- **v2.4.0: engine readiness (stage 1 of the game-dev requests)** — 22 new tools that decide whether a mesh survives import into Unity, Unreal, Godot, Bevy or Timberborn's Timbermesh: validation (`validate_asset` with 22 fixed check ids and six safe fixes, `find_mesh_issues` with an optional rendered view, `compare_meshes` for round-trip diffs, `apply_transforms`, `fix_normals`, `cleanup_mesh`), optimisation and LODs (`decimate_mesh` by ratio or triangle target, `generate_lods`, `set_normals`, `triangulate_for_export`, `get_triangle_budget`), collision (`create_collision` with engine naming, `get_collision_info`, `check_collision_fit`), sockets, pivots and hierarchy (`add_socket`, `list_sockets`, `set_pivot`, `snap_to_grid`, `build_export_hierarchy`) and engine export (`get_export_preset`, `export_for_engine` with a per-file manifest and validation gate, `batch_export`). Existing tools gained parameters: `export_object` (object lists and the engine exporter switches), `import_file` (axes, scale, custom normals, per-object report), `get_mesh_stats` (evaluated triangles and topology counts), `get_scene_info` (`limit`, per-object `triangles` / `hidden` / `parent` / `collections`), `apply_modifier` (`apply_all`, `keep`; `modifier_name` optional), `set_origin` (`BOTTOM_CENTER`, `TOP_CENTER`, `CUSTOM`). The legacy Scene properties for API keys are gone (values migrate into the add-on preferences on load). Every 2.4.0 tool is batchable and transactional through the generic driver, and a 2.3.0 driver bug (ROLLBACK not reverting Python-only edits) is fixed. Wire protocol stays 1; every 2.3.0 tool keeps its schema. Reference: `TOOLS.md` sections 36-40, `docs/release-notes/v2.4.0.md`.
+- **v2.3.0: generic driver** — 13 new tools that address Blender's RNA and operator layer directly (CDP-style) instead of one hand-written tool per question: `describe` (any struct, property or operator from Blender's own definitions, with enum items, ranges and read-only flags), `rna_get` / `rna_set` (any property by ref, validated, radians by default), `find` / `context_info`, `data_new` / `data_remove`, `call_operator` (with a declared context: mode, active, selected, area) / `call_method`, `scene_snapshot` / `scene_diff` (keyed by uid, so renames are detected), `batch` (many commands in one round trip, `"$id.path"` references between them, undo on failure) / `transaction` (BEGIN / COMMIT / ROLLBACK as one undo step). Refs look like `#127`, `OBJECT:Cube`, `OBJECT:Cube/modifiers["Bevel"].width`, `context/scene.frame_current`, `data/objects`, `prefs/edit.undo_steps`. Rides along: `uid` on `get_scene_info` / `get_object_info` / `find_objects_by_type` / `get_armature_info`, `execute_blender_code(result_expr=)` with a structured error dict instead of a raw exception, `get_version` reports the driver registries, two server settings (`driver_reply_max_chars`, `driver_batch_max`), and `add_modifier` params go through the driver's coercer (dotted keys, pointer values as `#uid` / `IDTYPE:Name` / plain names; an out-of-range value is refused instead of silently clamped). Wire protocol stays 1 and every 2.2.0 tool keeps its schema. Events (`events_subscribe` / `events_poll` / `events_unsubscribe`) are deferred to the generic-driver Tier 2 stage. Reference: `TOOLS.md` section 35, `docs/release-notes/v2.3.0.md`.
 - **v2.2.0: rigging and animation** — 21 new tools: armatures and bones (`create_armature`, `add_bones`, `get_armature_info`, `set_bone_properties`, `delete_bones`), skinning and weights (`bind_armature`, `get_vertex_groups`, `get_vertex_weights`, `set_vertex_weights`, `render_weight_map`, `find_unweighted_vertices`), pose and constraints (`set_pose`, `get_pose`, `reset_pose`, `add_constraint`, `get_constraints`, `remove_constraint`), animation (`set_keyframes`, `get_animation_info`, `playblast`, `bake_action`); every act tool has a perceive twin (`get_armature_info`, `get_pose`, `render_weight_map`, `playblast`). Bones are returned by name; on Blender 5.x actions are slotted and the tools bind the slot. Rig-aware changes to existing tools: `export_object` gains `include_hierarchy` (armature and children export with the mesh) and the FBX/glTF animation parameters (`bake_anim`, `add_leaf_bones`, `use_armature_deform_only`, `bake_anim_simplify_factor`, `mesh_smooth_type`, bone axes, `apply_scale_options`, `export_animations` / `export_skins` / `export_morph`; parameters that do not apply to the chosen format are reported as ignored); `add_keyframe` keys pose bones (`bone`) and reports a rotation-mode switch; `capture_viewport_angle` / `capture_contact_sheet` gain `overlay` (`bones_in_front`, `wireframe`, `weight_paint`); `parent_object` gains `parent_type=BONE` + `bone`; `get_project_profile(apply_units=True)`. Rigging and animation tools follow as they land.
 - **v2.1.0 (in progress on `blender-5.2`): settings, save and load** — the add-on now starts its socket server automatically when Blender starts (preference, on by default), the port and every API key moved from Scene properties into the add-on Preferences (never written into `.blend` files again), the server binds `127.0.0.1`, and `get_version` / `ensure_server_running` commands report the add-on version and wire protocol (`PROTOCOL = 1`). 56 new tools: file lifecycle, generic and typed settings, presets and project profile, add-ons and preferences, session state; `save_blend` / `load_blend` / `set_render_settings` / `start_blender` gained parameters, none removed.
 - **v2.0.0: Blender 5.2 LTS** — the four 5.0 API breaks are fixed (EEVEE engine id, `Scene.node_tree` removal, boolean solver `FAST`→`FLOAT`, `media_type` before `file_format`); 4.x/5.x differences are resolved by try-assign, never by version checks. `start_blender` also finds portable `blender-<ver>-windows-x64` folders. Details: `docs/MIGRATION-blender-5.2.md`
-- **169 tools** across 34 categories (92 in 2.0.0, 56 added in 2.1.0, 21 added in 2.2.0; up from the original ~20)
+- **204 tools** across 40 categories (92 in 2.0.0, 56 added in 2.1.0, 21 added in 2.2.0, 13 added in 2.3.0, 22 added in 2.4.0; up from the original ~20)
 - **Blender 4.x compatibility** (v1.6.0) — fixes for BMesh layer API changes, EEVEE engine name, `temp_override` region requirement, compositor node ordering
 - **No telemetry** — all analytics code removed
 - **Auto-restart on addon reload** — server restarts automatically when the addon is cycled in Preferences; no manual click needed
 - **`img_to_3d_server.py`** — local image-to-3D inference via TripoSR (optional, loads/unloads on demand to free VRAM)
-- **`TOOLS.md`** — full reference for all 169 tools with parameters
+- **`TOOLS.md`** — full reference for all 204 tools with parameters
 
 ---
 
-## Tool categories (169 tools)
+## Tool categories (204 tools)
 
 | Category | Tools |
 |---|---|
@@ -43,7 +45,13 @@ This is an extended fork of [ahujasid/blender-mcp](https://github.com/ahujasid/b
 | Animation | `add_keyframe`, `set_frame`, `set_keyframes`, `get_animation_info`, `playblast`, `bake_action` |
 | Collections | `create_collection`, `move_to_collection` |
 | Export / import | `export_object`, `import_file`, `save_blend`, `load_blend` |
-| Scripting | `execute_blender_code` |
+| Scripting | `execute_blender_code` (`result_expr` since 2.3.0; prefer the generic driver for anything without a dedicated tool) |
+| Generic driver (2.3.0) | `describe`, `rna_get`, `rna_set`, `data_new`, `data_remove`, `find`, `context_info`, `call_operator`, `call_method`, `scene_snapshot`, `scene_diff`, `batch`, `transaction` |
+| Validation (2.4.0) | `validate_asset`, `find_mesh_issues`, `compare_meshes`, `apply_transforms`, `fix_normals`, `cleanup_mesh` |
+| Optimisation & LODs (2.4.0) | `decimate_mesh`, `generate_lods`, `set_normals`, `triangulate_for_export`, `get_triangle_budget` |
+| Collision (2.4.0) | `create_collision`, `get_collision_info`, `check_collision_fit` |
+| Sockets, pivots & hierarchy (2.4.0) | `add_socket`, `list_sockets`, `set_pivot`, `snap_to_grid`, `build_export_hierarchy` |
+| Engine export (2.4.0) | `get_export_preset`, `export_for_engine`, `batch_export` |
 | Version & server settings (2.1.0) | `get_version`, `get_server_settings`, `set_server_settings` |
 | File lifecycle (2.1.0) | `get_file_state`, `new_file`, `revert_file`, `recover_file`, `save_copy`, `save_version`, `list_versions`, `append_from_blend`, `link_from_blend`, `set_autosave`, `make_paths_relative`, `make_paths_absolute`, `find_missing_files`, `pack_all`, `unpack_all` |
 | Settings & presets (2.1.0) | `describe_settings`, `get_settings`, `set_settings`, `settings_snapshot`, `settings_restore`, `list_settings_snapshots`, `delete_settings_snapshot`, `set_output_settings`, `set_color_management`, `set_render_quality`, `set_render_device`, `list_render_devices`, `set_simplify`, `set_frame_range`, `set_scene_units`, `set_viewport_defaults`, `save_preset`, `load_preset`, `list_presets`, `delete_preset`, `export_preset`, `import_preset`, `apply_blender_preset`, `list_blender_presets`, `set_project_profile`, `get_project_profile` |
@@ -161,7 +169,7 @@ Edit > Preferences > Add-ons > Blender MCP holds:
 | Start server automatically | on | Starts the socket server 0.5 s after Blender starts; ignored in `--background` |
 | Hyper3D API key, Sketchfab API key, Hunyuan 3D SecretId / SecretKey | empty | Password fields, stored in `userpref.blend`, never in a `.blend` file |
 
-Before 2.1.0 the keys and the port were Scene properties and travelled inside every saved `.blend`. On the first load of such a file the add-on moves any key it finds into the Preferences (only where the preference is still empty) and blanks the Scene copy, so the next save no longer carries it. The legacy Scene properties stay registered but hidden (through 2.1.x and 2.2.0) so a file coming straight from 1.6.0 still migrates; they are removed in 2.3.0. Because preferences are per Blender installation (`%APPDATA%\Blender Foundation\Blender\<ver>\config\userpref.blend`), you enter each key once per installation, for example once in 4.3 and once in 5.2. The keys are write-only over the wire: no tool ever echoes them back.
+Before 2.1.0 the keys and the port were Scene properties and travelled inside every saved `.blend`. On the first load of such a file the add-on moves any key it finds into the Preferences (only where the preference is still empty) and blanks the Scene copy, so the next save no longer carries it. The legacy Scene properties stay registered but hidden (through 2.1.x, 2.2.0 and 2.3.0) so a file coming straight from 1.6.0 still migrates; removing them is a later debt. Because preferences are per Blender installation (`%APPDATA%\Blender Foundation\Blender\<ver>\config\userpref.blend`), you enter each key once per installation, for example once in 4.3 and once in 5.2. The keys are write-only over the wire: no tool ever echoes them back.
 
 ## Environment variables
 
@@ -171,6 +179,8 @@ Before 2.1.0 the keys and the port were Scene properties and travelled inside ev
 | `BLENDER_HOST` | `127.0.0.1` | Host of the Blender add-on socket (the add-on binds `127.0.0.1` only since 2.1.0; was `localhost` before) |
 | `BLENDER_PORT` | `9876` | Port of the Blender add-on socket |
 | `BLENDER_MCP_SETTINGS_DIR` | `~/.blender_mcp` | Directory of the server's `settings.json` and `presets/` (2.1.0). Tests and harness runs always set it so they never touch your real file |
+| `BLENDER_DRIVER_REPLY_MAX` | `24000` | Reply cap in characters for the generic driver's reading tools (2.3.0); overrides the settings file key `driver_reply_max_chars`. A tool's own `max_chars` argument wins over both |
+| `BLENDER_DRIVER_BATCH_MAX` | `200` | Commands per `batch` the server accepts before refusing without contacting Blender (2.3.0); overrides `driver_batch_max`. The add-on caps at 200 as well and stops a batch after 60 s of wall time |
 | `IMG_TO_3D_PORT` | `7862` | Port of the local TripoSR server. Since 2.1.0 the MCP server honours it (env > settings file `img_to_3d_port` > 7862); in 2.0.0 `load_img_to_3d_model` always used 7862 |
 | `IMG_TO_3D_MODEL_DIR` | `stabilityai/TripoSR` | Local weights path or HuggingFace hub ID |
 | `IMG_TO_3D_DEVICE` | auto | `cuda` or `cpu` |
@@ -195,6 +205,8 @@ logs one warning and falls back to the defaults; unknown keys in the file are pr
 | `image_max_pixels` | `8000000` | | Pixel ceiling before image replies are downscaled |
 | `log_level` | `INFO` | | Server log level |
 | `img_to_3d_port` | `7862` | `IMG_TO_3D_PORT` | Local TripoSR server port |
+| `driver_reply_max_chars` | `24000` | `BLENDER_DRIVER_REPLY_MAX` | Reply cap the server sends on every generic-driver read (`describe`, `rna_get`, `find`, `call_method`, `scene_snapshot`, `scene_diff`, `batch`); the add-on truncates to it and lists what it dropped (2.3.0) |
+| `driver_batch_max` | `200` | `BLENDER_DRIVER_BATCH_MAX` | `batch` size above which the server refuses the call before sending anything (2.3.0) |
 
 `get_server_settings` shows every key with its source (`env`, `file` or `default`);
 `set_server_settings` writes the file atomically (a `null` value resets a key to its
@@ -231,6 +243,7 @@ Blender scene
 
 - All addon handlers run on Blender's main thread via `bpy.app.timers.register()` — no threading issues
 - Commands are JSON `{ "type": "...", "params": {...} }`, responses are `{ "status": "success"|"error", "result": ... }`
+- Since 2.3.0 the generic driver (`describe`, `rna_get`, `rna_set`, `call_operator`, `call_method`, `data_new`, ... handler keys `drv_*`) addresses Blender's RNA layer directly by ref, validated against Blender's own property and operator definitions, so most "there is no tool for X" cases no longer need `execute_blender_code`. That tool stays for BMesh / numpy loops; it now returns `value` for a `result_expr` and a structured error (`error`, `traceback`, `line`) instead of raising. Driver reads are capped (`driver_reply_max_chars`, default 24000) and every capped reply names what was dropped in `truncated`.
 
 ---
 
@@ -241,7 +254,7 @@ Blender scene
 - **`start_blender` launches the wrong Blender** — auto-detection takes the highest version it finds across Program Files and portable folders. Set `BLENDER_EXE` (see Environment variables) or pass `blender_exe=` to pin one.
 - **Boolean solver `FAST` rejected** — Blender 5.0 renamed it `FLOAT`. `boolean_operation` accepts either spelling and maps it to the live enum; `MANIFOLD` is passed through on 5.2+. The reply names the solver used.
 - **Render writes nothing after depth map** — compositor state corruption from empty node tree. Fixed in this fork via full snapshot/restore in `render_depth_map`.
-- **`execute_blender_code`** runs arbitrary Python in Blender — powerful but irreversible. Save your work first.
+- **`execute_blender_code`** runs arbitrary Python in Blender — powerful but irreversible. Save your work first. Since 2.3.0 prefer `describe` plus the driver tools (`rna_set`, `call_operator`, ...) inside a `transaction`, which validate every value and can `ROLLBACK`; pass `result_expr` when you need a value back, and read `error` / `traceback` / `line` instead of a raw exception.
 - **`[blender-mcp mismatch]` at the top of a reply** — the server and the add-on differ in version or wire protocol (shown once per connection; a pre-2.1 add-on is reported as `pre-2.1 / protocol none`). Deploy the matching `addon.py`, cycle the add-on, and check with `get_version`.
 - **Connection issues** — the sidebar tab must show `Running on 127.0.0.1:<port>`. If it shows the **Connect to MCP server** button, autostart is off (Preferences > Add-ons > Blender MCP) or the add-on was enabled after launch: click the button once. Headless (`--background`) Blender never opens the port by itself; the server's `start_blender` handles that path. On 2.0.0 and earlier the server never started on a normal launch (fixed in 2.1.0).
 

@@ -6,6 +6,8 @@ Server-side configuration comes from settings.py (settings.json + environment).
 from mcp.server.fastmcp import FastMCP, Context, Image
 import socket
 import json
+import datetime
+import fnmatch
 import asyncio
 import logging
 import tempfile
@@ -550,11 +552,17 @@ def get_blender_connection():
 
 
 @mcp.tool()
-def get_scene_info(ctx: Context) -> str:
-    """Get detailed information about the current Blender scene"""
+def get_scene_info(ctx: Context, limit: int = None) -> str:
+    """
+    Get detailed information about the current Blender scene.
+
+    Parameters:
+    - limit: Object entries to return (add-on default 10; 0 = every object)
+    """
     try:
         blender = get_blender_connection()
-        result = blender.send_command("get_scene_info")
+        # R-B2-32: forwarded only when given, so the 2.2 wire tuple stays unchanged
+        result = blender.send_command("get_scene_info", {"limit": int(limit)} if limit is not None else None)
 
         # Just return the JSON representation of what Blender sent us
         return json.dumps(result, indent=2)
@@ -617,18 +625,36 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
 
 
 @mcp.tool()
-def execute_blender_code(ctx: Context, code: str) -> str:
+def execute_blender_code(ctx: Context, code: str, result_expr: str = None) -> str:
     """
     Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
+    Prefer describe / rna_get / rna_set / call_operator for anything they cover; keep this for BMesh and numpy loops.
 
     Parameters:
     - code: The Python code to execute
+    - result_expr: Optional expression evaluated after the code in the same namespace; its value
+                   comes back JSON-encoded (an ID as {uid, id_type, name}) under "value"
     """
     try:
         # Get the global connection
         blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        params = {"code": code}
+        if result_expr:
+            params["result_expr"] = result_expr
+        result = blender.send_command("execute_code", params)
+        if "error" in result:
+            msg = f"Error: {result['error']}"
+            if result.get("line") is not None:
+                msg += f" (line {result['line']})"
+            for frame in result.get("traceback") or []:
+                msg += f"\n  {frame}"
+            if result.get("result"):   # RS-9: stdout captured before the exception
+                msg += f"\nstdout: {result['result']}"
+            return msg
+        msg = f"Code executed successfully: {result.get('result', '')}"
+        if "value" in result:
+            msg += f"\nvalue: {json.dumps(result['value'], indent=2)}"
+        return msg
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         return f"Error executing code: {str(e)}"
@@ -1667,9 +1693,12 @@ async def close_blender(
     pid = _blender_process.pid if _blender_process else None
     host, port = _blender_host_port()
     graceful = False
+    managed = _blender_process is not None
 
-    # Graceful path: ask Blender to quit via the addon socket (connect if needed)
-    if not force and _probe_port(host, port, 0.5):
+    # Graceful path: ask Blender to quit via the addon socket (connect if needed).
+    # R-B2-45 (F-B2-5): force only skips this for a process this server started; with no managed
+    # process the socket is the only way to reach Blender, so force takes the graceful path too.
+    if (not force or not managed) and _probe_port(host, port, 0.5):
         try:
             conn = get_blender_connection()
             conn.send_command("quit_blender", {"save_prompt": False, "save": save})
@@ -1698,10 +1727,12 @@ async def close_blender(
             graceful = False
         _blender_process = None
 
+    if graceful and force and not managed:
+        return "Blender asked to quit (not a process this server started; force applies only to managed processes)."
     if graceful:
         how = "gracefully"
-    elif pid or force:
-        how = "process terminated"
+    elif pid:
+        how = "process terminated"   # only after a real terminate/kill of the managed process (R-B2-45)
     else:
         how = "no running instance found"
     return f"Blender closed ({how})." + (f" (pid was {pid})" if pid else "")
@@ -1767,6 +1798,8 @@ def get_version(ctx: Context) -> str:
                      f"{info.get('blender')}, Python {info.get('python')}"
                      + (f", file {info['addon_file']}" if info.get("addon_file") else ""))
         lines.append(f"protocol_match: {'true' if info.get('protocol') == PROTOCOL else 'false'}")
+        if isinstance(info.get("registries"), dict):   # H16: the add-on's blendermcp_* registry sizes
+            lines.append(f"registries: {json.dumps(info['registries'], sort_keys=True)}")
     mismatch = _mismatch_text(info)
     if info.get("unreachable"):
         lines.append("Compatibility: unknown (add-on unreachable)")
@@ -1787,10 +1820,11 @@ def get_server_settings(ctx: Context) -> str:
     value: env, file or default.
 
     Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,
-    presets_dir, image_max_pixels, log_level, img_to_3d_port. File:
-    <settings dir>/settings.json where the settings dir is ~/.blender_mcp or
-    BLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST, BLENDER_PORT,
-    BLENDER_EXE and IMG_TO_3D_PORT override the file.
+    presets_dir, image_max_pixels, log_level, img_to_3d_port, driver_reply_max_chars,
+    driver_batch_max. File: <settings dir>/settings.json where the settings dir is
+    ~/.blender_mcp or BLENDER_MCP_SETTINGS_DIR. Environment variables BLENDER_HOST,
+    BLENDER_PORT, BLENDER_EXE, IMG_TO_3D_PORT, BLENDER_DRIVER_REPLY_MAX and
+    BLENDER_DRIVER_BATCH_MAX override the file.
     """
     lines = [f"Settings file: {_settings.settings_path()} ({_settings.file_state()})",
              f"Presets dir: {_settings.presets_dir()}"]
@@ -1808,7 +1842,10 @@ def set_server_settings(ctx: Context, values: str) -> str:
     Parameters:
     - values: JSON object of key -> value, e.g. '{"port": 9877, "output_dir": "D:/renders"}'.
       Keys: host, port, connect_timeout, command_timeout, blender_exe, output_dir,
-      presets_dir, image_max_pixels, log_level, img_to_3d_port. A null value resets
+      presets_dir, image_max_pixels, log_level, img_to_3d_port, driver_reply_max_chars
+      (reply cap of the generic driver's reading tools, default 24000; env
+      BLENDER_DRIVER_REPLY_MAX), driver_batch_max (commands per batch, default 200, can only
+      lower the limit since the add-on caps at 200; env BLENDER_DRIVER_BATCH_MAX). A null value resets
       a key to its default. Unknown keys and wrong types are reported as rejected.
       host and port take effect on the next connection (the current one is dropped);
       the other keys apply immediately. A key set by an environment variable keeps
@@ -2806,22 +2843,37 @@ def subdivide_mesh(
 
 
 @mcp.tool()
-def apply_modifier(ctx: Context, name: str, modifier_name: str) -> str:
+def apply_modifier(ctx: Context, name: str, modifier_name: str = None, apply_all: bool = False,
+                   keep: str = None) -> str:
     """
-    Apply a named modifier on a mesh object, collapsing it into the mesh data.
+    Apply a named modifier on a mesh object, collapsing it into the mesh data,
+    or every modifier in stack order with apply_all.
 
     Parameters:
     - name: Object name
     - modifier_name: Exact modifier name as shown in Blender's Properties panel
+                     (not needed with apply_all)
+    - apply_all: Apply every modifier in order; one failure does not stop the rest
+    - keep: Comma list of modifier names or types to skip, e.g. "ARMATURE" (apply_all)
+
+    Reply (apply_all): applied, kept and failed {name: reason}.
     """
+    if not apply_all and not (modifier_name or "").strip():
+        return "Error: modifier_name required unless apply_all"
     try:
         blender = get_blender_connection()
-        result = blender.send_command("apply_modifier", {
-            "name": name, "modifier_name": modifier_name
-        })
+        payload = {"name": name, "modifier_name": modifier_name}
+        if apply_all or keep:
+            payload.update({"apply_all": bool(apply_all), "keep": keep})
+        result = blender.send_command("apply_modifier", payload)
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Applied modifier '{modifier_name}' on '{name}'"
+        msg = f"Applied {result.get('applied', [])} on '{name}'"
+        if result.get("kept"):
+            msg += f". Kept: {result['kept']}"
+        if result.get("failed"):
+            msg += f". Failed: {result['failed']}"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -3169,6 +3221,22 @@ def export_object(
     export_animations: bool = True,
     export_skins: bool = True,
     export_morph: bool = True,
+    objects: str = None,
+    apply_modifiers: bool = True,
+    axis_forward: str = None,
+    axis_up: str = None,
+    global_scale: float = None,
+    use_tspace: bool = None,
+    use_triangles: bool = None,
+    use_custom_props: bool = None,
+    colors_type: str = None,
+    export_apply: bool = None,
+    export_tangents: bool = None,
+    export_extras: bool = None,
+    export_yup: bool = None,
+    export_attributes: bool = None,
+    export_vertex_color: str = None,
+    export_animation_mode: str = None,
 ) -> str:
     """
     Export an object (or the full scene) to a 3D file. A skinned mesh exports WITH
@@ -3176,10 +3244,20 @@ def export_object(
 
     Parameters:
     - name: Object to export; exports entire scene if omitted
+    - objects: Comma list of objects to export (alternative to name; not both)
     - filepath: Output file path. If omitted: <server output_dir>/<name or scene>.<format>
                 when the output_dir setting is set, else a temp-dir path.
     - file_format: glb, gltf, fbx, obj, stl, ply (default glb)
     - include_hierarchy: Also select the parent armature and all children (default True)
+    - apply_modifiers: Export the evaluated mesh (default True)
+    Engine params (None = the exporter's default; enums validated against this Blender):
+    - axis_forward / axis_up / global_scale: FBX and OBJ axes and scale
+    - use_tspace / use_triangles / use_custom_props / colors_type: FBX
+    - export_apply / export_tangents / export_extras / export_yup / export_attributes /
+      export_vertex_color / export_animation_mode: glTF
+    Reply adds size_bytes, object_count, vertices_written, triangles_written, warnings
+    (unapplied scale, missing UVs, ngons without use_triangles, materials without nodes)
+    and transform_baked (OBJ on Blender 4.x always bakes the object transform).
     FBX only (ignored for other formats, reported):
     - bake_anim: Bake animation into the FBX (default True)
     - add_leaf_bones: Add end bones for bone tails (default False, engines do not want them)
@@ -3193,9 +3271,12 @@ def export_object(
     - export_animations / export_skins / export_morph: Include animations, skinning,
       shape keys (all default True)
     """
+    if name and objects:
+        return "Error: give name or objects, not both"
     try:
         if not filepath:
-            filepath = _default_output_path(f"{name or 'scene'}.{(file_format or 'glb').lower()}")
+            stem = name or (_split_csv(objects)[0] if objects else None) or "scene"
+            filepath = _default_output_path(f"{stem}.{(file_format or 'glb').lower()}")
         blender = get_blender_connection()
         result = blender.send_command("export_object", {
             "name": name, "filepath": filepath, "file_format": file_format,
@@ -3208,6 +3289,15 @@ def export_object(
             "apply_scale_options": apply_scale_options,
             "export_animations": export_animations, "export_skins": export_skins,
             "export_morph": export_morph,
+            # B2 (13.2.2): engine params, None = exporter default
+            "objects": objects, "apply_modifiers": apply_modifiers,
+            "axis_forward": axis_forward, "axis_up": axis_up, "global_scale": global_scale,
+            "use_tspace": use_tspace, "use_triangles": use_triangles,
+            "use_custom_props": use_custom_props, "colors_type": colors_type,
+            "export_apply": export_apply, "export_tangents": export_tangents,
+            "export_extras": export_extras, "export_yup": export_yup,
+            "export_attributes": export_attributes, "export_vertex_color": export_vertex_color,
+            "export_animation_mode": export_animation_mode,
         })
         if "error" in result:
             return f"Error: {result['error']}"
@@ -3217,19 +3307,38 @@ def export_object(
             msg += f" {len(ex)} object(s): {', '.join(ex[:8])}{', ...' if len(ex) > 8 else ''}"
         elif ex:
             msg += f" ({ex})"
+        if "size_bytes" in result:
+            msg += (f". size_bytes={result.get('size_bytes')} object_count={result.get('object_count')} "
+                    f"vertices_written={result.get('vertices_written')} "
+                    f"triangles_written={result.get('triangles_written')}")
+        if result.get("transform_baked"):
+            msg += ". transform_baked: true (OBJ on Blender 4.x bakes the object transform into the vertices)"
         opts = result.get("fbx_options") or result.get("gltf_options")
         if isinstance(opts, dict) and opts:
             msg += ". Options: " + ", ".join(f"{k}={v}" for k, v in list(opts.items())[:10])
         ignored = result.get("ignored") or result.get("ignored_params")
         if ignored:
             msg += f". Ignored for {result.get('format', file_format)}: {ignored}"
+        if result.get("warnings"):
+            msg += ". Warnings: " + "; ".join(str(w) for w in result["warnings"])
         return msg
     except Exception as e:
         return f"Error: {e}"
 
 
 @mcp.tool()
-def import_file(ctx: Context, filepath: str) -> str:
+def import_file(
+    ctx: Context,
+    filepath: str,
+    axis_forward: str = None,
+    axis_up: str = None,
+    global_scale: float = None,
+    use_custom_normals: bool = True,
+    use_image_search: bool = None,
+    ignore_leaf_bones: bool = None,
+    import_shading: str = None,
+    merge_vertices: bool = None,
+) -> str:
     """
     Import a 3D file into the current Blender scene.
     Supports: .glb, .gltf, .fbx, .obj, .stl, .ply, .blend, .bvh (needs the
@@ -3237,16 +3346,37 @@ def import_file(ctx: Context, filepath: str) -> str:
 
     Parameters:
     - filepath: Absolute path to the file to import
+    - axis_forward / axis_up / global_scale: importer axes and scale (FBX, OBJ)
+    - use_custom_normals: keep the file's custom normals (default True)
+    - use_image_search / ignore_leaf_bones: FBX
+    - import_shading (NORMALS, FLAT, SMOOTH) / merge_vertices: glTF
+    None = the importer's default; kwargs this Blender lacks are skipped and reported.
 
-    Reply lists the new objects and, for rigged files, the armatures, the new
-    actions and any bone-shape helper objects the importer added.
+    Reply lists the new objects (per object: type, vertices, triangles,
+    has_custom_normals, uv_layers, materials) and, for rigged files, the armatures,
+    the new actions and any bone-shape helper objects the importer added.
     """
     try:
         blender = get_blender_connection()
-        result = blender.send_command("import_file", {"filepath": filepath})
+        result = blender.send_command("import_file", {
+            "filepath": filepath,
+            # B2 (13.2.2): importer params, None = importer default
+            "axis_forward": axis_forward, "axis_up": axis_up, "global_scale": global_scale,
+            "use_custom_normals": use_custom_normals, "use_image_search": use_image_search,
+            "ignore_leaf_bones": ignore_leaf_bones, "import_shading": import_shading,
+            "merge_vertices": merge_vertices,
+        })
         if "error" in result:
             return f"Error: {result['error']}"
         msg = f"Imported {filepath}. New objects: {result.get('imported_objects', [])}"
+        objs = result.get("objects")
+        if isinstance(objs, list) and objs:
+            rows = [f"{o.get('name')} ({o.get('type')}, {o.get('vertices')} verts, {o.get('triangles')} tris, "
+                    f"custom_normals={o.get('has_custom_normals')}, uv_layers={o.get('uv_layers')}, "
+                    f"materials={o.get('materials')})" for o in objs if isinstance(o, dict)]
+            msg += ". Objects: " + "; ".join(rows)
+        if result.get("ignored"):
+            msg += f". Ignored (not in this Blender's importer): {result['ignored']}"
         if result.get("armatures"):
             msg += f". Armatures: {result['armatures']}"
         if result.get("new_actions"):
@@ -3424,6 +3554,23 @@ def _parse_json_object(text: str, label: str) -> dict | str:
 
 def _split_csv(text: str) -> list[str]:
     return [p.strip() for p in str(text).split(",") if p.strip()] if text else []
+
+
+def _parse_refs(text, label: str) -> list | str:
+    """'a,b,c' or a JSON list of strings -> list[str]; empty -> []; returns an 'Error: ...' string
+    on bad input (R12: the driver's "comma list or JSON list" parameters)."""
+    if text is None or str(text).strip() == "":
+        return []
+    text = str(text)
+    if not text.lstrip().startswith("["):
+        return _split_csv(text)
+    try:
+        items = json.loads(text)
+    except json.JSONDecodeError as e:
+        return f"Error: {label} is not valid JSON ({e.msg} at position {e.pos})"
+    if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+        return f"Error: {label} must be a JSON list of strings, e.g. '[\"#127\", \"OBJECT:Cube\"]'"
+    return items
 
 
 # ─── Session state ────────────────────────────────────────────────────────────
@@ -5287,25 +5434,42 @@ def rename_object(ctx: Context, old_name: str, new_name: str) -> str:
 
 
 @mcp.tool()
-def set_origin(ctx: Context, name: str, origin_type: str = "ORIGIN_GEOMETRY") -> str:
+def set_origin(ctx: Context, name: str, origin_type: str = "ORIGIN_GEOMETRY", location: str = None) -> str:
     """
-    Set an object's origin point.
+    Set an object's origin point. The mesh stays where it is in the world.
 
     Parameters:
     - name: Object name
     - origin_type: ORIGIN_GEOMETRY (centre of mesh),
                    ORIGIN_CURSOR (3D cursor position),
                    ORIGIN_CENTER_OF_MASS,
-                   ORIGIN_CENTER_OF_VOLUME
+                   ORIGIN_CENTER_OF_VOLUME,
+                   BOTTOM_CENTER / TOP_CENTER (bounding-box bottom or top centre,
+                   the game-prop standard), CUSTOM (world point from location)
+    - location: "x,y,z" world coordinates, required for CUSTOM
     """
+    loc = None
+    if (origin_type or "").strip().upper() == "CUSTOM":
+        if location is None or str(location).strip() == "":
+            return "Error: location is required for origin_type CUSTOM, e.g. '0,0,0'"
+        loc = _parse_vec3(location, "location")
+        if isinstance(loc, str):
+            return loc
     try:
         blender = get_blender_connection()
-        result = blender.send_command("set_origin", {
-            "name": name, "origin_type": origin_type,
-        })
+        payload = {"name": name, "origin_type": origin_type}
+        if loc is not None:
+            payload["location"] = loc
+        result = blender.send_command("set_origin", payload)
         if "error" in result:
             return f"Error: {result['error']}"
-        return f"Origin of '{name}' set ({origin_type}). New location: {result['new_location']}"
+        msg = (f"Origin of '{name}' set ({result.get('origin_type', origin_type)}). "
+               f"New location: {result['new_location']}")
+        if result.get("offset_applied") is not None:
+            msg += f". Mesh offset applied (local): {result['offset_applied']}"
+        if result.get("isolated"):   # RS-14 / R-B2-37: a multi-user mesh got its own copy first
+            msg += "; mesh data isolated (was shared)"
+        return msg
     except Exception as e:
         return f"Error: {e}"
 
@@ -5731,13 +5895,18 @@ def set_render_settings(
 # data JSON strings, parsed here and sent as native types.
 
 def _parse_json_any(text: str, label: str):
-    """Parse a JSON argument (object or list); returns the value or an 'Error: ...' string."""
+    """Parse a JSON argument (object or list); returns the value or an 'Error: ...' string.
+    A decoded scalar (string, number, bool, null) is an error too (R31): callers tell the error
+    text from a value by isinstance(str), so a JSON string value must never come back raw."""
     if text is None or str(text).strip() == "":
         return None
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except json.JSONDecodeError as e:
         return f"Error: {label} is not valid JSON ({e.msg} at position {e.pos})"
+    if not isinstance(value, (dict, list)):
+        return f"Error: {label} must be a JSON object or list"
+    return value
 
 
 def _parse_vec3(text, label: str):
@@ -6887,6 +7056,1536 @@ async def generate_3d_from_image(
                 f"Use import_file('{output_path}') to load it into Blender.")
     except Exception as e:
         return f"Error calling image-to-3D server: {e}"
+
+
+# ─── Generic driver (D1): RNA / operator protocol, PLAN.md 12.2 ──────────────
+# Every driver tool addresses data by ref ("#uid", "IDTYPE:Name", "<ref>/rna.path",
+# "context/...", "data/...", "prefs/..."), sends EXACTLY the 12.2.2 handler kwargs and
+# returns the add-on's reply pretty-printed. The add-on applies the reply cap; the server
+# always sends max_chars (settings driver_reply_max_chars, env BLENDER_DRIVER_REPLY_MAX).
+# JSON params cross the MCP boundary as strings: dict -> _parse_json_object, list-or-dict
+# -> _parse_json_any, "comma list or JSON list" -> _parse_refs (R12). Angles are raw
+# radians unless angles="DEGREES" (R10).
+
+def _driver_cap(max_chars) -> int:
+    """The max_chars to send: the tool's own value, else settings driver_reply_max_chars (24000).
+    A setting <= 0 or non-numeric falls back to 24000 (RS-12: 0 would blank every driver read)."""
+    try:
+        if max_chars is not None and int(max_chars) > 0:
+            return int(max_chars)
+    except (TypeError, ValueError):
+        pass
+    try:
+        setting = int(_settings.get("driver_reply_max_chars", 24000))
+    except (TypeError, ValueError):
+        setting = 0
+    return setting if setting > 0 else 24000
+
+
+def _join_fields(text, label: str):
+    """A comma string stays as is (wire shape str); a JSON list of strings is joined with ','
+    (the MCP side accepts both, G6). None/empty -> None. Returns an 'Error: ...' string on bad JSON."""
+    if text is None or str(text).strip() == "":
+        return None
+    if not str(text).lstrip().startswith("["):
+        return text
+    items = _parse_refs(text, label)
+    return items if isinstance(items, str) else ",".join(items)
+
+
+def _driver_reply(result) -> str:
+    """Render a driver reply: errors as 'Error: <text>' plus the teaching keys (closest, valid,
+    tried, ...) one per line; success replies pretty-printed like get_settings."""
+    if isinstance(result, dict) and "error" in result:
+        lines = [f"Error: {result['error']}"]
+        for key, val in result.items():
+            if key != "error":
+                lines.append(f"{key}: {json.dumps(val)}")
+        return "\n".join(lines)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def describe(ctx: Context, what: str, fields: str = "all", include_functions: bool = False,
+             search: str = None, max_chars: int = None) -> str:
+    """
+    Describe an RNA struct, one property, or an operator from Blender's own definitions.
+
+    Parameters:
+    - what: a ref ("OBJECT:Cube", "#127/modifiers[\"Bevel\"].width"), a struct name ("Object",
+            "BooleanModifier"), an operator id ("mesh.bevel"), or "ops" to list operators
+    - fields: "all" or a comma list of property identifiers
+    - include_functions: also list the struct's functions
+    - search: substring over identifiers, names and descriptions (with what="ops": every operator)
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_describe", {
+            "what": what, "fields": fields, "include_functions": include_functions,
+            "search": search, "max_chars": _driver_cap(max_chars),
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def rna_get(ctx: Context, refs: str, fields: str = None, depth: int = 0, angles: str = "RADIANS",
+            max_chars: int = None) -> str:
+    """
+    Read properties of one or more refs in one round trip (see describe for the ref grammar).
+
+    Parameters:
+    - refs: comma list or JSON list of refs ("#127", "OBJECT:Cube/location", "SCENE:Scene/render")
+    - fields: comma list of property identifiers; "all" expands pointers to depth; a collection
+              named with [] (e.g. "modifiers[]") lists its items; default = every scalar property
+    - depth: pointer expansion depth
+    - angles: RADIANS (raw) or DEGREES for rotation properties
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    ref_list = _parse_refs(refs, "refs")
+    if isinstance(ref_list, str):
+        return ref_list
+    if not ref_list:
+        return "Error: refs must name at least one ref, e.g. 'OBJECT:Cube' or '#127/location'"
+    fields = _join_fields(fields, "fields")
+    if isinstance(fields, str) and fields.startswith("Error: "):
+        return fields
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_get", {
+            "refs": ref_list, "fields": fields, "depth": depth, "angles": angles,
+            "max_chars": _driver_cap(max_chars),
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def rna_set(ctx: Context, sets: str, angles: str = "RADIANS", stop_on_error: bool = True,
+            publish: bool = True) -> str:
+    """
+    Set properties by ref. Values are coerced and validated against the property's RNA
+    definition (enum membership, range, read-only); use describe to learn a property.
+
+    Parameters:
+    - sets: JSON list of [ref, value] pairs or JSON object {ref: value}, e.g.
+            '[["#127/location", [1, 2, 3]], ["SCENE:Scene/render.engine", "CYCLES"]]'
+    - angles: RADIANS (raw) or DEGREES for rotation properties
+    - stop_on_error: stop at the first refused item (the earlier ones stay applied)
+    - publish: notify msgbus subscribers of each change
+    """
+    set_list = _parse_json_any(sets, "sets")
+    if isinstance(set_list, str):
+        return set_list
+    if not isinstance(set_list, (list, dict)) or not set_list:
+        return "Error: sets must be a non-empty JSON list of [ref, value] pairs or a JSON object {ref: value}"
+    if isinstance(set_list, dict):
+        set_list = [[ref, value] for ref, value in set_list.items()]   # canonical wire shape (G6)
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_set", {
+            "sets": set_list, "angles": angles, "stop_on_error": stop_on_error, "publish": publish,
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def data_new(ctx: Context, collection: str, args: str = None, kwargs: str = None,
+             link_to: str = None, set: str = None) -> str:
+    """
+    Create an ID through bpy.data.<collection>.new(...) and return its uid
+    (describe("BlendData") lists the collections; the error names those with new()).
+
+    Parameters:
+    - collection: a bpy.data collection with new(): objects, meshes, materials, lights, cameras,
+                  collections, armatures, images, node_groups, actions, curves, texts, ...
+    - args: JSON list of positional arguments for new(); a ref is accepted where an ID is
+            expected, e.g. '["Cube2", "MESH:Cube"]' for objects
+    - kwargs: JSON object of keyword arguments for new()
+    - link_to: for objects: "scene" (default: the active scene's root collection),
+               "COLLECTION:Name" or "#uid"
+    - set: initial properties as for rna_set (paths relative to the new ID)
+    """
+    arg_list = _parse_json_any(args, "args")
+    if isinstance(arg_list, str):
+        return arg_list
+    if arg_list is not None and not isinstance(arg_list, list):
+        return "Error: args must be a JSON list, e.g. '[\"Name\"]'"
+    kw = _parse_json_object(kwargs, "kwargs")
+    if isinstance(kw, str):
+        return kw
+    set_list = _parse_json_any(set, "set")
+    if isinstance(set_list, str):
+        return set_list
+    if set_list is not None and not isinstance(set_list, (list, dict)):
+        return "Error: set must be a JSON list of [path, value] pairs or a JSON object {path: value}"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_new", {
+            "collection": collection, "args": arg_list, "kwargs": kw or None,
+            "link_to": link_to, "set": set_list,
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def data_remove(ctx: Context, refs: str, do_unlink: bool = True, purge_orphans: bool = False) -> str:
+    """
+    Remove IDs by ref (bpy.data.<collection>.remove).
+
+    Parameters:
+    - refs: comma list or JSON list of ID refs ("#127", "MESH:Cube")
+    - do_unlink: unlink from every user first; False refuses an ID that still has users
+    - purge_orphans: run orphans_purge (recursive) afterwards
+    """
+    ref_list = _parse_refs(refs, "refs")
+    if isinstance(ref_list, str):
+        return ref_list
+    if not ref_list:
+        return "Error: refs must name at least one ID ref, e.g. '#127' or 'MESH:Cube'"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_remove", {
+            "refs": ref_list, "do_unlink": do_unlink, "purge_orphans": purge_orphans,
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find(ctx: Context, id_type: str = "OBJECT", name: str = None, where: str = None,
+         scope: str = "SCENE", fields: str = "name,type", limit: int = 100,
+         max_chars: int = None) -> str:
+    """
+    Query IDs by type, name glob and property conditions; returns uids.
+
+    Parameters:
+    - id_type: OBJECT, MESH, MATERIAL, ... (ID.id_type identifiers; see describe)
+    - name: glob pattern (fnmatch), e.g. "Cube*"
+    - where: JSON list of [path, op, value] conditions with op in ==, !=, <, <=, >, >=, in,
+             contains, exists; "[]" in a path means any item, e.g.
+             '[["type", "==", "MESH"], ["modifiers[].type", "contains", "ARMATURE"]]'
+    - scope: SCENE (objects of the active scene) or DATA (all of bpy.data)
+    - fields: comma list of properties to report per hit
+    - limit: maximum hits
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    cond = _parse_json_any(where, "where")
+    if isinstance(cond, str):
+        return cond
+    if cond is not None and not isinstance(cond, list):
+        return "Error: where must be a JSON list of [path, op, value] conditions"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_find", {
+            "id_type": id_type, "name": name, "where": cond, "scope": scope, "fields": fields,
+            "limit": limit, "max_chars": _driver_cap(max_chars),
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def context_info(ctx: Context, fields: str = None) -> str:
+    """
+    What call_operator's context declaration is applied against: mode, active object (uid),
+    selection, scene, view layer, window/areas, frame, and whether Blender runs headless.
+
+    Parameters:
+    - fields: comma list of keys to report; omit for all
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_context", {"fields": fields})
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def call_operator(ctx: Context, op: str, params: str = None, context: str = None,
+                  exec_context: str = "EXEC_DEFAULT", undo: bool = True) -> str:
+    """
+    Run a Blender operator under a declared context. Parameters are validated against the
+    operator's RNA first (describe("mesh.bevel") lists them); poll failure returns the reason.
+
+    Parameters:
+    - op: operator id, e.g. "object.modifier_add", "mesh.bevel"
+    - params: JSON object of operator properties, e.g. '{"type": "BEVEL"}'
+    - context: JSON object {"mode", "active", "selected", "area", "region", "scene", "keep", "extra"};
+               active/selected are refs; area/region need a GUI session; extra keys are whitelisted
+    - exec_context: EXEC_DEFAULT; INVOKE_* only with context.area in a GUI session
+    - undo: wrap in an undo push (so transaction / batch rollback covers it)
+    """
+    kw = _parse_json_object(params, "params")
+    if isinstance(kw, str):
+        return kw
+    decl = _parse_json_object(context, "context")
+    if isinstance(decl, str):
+        return decl
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_op", {
+            "op": op, "params": kw or None, "context": decl or None,
+            "exec_context": exec_context, "undo": undo,
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def call_method(ctx: Context, ref: str, method: str, args: str = None, kwargs: str = None,
+                depsgraph: bool = False, max_chars: int = None) -> str:
+    """
+    Call an RNA function on an ID or struct (describe(..., include_functions=True) lists them).
+
+    Parameters:
+    - ref: the ID or struct ("#127", "MESH:Cube", "OBJECT:Cube/modifiers[\"Bevel\"]")
+    - method: function name, e.g. "from_pydata", "evaluated_get", "to_mesh"
+    - args: JSON list of positional arguments (refs accepted where an ID is expected)
+    - kwargs: JSON object of keyword arguments
+    - depsgraph: pass context.evaluated_depsgraph_get() as the first argument (evaluated_get, to_mesh)
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    arg_list = _parse_json_any(args, "args")
+    if isinstance(arg_list, str):
+        return arg_list
+    if arg_list is not None and not isinstance(arg_list, list):
+        return "Error: args must be a JSON list, e.g. '[[[0, 0, 0], [1, 0, 0]], [], []]'"
+    kw = _parse_json_object(kwargs, "kwargs")
+    if isinstance(kw, str):
+        return kw
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_call", {
+            "ref": ref, "method": method, "args": arg_list, "kwargs": kw or None,
+            "depsgraph": depsgraph, "max_chars": _driver_cap(max_chars),
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def scene_snapshot(ctx: Context, name: str, scope: str = "SCENE", types: str = None,
+                   fields: str = "name,type,parent,location,rotation_euler,scale,hide_viewport,hide_render,users",
+                   include: str = None, depth: int = 1, return_tree: bool = True,
+                   angles: str = "RADIANS", max_chars: int = None) -> str:
+    """
+    Capture the scene (or all of bpy.data) keyed by uid, for a later scene_diff. Lives in the
+    Blender session only.
+
+    Parameters:
+    - name: snapshot name (scene_diff refers to it)
+    - scope: SCENE (IDs reachable from the active scene) or DATA (every ID collection)
+    - types: comma list or JSON list of id_type filters, e.g. "OBJECT,MESH"
+    - fields: comma list of per-ID properties to capture
+    - include: comma list or JSON list of per-object expansions: modifiers, constraints,
+               material_slots, vertex_groups, children
+    - depth: parent/child tree depth
+    - return_tree: False returns only {name, count, chars} (capture without paying for the reply)
+    - angles: RADIANS (raw) or DEGREES for rotation fields
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    if not name or not str(name).strip():
+        return "Error: name must be a non-empty snapshot name"
+    type_list = _parse_refs(types, "types")
+    if isinstance(type_list, str):
+        return type_list
+    fields = _join_fields(fields, "fields")
+    if isinstance(fields, str) and fields.startswith("Error: "):
+        return fields
+    include_list = _parse_refs(include, "include")
+    if isinstance(include_list, str):
+        return include_list
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_snapshot", {
+            "name": name, "scope": scope, "types": type_list or None, "fields": fields,
+            "include": include_list or None, "depth": depth, "return_tree": return_tree,
+            "angles": angles, "max_chars": _driver_cap(max_chars),
+        })
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def scene_diff(ctx: Context, a: str, b: str = "NOW", max_chars: int = None) -> str:
+    """
+    Diff two scene snapshots (or a snapshot against the live scene): added, removed, renamed
+    (by uid) and changed fields.
+
+    Parameters:
+    - a: snapshot name
+    - b: snapshot name, or NOW = the live scene captured with a's parameters
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    if not a or not str(a).strip():
+        return "Error: a must be a snapshot name (see scene_snapshot)"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_diff", {"a": a, "b": b, "max_chars": _driver_cap(max_chars)})
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def batch(ctx: Context, commands: str, stop_on_error: bool = True, undo: str = "AUTO",
+          refs: bool = True, max_chars: int = None) -> str:
+    """
+    Run many commands in one round trip (any tool's handler key: driver drv_* or legacy).
+    Refused server-side above the driver_batch_max setting (default 200; the setting can only LOWER
+    the limit, the add-on caps at 200) without contacting Blender.
+
+    Parameters:
+    - commands: JSON list of {"id"?: str, "type": handler key, "params"?: object}, e.g.
+                '[{"id": "m", "type": "drv_new", "params": {"collection": "meshes", "args": ["M"]}},
+                  {"type": "drv_new", "params": {"collection": "objects", "args": ["O", "$m.uid"]}}]'
+    - stop_on_error: stop at the first failing command (the rest are reported as skipped)
+    - undo: AUTO = one undo step for the batch, rolled back when a command fails and stop_on_error
+            is set; NONE for read-only batches
+    - refs: replace "$<id>.<path>" strings in later params with that earlier result
+    - max_chars: reply cap (default: server setting driver_reply_max_chars)
+    """
+    cmd_list = _parse_json_any(commands, "commands")
+    if isinstance(cmd_list, str):
+        return cmd_list
+    if not isinstance(cmd_list, list) or not cmd_list:
+        return "Error: commands must be a non-empty JSON list of {\"type\": handler key, \"params\": {...}} objects"
+    for i, cmd in enumerate(cmd_list):
+        if not isinstance(cmd, dict) or not isinstance(cmd.get("type"), str) or not cmd["type"]:
+            return f"Error: commands[{i}] must be an object with a string \"type\" (handler key)"
+    limit = min(int(_settings.get("driver_batch_max", 200)), 200)   # RS-6: lower-only, add-on caps at 200
+    if len(cmd_list) > limit:
+        return (f"Error: batch has {len(cmd_list)} commands; the limit is {limit} "
+                f"(server setting driver_batch_max, env BLENDER_DRIVER_BATCH_MAX); split the batch")
+    undo = (undo or "AUTO").strip().upper()
+    if undo not in ("AUTO", "NONE"):
+        return "Error: undo must be AUTO or NONE"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_batch", {
+            "commands": cmd_list, "stop_on_error": stop_on_error, "undo": undo, "refs": refs,
+            "max_chars": _driver_cap(max_chars),
+        })
+        if isinstance(result, dict) and "error" not in result and isinstance(result.get("results"), list):
+            # one-line head (counts, rolled_back, stopped_at) then the pretty JSON (12.2.2)
+            rows = result["results"]
+            counts = {s: sum(1 for r in rows if r.get("status") == s) for s in ("ok", "error", "skipped")}
+            head = (f"batch: {len(rows)} commands, {counts['ok']} ok, {counts['error']} error, "
+                    f"{counts['skipped']} skipped; rolled_back={result.get('rolled_back')}, "
+                    f"undo_available={result.get('undo_available')}, stopped_at={result.get('stopped_at')}, "
+                    f"elapsed_ms={result.get('elapsed_ms')}")
+            return head + "\n" + _driver_reply(result)
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def transaction(ctx: Context, action: str, name: str = None) -> str:
+    """
+    Group driver changes into one undo step: BEGIN, then COMMIT or ROLLBACK (Ctrl-Z back to
+    the state at BEGIN; interleaved GUI edits are undone too, so keep transactions short).
+
+    Parameters:
+    - action: BEGIN, COMMIT, ROLLBACK or STATUS
+    - name: transaction name (BEGIN); shown in Blender's undo history as mcp:<name>
+    """
+    act = (action or "").strip().upper()
+    if act not in ("BEGIN", "COMMIT", "ROLLBACK", "STATUS"):
+        return "Error: action must be BEGIN, COMMIT, ROLLBACK or STATUS"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("drv_transaction", {"action": act, "name": name})
+        return _driver_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# --- Engine readiness ---
+# Phase B2 (PLAN.md section 13, 13.2.3+): validation, LODs, collision, sockets, export presets.
+# Every tool is an add-on handler of the same name (H23); the wrapper validates what it can
+# before connecting (enums, csv shapes) and renders the add-on's reply as JSON or "Error: ...".
+
+_B2_PROFILES = ("GENERIC", "UNITY", "UNREAL", "GODOT", "BEVY", "TIMBERMESH")
+_B2_ISSUES = ("NON_MANIFOLD", "NGONS", "LOOSE", "DEGENERATE", "DOUBLES", "FLIPPED", "INTERIOR_FACES", "BOUNDARY")
+_B2_COMPARE = ("VERTS", "ORDER", "NORMALS", "UVS", "TANGENTS", "MATERIALS", "GROUPS")
+_B2_NORMAL_MODES = ("OUTSIDE", "INSIDE", "FLIP", "CLEAR_CUSTOM")
+
+
+def _b2_enum(value, valid: tuple, label: str) -> str:
+    """Upper-cased enum value, or an 'Error: ...' string naming the valid values."""
+    v = (value or "").strip().upper()
+    if v not in valid:
+        return f"Error: {label} must be one of {', '.join(valid)} (got {value!r})"
+    return v
+
+
+def _b2_objects(objects, label: str = "objects") -> str:
+    """A non-empty comma list of object names (globs allowed, parsed by the add-on), else 'Error: ...'."""
+    if not objects or not _split_csv(objects):
+        return f"Error: {label} must be a comma list of object names, e.g. 'Cube,Prop*'"
+    return objects
+
+
+def _b2_reply(result) -> str:
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def validate_asset(
+    ctx: Context,
+    objects: str = None,
+    collection: str = None,
+    profile: str = "GENERIC",
+    max_triangles: int = None,
+    require_uv: bool = True,
+    require_uv2: bool = False,
+    max_bone_influences: int = 4,
+    fix: bool = False,
+) -> str:
+    """
+    Pre-flight check of meshes for an engine: 22 fixed checks per object (transforms,
+    origin, topology, normals, UVs, budgets, materials, names, hierarchy), each
+    PASS / WARN / FAIL with a detail, a count and sample indices, plus an overall
+    verdict. fix=True applies only the safe fixes (apply transforms, normals outside,
+    remove doubles, delete loose, triangulate ngons, rename illegal characters) and
+    re-checks; fix=False changes nothing and lists fixes_available.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed), or
+    - collection: Collection name (one of the two)
+    - profile: GENERIC, UNITY, UNREAL, GODOT, BEVY or TIMBERMESH
+    - max_triangles: Budget for the triangle_budget check (None = no budget)
+    - require_uv / require_uv2: missing_uv / missing_uv2 become FAIL (default True / False)
+    - max_bone_influences: bone_influences WARN above this (default 4)
+    - fix: Apply the safe fixes and report fixes_applied (default False)
+    """
+    if bool(objects) == bool(collection):
+        return "Error: give objects or collection (exactly one)"
+    prof = _b2_enum(profile, _B2_PROFILES, "profile")
+    if prof.startswith("Error: "):
+        return prof
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("validate_asset", {
+            "objects": objects, "collection": collection, "profile": prof,
+            "max_triangles": max_triangles, "require_uv": require_uv, "require_uv2": require_uv2,
+            "max_bone_influences": max_bone_influences, "fix": bool(fix),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def find_mesh_issues(
+    ctx: Context,
+    mesh: str,
+    issue: str,
+    render: bool = False,
+    angle: str = "iso_front_right",
+    max_indices: int = 500,
+):
+    """
+    Element indices for one issue class on a mesh (validate_asset says what, this
+    says where). render=True returns an image of those elements selected in edit
+    mode from a named viewport angle instead (mode and selection restored; needs a
+    GUI session).
+
+    Parameters:
+    - mesh: Mesh object name
+    - issue: NON_MANIFOLD, NGONS, LOOSE, DEGENERATE, DOUBLES, FLIPPED, INTERIOR_FACES or BOUNDARY
+    - render: True returns an image instead of the indices (default False)
+    - max_indices: Cap on the indices returned (default 500; truncated flag set when hit)
+    - angle: front, back, left, right, top, bottom, iso_front_right, iso_front_left
+
+    Reply (render=False): mesh, issue, element (VERT/EDGE/FACE), count, indices, truncated.
+    """
+    iss = _b2_enum(issue, _B2_ISSUES, "issue")
+    if iss.startswith("Error: "):
+        if render:
+            raise Exception(iss[len("Error: "):])
+        return iss
+    if render and angle not in _VALID_ANGLES:
+        raise Exception(f"Unknown angle '{angle}'. Valid angles: {', '.join(_VALID_ANGLES)}")
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("find_mesh_issues", {
+            "mesh": mesh, "issue": iss, "render": bool(render), "angle": angle,
+            "max_indices": max_indices,
+        })
+        if "error" in result:
+            if render:
+                raise Exception(result["error"])
+            return f"Error: {result['error']}"
+        if not render:
+            return json.dumps({k: v for k, v in result.items() if k not in ("filepath", "image", "image_path")},
+                              indent=2)
+        if result.get("image_error"):   # RS-3: the add-on's own capture error text (addon find_mesh_issues)
+            raise Exception(result["image_error"])
+        img = result.get("image") or {}
+        if "error" in img:
+            raise Exception(img["error"])
+        fp = img.get("filepath") or result.get("image_path") or result.get("filepath")
+        if not fp or not os.path.exists(fp):
+            raise Exception(f"the add-on reported no capture file ({result.get('count')} {iss} element(s) found)")
+        return _safe_image_return(_read_and_remove(fp))
+    except Exception as e:
+        if render:
+            logger.error(f"find_mesh_issues error: {e}")
+            raise Exception(f"find_mesh_issues failed: {e}") from e
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def compare_meshes(
+    ctx: Context,
+    mesh_a: str,
+    mesh_b: str,
+    tolerance: float = 1e-5,
+    compare: str = "ALL",
+) -> str:
+    """
+    Numeric diff of two meshes for round-trip safety: vertex and triangle counts,
+    positions differing beyond tolerance, vertex ORDER, custom normals (max angle),
+    UV layers (max delta), tangents, material slots and vertex groups.
+
+    Parameters:
+    - mesh_a / mesh_b: Mesh object names
+    - tolerance: Position tolerance (default 1e-5)
+    - compare: ALL or a comma list of VERTS, ORDER, NORMALS, UVS, TANGENTS, MATERIALS, GROUPS
+
+    Reply: same (bool), unit_test_compare (Blender's own verdict, "Same" when equal)
+    and one block per compared aspect.
+    """
+    parts = [p.upper() for p in _split_csv(compare)] or ["ALL"]
+    bad = [p for p in parts if p != "ALL" and p not in _B2_COMPARE]
+    if bad:
+        return f"Error: compare must be ALL or a comma list of {', '.join(_B2_COMPARE)} (got {bad})"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("compare_meshes", {
+            "mesh_a": mesh_a, "mesh_b": mesh_b, "tolerance": tolerance, "compare": ",".join(parts),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def apply_transforms(
+    ctx: Context,
+    objects: str,
+    location: bool = False,
+    rotation: bool = True,
+    scale: bool = True,
+    keep_children_world: bool = True,
+) -> str:
+    """
+    Apply object transforms into the mesh data (object.transform_apply). Shared
+    mesh data gets its own copy (isolate_users), reported under isolated; on
+    Blender 5.x a negative scale gets its normals flipped back (flip_corrected).
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - location / rotation / scale: Which channels to apply (default False / True / True)
+    - keep_children_world: Children keep their world transform (default True)
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("apply_transforms", {
+            "objects": objs, "location": bool(location), "rotation": bool(rotation),
+            "scale": bool(scale), "keep_children_world": bool(keep_children_world),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def fix_normals(
+    ctx: Context,
+    objects: str,
+    mode: str = "OUTSIDE",
+    also_sharp_by_angle: float = None,
+) -> str:
+    """
+    Recalculate face normals (OUTSIDE / INSIDE), FLIP them, or CLEAR_CUSTOM split
+    normals so a re-export does not carry stale ones.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - mode: OUTSIDE (default), INSIDE, FLIP or CLEAR_CUSTOM
+    - also_sharp_by_angle: Also mark edges sharper than this angle in degrees (optional)
+
+    Reply: faces_flipped per object, custom_normals_cleared, sharp_edges_marked.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    m = _b2_enum(mode, _B2_NORMAL_MODES, "mode")
+    if m.startswith("Error: "):
+        return m
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("fix_normals", {
+            "objects": objs, "mode": m, "also_sharp_by_angle": also_sharp_by_angle,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def cleanup_mesh(
+    ctx: Context,
+    objects: str,
+    remove_doubles: float = 0.0001,
+    delete_loose: bool = True,
+    dissolve_degenerate: bool = True,
+    fill_holes: int = 0,
+    limited_dissolve: float = None,
+) -> str:
+    """
+    One BMesh clean-up pass per mesh: merge doubles, delete loose elements,
+    dissolve degenerate faces, fill holes, limited dissolve by angle.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - remove_doubles: Merge distance (default 0.0001; 0 = skip)
+    - delete_loose: Remove loose verts and edges (default True)
+    - dissolve_degenerate: Remove zero-area faces and zero-length edges (default True)
+    - fill_holes: Fill holes with up to this many sides (default 0 = skip)
+    - limited_dissolve: Dissolve flat regions below this angle in degrees (optional)
+
+    Reply: per_object counts removed per step, faces before and after.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    if remove_doubles is not None and remove_doubles < 0:
+        return "Error: remove_doubles must be >= 0"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("cleanup_mesh", {
+            "objects": objs, "remove_doubles": remove_doubles, "delete_loose": bool(delete_loose),
+            "dissolve_degenerate": bool(dissolve_degenerate), "fill_holes": fill_holes,
+            "limited_dissolve": limited_dissolve,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# Optimisation, LODs and collision (13.2.3 / 13.2.4, B2-S L2)
+
+_B2_DECIMATE_MODES = ("COLLAPSE", "PLANAR", "DISSOLVE", "UNSUBDIVIDE", "UNSUBDIV")
+_B2_SET_NORMAL_MODES = ("AUTO_SMOOTH", "AUTO_SMOOTH_MODIFIER", "WEIGHTED", "SMOOTH", "FLAT", "FROM_OBJECT", "CLEAR_CUSTOM")
+_B2_QUAD_METHODS = ("BEAUTY", "FIXED", "FIXED_ALTERNATE", "SHORTEST_DIAGONAL", "LONGEST_DIAGONAL")
+_B2_NGON_METHODS = ("BEAUTY", "CLIP")
+_B2_GROUP_BY = ("OBJECT", "COLLECTION", "MATERIAL")
+_B2_SHAPES = ("CONVEX", "BOX", "SPHERE", "CAPSULE", "CYLINDER", "MESH_DECIMATED", "SLICED_CONVEX")
+_B2_AXES = ("X", "Y", "Z")
+
+
+def _b2_axis(value):
+    """None stays None; else an X/Y/Z axis or an 'Error: ...' string."""
+    if value is None or str(value).strip() == "":
+        return None
+    return _b2_enum(value, _B2_AXES, "symmetry_axis")
+
+
+@mcp.tool()
+def decimate_mesh(
+    ctx: Context,
+    mesh: str,
+    ratio: float = None,
+    target_triangles: int = None,
+    mode: str = "COLLAPSE",
+    angle_limit: float = 5.0,
+    iterations: int = 2,
+    symmetry_axis: str = None,
+    vertex_group: str = None,
+    vertex_group_factor: float = 1.0,
+    keep_uv_seams: bool = True,
+    triangulate: bool = True,
+    apply: bool = True,
+    new_object: str = None,
+) -> str:
+    """
+    Reduce a mesh with a Decimate modifier, by ratio or to a triangle target
+    (iterated, at most 6 passes, within 5 %). new_object works on a copy and
+    leaves the source untouched.
+
+    Parameters:
+    - mesh: Mesh object name
+    - ratio: Keep this fraction of faces (0..1), or
+    - target_triangles: Aim for this many triangles (one of the two)
+    - mode: COLLAPSE (default), PLANAR / DISSOLVE, UNSUBDIVIDE / UNSUBDIV
+    - angle_limit: PLANAR angle in degrees (default 5)
+    - iterations: UNSUBDIVIDE passes (default 2)
+    - symmetry_axis: X, Y or Z to decimate symmetrically
+    - vertex_group / vertex_group_factor: weight the reduction by a group
+    - keep_uv_seams: Delimit by UV and seam edges (default True)
+    - triangulate: Collapse to triangles (default True)
+    - apply: Apply the modifier (default True; False leaves it live)
+    - new_object: Name for a decimated copy; the source stays intact
+
+    Reply: result_object, mode, ratio_used, triangles_before, triangles_after, passes, applied, modifier.
+    """
+    if (ratio is None) == (target_triangles is None):
+        return "Error: give ratio or target_triangles (exactly one)"
+    m = _b2_enum(mode, _B2_DECIMATE_MODES, "mode")
+    if m.startswith("Error: "):
+        return m
+    ax = _b2_axis(symmetry_axis)
+    if isinstance(ax, str) and ax.startswith("Error: "):
+        return ax
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("decimate_mesh", {
+            "mesh": mesh, "ratio": ratio, "target_triangles": target_triangles, "mode": m,
+            "angle_limit": angle_limit, "iterations": iterations, "symmetry_axis": ax,
+            "vertex_group": vertex_group, "vertex_group_factor": vertex_group_factor,
+            "keep_uv_seams": bool(keep_uv_seams), "triangulate": bool(triangulate),
+            "apply": bool(apply), "new_object": new_object,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def generate_lods(
+    ctx: Context,
+    mesh: str,
+    ratios: str = None,
+    triangle_targets: str = None,
+    naming: str = "{name}_LOD{level}",
+    collection: str = None,
+    parent_to_lod0: bool = False,
+    mode: str = "COLLAPSE",
+    symmetry_axis: str = None,
+    keep_uv_seams: bool = True,
+    preserve_silhouette_group: str = None,
+    transfer_normals: bool = False,
+) -> str:
+    """
+    Build an LOD chain: the source becomes <name>_LOD0 and each level is a
+    decimated copy sharing its materials (Unity-style naming by default). Every
+    target name is checked first; a collision changes nothing.
+
+    Parameters:
+    - mesh: Source mesh object name (an existing _LOD<n> suffix is stripped)
+    - ratios: Comma list of face ratios per level, or
+    - triangle_targets: Comma list of triangle counts per level (not both; with
+      neither the add-on uses ratios 0.5,0.25,0.1)
+    - naming: Pattern with {name} and {level} (default "{name}_LOD{level}")
+    - collection: Put the levels in this collection (optional)
+    - parent_to_lod0: Parent the levels to LOD0 (default False)
+    - mode / symmetry_axis / keep_uv_seams: As decimate_mesh
+    - preserve_silhouette_group: Vertex group that weights the reduction (optional)
+    - transfer_normals: Data Transfer custom normals from LOD0 to each level (default False)
+
+    Reply: source, lod0, levels [{level, name, triangles, ratio}], collection, custom_normals_transferred.
+    """
+    if ratios is not None and triangle_targets is not None:
+        return "Error: give ratios or triangle_targets, not both"
+    m = _b2_enum(mode, _B2_DECIMATE_MODES, "mode")
+    if m.startswith("Error: "):
+        return m
+    ax = _b2_axis(symmetry_axis)
+    if isinstance(ax, str) and ax.startswith("Error: "):
+        return ax
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("generate_lods", {
+            "mesh": mesh, "ratios": ratios, "triangle_targets": triangle_targets, "naming": naming,
+            "collection": collection, "parent_to_lod0": bool(parent_to_lod0), "mode": m,
+            "symmetry_axis": ax, "keep_uv_seams": bool(keep_uv_seams),
+            "preserve_silhouette_group": preserve_silhouette_group,
+            "transfer_normals": bool(transfer_normals),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_normals(
+    ctx: Context,
+    objects: str,
+    mode: str = "AUTO_SMOOTH",
+    angle: float = 30.0,
+    keep_sharp: bool = True,
+    source_object: str = None,
+    apply: bool = True,
+) -> str:
+    """
+    Set shading normals for export: smooth by angle (marks sharp edges, both
+    Blender versions), weighted normals, flat or smooth, custom normals
+    transferred from a high-poly source, or clear custom normals.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - mode: AUTO_SMOOTH (default), AUTO_SMOOTH_MODIFIER (Blender 5.x Smooth by Angle
+            modifier), WEIGHTED, SMOOTH, FLAT, FROM_OBJECT, CLEAR_CUSTOM
+    - angle: Smoothing angle in degrees (default 30)
+    - keep_sharp: Keep marked sharp edges (default True)
+    - source_object: High-poly source for FROM_OBJECT (required then)
+    - apply: Apply the modifier used (default True)
+
+    Reply: method, modifier_used, has_custom_normals and sharp_edges per object.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    m = _b2_enum(mode, _B2_SET_NORMAL_MODES, "mode")
+    if m.startswith("Error: "):
+        return m
+    if m == "FROM_OBJECT" and not (source_object or "").strip():
+        return "Error: source_object is required for mode FROM_OBJECT"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_normals", {
+            "objects": objs, "mode": m, "angle": angle, "keep_sharp": bool(keep_sharp),
+            "source_object": source_object, "apply": bool(apply),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def triangulate_for_export(
+    ctx: Context,
+    objects: str,
+    quad_method: str = "SHORTEST_DIAGONAL",
+    ngon_method: str = "BEAUTY",
+    keep_custom_normals: bool = True,
+    min_vertices: int = 4,
+    as_modifier: bool = False,
+) -> str:
+    """
+    Triangulate with a Triangulate modifier (keeps custom normals, unlike the
+    BMesh operator), applied, or left live with as_modifier so the source stays quads.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - quad_method: BEAUTY, FIXED, FIXED_ALTERNATE, SHORTEST_DIAGONAL (default), LONGEST_DIAGONAL
+    - ngon_method: BEAUTY (default) or CLIP
+    - keep_custom_normals: Preserve custom split normals (default True)
+    - min_vertices: Only faces with at least this many vertices (default 4)
+    - as_modifier: Leave the modifier live instead of applying (default False)
+
+    Reply: per_object {triangles_before, triangles_after, modifier}.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    qm = _b2_enum(quad_method, _B2_QUAD_METHODS, "quad_method")
+    if qm.startswith("Error: "):
+        return qm
+    nm = _b2_enum(ngon_method, _B2_NGON_METHODS, "ngon_method")
+    if nm.startswith("Error: "):
+        return nm
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("triangulate_for_export", {
+            "objects": objs, "quad_method": qm, "ngon_method": nm,
+            "keep_custom_normals": bool(keep_custom_normals), "min_vertices": min_vertices,
+            "as_modifier": bool(as_modifier),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_triangle_budget(
+    ctx: Context,
+    objects: str = None,
+    budget: int = None,
+    group_by: str = "OBJECT",
+) -> str:
+    """
+    Triangle counts with modifiers evaluated, sorted descending, with each
+    item's share of a budget.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed); None = every mesh in the scene
+    - budget: Triangle budget (optional; sets over_budget)
+    - group_by: OBJECT (default), COLLECTION or MATERIAL
+
+    Reply: group_by, budget, total, items [{name, triangles, share}], over_budget.
+    """
+    gb = _b2_enum(group_by, _B2_GROUP_BY, "group_by")
+    if gb.startswith("Error: "):
+        return gb
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_triangle_budget", {
+            "objects": objects or None, "budget": budget, "group_by": gb,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def create_collision(
+    ctx: Context,
+    mesh: str,
+    shape: str = "CONVEX",
+    profile: str = "UNREAL",
+    count: int = 1,
+    axis: str = "Z",
+    decimate_ratio: float = 0.1,
+    padding: float = 0.0,
+    display_wire: bool = True,
+    parent: bool = True,
+    collection: str = None,
+) -> str:
+    """
+    Create a collision proxy from the evaluated mesh, named by the engine's
+    convention (UNREAL UCX_<mesh>_NN, GODOT <mesh>-convcol / -col, UNITY
+    <mesh>_Collider, others <mesh>_COL), wire-displayed, hidden from render.
+
+    Parameters:
+    - mesh: Source mesh object name
+    - shape: CONVEX (default), BOX, SPHERE, CAPSULE, CYLINDER, MESH_DECIMATED, SLICED_CONVEX
+    - profile: UNREAL (default), UNITY, GODOT, BEVY, TIMBERMESH or GENERIC
+    - count: SLICED_CONVEX slabs along axis (1..32, default 1)
+    - axis: Slicing axis X, Y or Z (default Z)
+    - decimate_ratio: MESH_DECIMATED ratio (default 0.1)
+    - padding: Grow fitted shapes by this distance (default 0)
+    - display_wire / parent: Wire display and parenting under the mesh (default True)
+    - collection: Put the proxy in this collection (optional)
+
+    Reply: proxies [{name, triangles, volume_ratio}], parent, collection.
+    """
+    sh = _b2_enum(shape, _B2_SHAPES, "shape")
+    if sh.startswith("Error: "):
+        return sh
+    prof = _b2_enum(profile, _B2_PROFILES, "profile")
+    if prof.startswith("Error: "):
+        return prof
+    if not isinstance(count, int) or count < 1 or count > 32:
+        return "Error: count must be between 1 and 32"
+    ax = _b2_enum(axis, _B2_AXES, "axis")
+    if ax.startswith("Error: "):
+        return ax
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("create_collision", {
+            "mesh": mesh, "shape": sh, "profile": prof, "count": count, "axis": ax,
+            "decimate_ratio": decimate_ratio, "padding": padding, "display_wire": bool(display_wire),
+            "parent": bool(parent), "collection": collection,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_collision_info(ctx: Context, mesh: str) -> str:
+    """
+    List a mesh's collision proxies by every engine's naming rule, with
+    triangle counts and whether each is parented to the mesh.
+
+    Parameters:
+    - mesh: Mesh object name
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_collision_info", {"mesh": mesh})
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def check_collision_fit(ctx: Context, mesh: str, samples: int = 2000) -> str:
+    """
+    How well the collision proxies cover the mesh: fraction of surface sample
+    points inside any proxy and the largest distance outside.
+
+    Parameters:
+    - mesh: Mesh object name
+    - samples: Surface sample points (1..20000, default 2000; deterministic)
+
+    Reply: proxies, covered_fraction, max_outside_distance, inside_samples.
+    """
+    if not isinstance(samples, int) or samples < 1 or samples > 20000:
+        return "Error: samples must be between 1 and 20000"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("check_collision_fit", {"mesh": mesh, "samples": samples})
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# Sockets, pivots, hierarchy and engine export (13.2.5 / 13.2.6, B2-S L3)
+
+_B2_SOCKET_PROFILES = ("UNREAL", "TIMBERMESH", "UNITY", "GENERIC")
+_B2_SPACES = ("LOCAL", "WORLD")
+_B2_SNAP_TO = ("NONE", "SURFACE", "VERTEX")
+_B2_PIVOT_MODES = ("BOTTOM_CENTER", "CENTER", "TOP_CENTER", "WORLD_ORIGIN", "CURSOR", "CUSTOM")
+_B2_SNAP_WHAT = ("ORIGIN", "BOUNDS_MIN", "BOUNDS_CENTER")
+_B2_ENGINES = ("UNITY", "UNREAL", "GODOT", "BEVY", "TIMBERMESH", "GENERIC_GLTF", "GENERIC_FBX")   # RS-2: no bare GENERIC
+_B2_TEXTURES = ("COPY", "EMBED", "NONE", "KEEP_PATHS")
+_B2_ONE_FILE_PER = ("OBJECT", "ROOT", "COLLECTION")
+_B2_ENGINE_EXT = {"UNITY": "fbx", "UNREAL": "fbx", "GENERIC_FBX": "fbx",
+                  "GODOT": "glb", "BEVY": "glb", "GENERIC_GLTF": "glb", "TIMBERMESH": "timbermesh"}
+
+
+def _b2_stem(text) -> str:
+    """A file stem from an object or collection name: RS-4 sanitised ([^A-Za-z0-9_.-] -> _),
+    'export' when nothing usable is left (a glob like 'Prop*' becomes 'Prop_')."""
+    stem = _re.sub(r"[^A-Za-z0-9_.-]", "_", str(text or ""))
+    return stem if _re.search(r"[A-Za-z0-9]", stem) else "export"
+
+
+def _b2_vec3_text(text, label: str, required: bool = False):
+    """Validate an 'x,y,z' string (forwarded as typed); None/empty -> None unless required."""
+    if text is None or str(text).strip() == "":
+        return f"Error: {label} is required, e.g. '0,0,0'" if required else None
+    v = _parse_vec3(text, label)
+    return v if isinstance(v, str) else text
+
+
+@mcp.tool()
+def add_socket(
+    ctx: Context,
+    parent: str,
+    name: str,
+    location: str = "0,0,0",
+    rotation: str = "0,0,0",
+    space: str = "LOCAL",
+    profile: str = "UNREAL",
+    bone: str = None,
+    display_size: float = 0.1,
+    snap_to: str = "NONE",
+    vertex_index: int = None,
+) -> str:
+    """
+    Add an attach-point Empty under an object (or one of its bones), named for
+    the engine: UNREAL SOCKET_<name>, TIMBERMESH #<name> (needs a # root in the
+    parent chain), else <name>.
+
+    Parameters:
+    - parent: Parent object name
+    - name: Socket name (the profile prefix is added)
+    - location / rotation: "x,y,z" (rotation in degrees), in space
+    - space: LOCAL (default) or WORLD
+    - profile: UNREAL (default), TIMBERMESH, UNITY or GENERIC
+    - bone: Parent to this bone (armature parents only)
+    - display_size: Empty display size (default 0.1)
+    - snap_to: NONE (default), SURFACE (closest point on the parent) or VERTEX (vertex_index)
+    - vertex_index: Vertex to snap to with snap_to=VERTEX
+
+    Reply: name, parent, bone, profile, location_world, rotation_world (deg), matrix_world.
+    """
+    if not (name or "").strip():
+        return "Error: name is required"
+    loc = _b2_vec3_text(location, "location")
+    if isinstance(loc, str) and loc.startswith("Error: "):
+        return loc
+    rot = _b2_vec3_text(rotation, "rotation")
+    if isinstance(rot, str) and rot.startswith("Error: "):
+        return rot
+    sp = _b2_enum(space, _B2_SPACES, "space")
+    if sp.startswith("Error: "):
+        return sp
+    prof = _b2_enum(profile, _B2_SOCKET_PROFILES, "profile")
+    if prof.startswith("Error: "):
+        return prof
+    snap = _b2_enum(snap_to, _B2_SNAP_TO, "snap_to")
+    if snap.startswith("Error: "):
+        return snap
+    if snap == "VERTEX" and vertex_index is None:
+        return "Error: vertex_index is required with snap_to VERTEX"
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("add_socket", {
+            "parent": parent, "name": name, "location": loc, "rotation": rot, "space": sp,
+            "profile": prof, "bone": bone, "display_size": display_size, "snap_to": snap,
+            "vertex_index": vertex_index,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def list_sockets(ctx: Context, parent: str = None) -> str:
+    """
+    List socket Empties (names starting with SOCKET_ or #), or every Empty child
+    of parent, with local and world transforms and the bone each follows. Read-only.
+
+    Parameters:
+    - parent: Restrict to this object's Empty children (optional)
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("list_sockets", {"parent": parent})
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def set_pivot(
+    ctx: Context,
+    objects: str,
+    mode: str = "BOTTOM_CENTER",
+    location: str = None,
+    keep_world: bool = True,
+) -> str:
+    """
+    Move the origin of several objects in one round trip (batch set_origin);
+    the meshes stay where they are in the world.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - mode: BOTTOM_CENTER (default), CENTER, TOP_CENTER, WORLD_ORIGIN, CURSOR or CUSTOM
+    - location: "x,y,z" world point for CUSTOM
+    - keep_world: Keep the mesh in place (default True)
+
+    Reply: per_object {name: {new_location}}.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    m = _b2_enum(mode, _B2_PIVOT_MODES, "mode")
+    if m.startswith("Error: "):
+        return m
+    loc = _b2_vec3_text(location, "location", required=(m == "CUSTOM"))
+    if isinstance(loc, str) and loc.startswith("Error: "):
+        return loc
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("set_pivot", {
+            "objects": objs, "mode": m, "location": loc, "keep_world": bool(keep_world),
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def snap_to_grid(
+    ctx: Context,
+    objects: str,
+    grid: float = 1.0,
+    axes: str = "XYZ",
+    what: str = "ORIGIN",
+) -> str:
+    """
+    Snap objects to a grid for modular-kit placement: the origin, the bounding
+    box minimum corner or the bounding box centre lands on a grid point.
+
+    Parameters:
+    - objects: Comma list of object names (globs allowed)
+    - grid: Grid step (> 0, default 1.0)
+    - axes: Any of X, Y, Z (default "XYZ")
+    - what: ORIGIN (default), BOUNDS_MIN or BOUNDS_CENTER
+
+    Reply: per_object {name: {before, after}}.
+    """
+    objs = _b2_objects(objects)
+    if objs.startswith("Error: "):
+        return objs
+    if grid is None or grid <= 0:
+        return "Error: grid must be > 0"
+    ax = "".join(sorted(set((axes or "").upper().replace(",", "").replace(" ", ""))))
+    if not ax or any(c not in "XYZ" for c in ax):
+        return "Error: axes must be a combination of X, Y and Z, e.g. 'XY'"
+    w = _b2_enum(what, _B2_SNAP_WHAT, "what")
+    if w.startswith("Error: "):
+        return w
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("snap_to_grid", {
+            "objects": objs, "grid": grid, "axes": ax, "what": w,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def build_export_hierarchy(
+    ctx: Context,
+    root_name: str,
+    meshes: str,
+    collision: str = None,
+    sockets: str = None,
+    lods: str = None,
+    profile: str = "UNREAL",
+) -> str:
+    """
+    Parent meshes, LODs, collision proxies and sockets under a root Empty in the
+    layout the engine's importer expects (UNREAL: LODs with a lod_group custom
+    prop, UCX children under their mesh; GODOT: -col siblings; others: LOD siblings).
+
+    Parameters:
+    - root_name: Root Empty (reused when it exists, created otherwise)
+    - meshes: Comma list of mesh names
+    - collision / sockets / lods: Comma lists (optional)
+    - profile: UNREAL (default), UNITY, GODOT, BEVY, TIMBERMESH or GENERIC
+
+    Reply: root, created_root, tree (nested names), custom_props_set.
+    """
+    if not (root_name or "").strip():
+        return "Error: root_name is required"
+    m = _b2_objects(meshes, "meshes")
+    if m.startswith("Error: "):
+        return m
+    prof = _b2_enum(profile, _B2_PROFILES, "profile")
+    if prof.startswith("Error: "):
+        return prof
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("build_export_hierarchy", {
+            "root_name": root_name, "meshes": m, "collision": collision, "sockets": sockets,
+            "lods": lods, "profile": prof,
+        })
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def get_export_preset(ctx: Context, engine: str) -> str:
+    """
+    Show the exact exporter settings export_for_engine applies for an engine:
+    format, kwargs, axes, units, naming rules and notes.
+
+    Parameters:
+    - engine: UNITY, UNREAL, GODOT, BEVY, TIMBERMESH, GENERIC_GLTF or GENERIC_FBX
+    """
+    eng = _b2_enum(engine, _B2_ENGINES, "engine")
+    if eng.startswith("Error: "):
+        return eng
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_export_preset", {"engine": eng})
+        return _b2_reply(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _b2_export_text(result: dict) -> str:
+    msg = (f"Exported {result.get('engine')} -> {result.get('filepath')} ({result.get('size_bytes')} bytes, "
+           f"{len(result.get('objects') or [])} objects, {result.get('triangles')} tris); "
+           f"manifest: {result.get('manifest_path')}")
+    val = result.get("validation")
+    msg += f"; validation: {val.get('verdict') if isinstance(val, dict) else 'skipped'}"
+    if result.get("warnings"):
+        msg += "; warnings: " + "; ".join(str(w) for w in result["warnings"])
+    return msg
+
+
+@mcp.tool()
+def export_for_engine(
+    ctx: Context,
+    engine: str,
+    objects: str = None,
+    collection: str = None,
+    filepath: str = None,
+    include_hierarchy: bool = True,
+    include_collision: bool = True,
+    include_sockets: bool = True,
+    include_lods: bool = True,
+    include_animation: bool = False,
+    apply_modifiers: bool = True,
+    triangulate: bool = True,
+    validate: bool = True,
+    textures: str = "COPY",
+    overrides: str = None,
+) -> str:
+    """
+    Export objects (with their hierarchy, LODs, collision and sockets) using an
+    engine preset (get_export_preset shows it), after validate_asset; a FAIL
+    verdict refuses the export unless overrides has "force": true. The add-on
+    writes <file>.manifest.json beside the file.
+
+    Parameters:
+    - engine: UNITY, UNREAL, GODOT, BEVY, TIMBERMESH, GENERIC_GLTF or GENERIC_FBX
+    - objects: Comma list of root objects (globs allowed), or
+    - collection: Collection to export (one of the two)
+    - filepath: Output file; default <output_dir>/<first root>.<ext> (stem sanitised)
+                when the output_dir setting is set, else a temp path chosen by the add-on
+    - include_hierarchy / include_collision / include_sockets / include_lods: default True
+    - include_animation: default False
+    - apply_modifiers: Export the evaluated mesh (default True)
+    - triangulate: Temporary Triangulate modifier for the file only (default True)
+    - validate: Run validate_asset first (default True)
+    - textures: COPY (default), EMBED, NONE or KEEP_PATHS
+    - overrides: JSON object of exporter kwargs merged over the preset; "force": true exports despite FAIL
+    """
+    if bool(objects) == bool(collection):
+        return "Error: give objects or collection (exactly one)"
+    if triangulate and not apply_modifiers:   # RS-13 / R-B2-38: the temporary modifier needs evaluation
+        return "Error: triangulate=True requires apply_modifiers=True"
+    eng = _b2_enum(engine, _B2_ENGINES, "engine")
+    if eng.startswith("Error: "):
+        return eng
+    tex = _b2_enum(textures, _B2_TEXTURES, "textures")
+    if tex.startswith("Error: "):
+        return tex
+    ov = _parse_json_object(overrides, "overrides")
+    if isinstance(ov, str):
+        return ov
+    try:
+        if not filepath:
+            stem = _b2_stem((_split_csv(objects)[0] if objects else None) or collection)
+            filepath = _default_output_path(f"{stem}.{_B2_ENGINE_EXT[eng]}")
+        blender = get_blender_connection()
+        result = blender.send_command("export_for_engine", {
+            "objects": objects, "collection": collection, "engine": eng, "filepath": filepath,
+            "include_hierarchy": bool(include_hierarchy), "include_collision": bool(include_collision),
+            "include_sockets": bool(include_sockets), "include_lods": bool(include_lods),
+            "include_animation": bool(include_animation), "apply_modifiers": bool(apply_modifiers),
+            "triangulate": bool(triangulate), "validate": bool(validate), "textures": tex,
+            "overrides": ov or None,
+        })
+        if "error" in result:
+            return _driver_reply(result)   # Error: <text> plus the validation block when present
+        return _b2_export_text(result)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def batch_export(
+    ctx: Context,
+    engine: str,
+    objects: str = None,
+    collection: str = None,
+    output_dir: str = None,
+    naming: str = "{name}",
+    one_file_per: str = "OBJECT",
+    skip_hidden: bool = True,
+    continue_on_error: bool = True,
+) -> str:
+    """
+    Export every root mesh (or the given objects) as its own file with
+    export_for_engine, one round trip per root, and write batch_manifest.json
+    in the output folder with a PASS/FAIL row per root.
+
+    Parameters:
+    - engine: UNITY, UNREAL, GODOT, BEVY, TIMBERMESH, GENERIC_GLTF or GENERIC_FBX
+    - objects: Comma list of roots (globs allowed); default every parent-less mesh in the scene
+    - collection: Only roots in this collection (optional, also filters an objects list)
+    - output_dir: Folder for the files; default the output_dir setting, else a temp folder
+    - naming: File stem pattern with {name} (default "{name}"; stems sanitised)
+    - one_file_per: OBJECT (default) = one file per object WITHOUT its children;
+                    ROOT = one file per root WITH its hierarchy;
+                    COLLECTION = all roots in one file named after the collection
+    - skip_hidden: Skip roots hidden in the viewport (default True)
+    - continue_on_error: Keep going after a failed root (default True)
+    """
+    eng = _b2_enum(engine, _B2_ENGINES, "engine")
+    if eng.startswith("Error: "):
+        return eng
+    per = _b2_enum(one_file_per, _B2_ONE_FILE_PER, "one_file_per")
+    if per.startswith("Error: "):
+        return per
+    if "{name}" not in (naming or ""):
+        return "Error: naming must contain {name}, e.g. 'prop_{name}'"
+    if per == "COLLECTION" and not collection:
+        return "Error: one_file_per COLLECTION needs collection"
+    ext = _B2_ENGINE_EXT[eng]
+    try:
+        # RS-11: the same output_dir resolution as every exporter, else a temp folder
+        out_dir = output_dir or os.path.dirname(_default_output_path("x") or "") \
+            or os.path.join(tempfile.gettempdir(), "blender_batch_export")
+        os.makedirs(out_dir, exist_ok=True)
+        blender = get_blender_connection()
+        # R-B2-28 / R-B2-32: ONE get_scene_info call (limit 0 = every object) resolves the roots
+        # (type MESH, parent null), the hidden flags and the collection membership
+        scene = blender.send_command("get_scene_info", {"limit": 0})
+        if "error" in scene:
+            return f"Error: {scene['error']}"
+        entries = [o for o in scene.get("objects", []) if isinstance(o, dict)]
+        names_in_scene = [o.get("name") for o in entries if o.get("name")]
+        hidden = {o.get("name") for o in entries if o.get("hidden")} if skip_hidden else set()
+        if objects:
+            roots = []   # RS-4: fnmatch globs expanded against the scene names, order kept, no duplicates
+            for pat in _split_csv(objects):
+                # RS-15 / R-B2-41: an exact name always wins (Panel[1] is a root); fnmatch only when nothing matches
+                if pat in names_in_scene or not any(c in pat for c in "*?["):
+                    hits = [pat]
+                else:
+                    hits = fnmatch.filter(names_in_scene, pat)
+                roots.extend(h for h in hits if h not in roots)
+        else:
+            roots = [o.get("name") for o in entries
+                     if o.get("type") == "MESH" and o.get("parent") is None and o.get("name")]
+        if collection:
+            # R-B2-30 / RS-5: entries carry `collections: [names]`; the filter applies to BOTH branches
+            if not all(isinstance(o.get("collections"), list) for o in entries):
+                return ("Error: collection filter unavailable: get_scene_info entries carry no "
+                        "`collections` key (add-on older than 2.4.0 L1.1)")
+            member = {o.get("name") for o in entries if collection in o["collections"]}
+            roots = [r for r in roots if r in member]
+        roots = [r for r in roots if r not in hidden]
+        if not roots:
+            return "Error: no root meshes to export (all hidden or none found)"
+        jobs = [(collection, roots)] if per == "COLLECTION" else [(r, [r]) for r in roots]
+        rows, lines = [], []
+        for label, names in jobs:
+            fp = os.path.join(out_dir, f"{naming.format(name=_b2_stem(label))}.{ext}")
+            try:
+                res = blender.send_command("export_for_engine", {
+                    "objects": ",".join(names), "collection": None, "engine": eng, "filepath": fp,
+                    "include_hierarchy": per != "OBJECT",   # R-B2-33 / RS-8: OBJECT = no children
+                    "include_collision": True, "include_sockets": True,
+                    "include_lods": True, "include_animation": False, "apply_modifiers": True,
+                    "triangulate": True, "validate": True, "textures": "COPY", "overrides": None,
+                })
+            except Exception as e:
+                res = {"error": str(e)}
+            if "error" in res:
+                rows.append({"object": label, "status": "FAIL", "filepath": None, "triangles": None, "error": str(res["error"])})
+                lines.append(f"FAIL {label}: {res['error']}")
+                if not continue_on_error:
+                    break
+            else:
+                rows.append({"object": label, "status": "PASS", "filepath": res.get("filepath", fp),
+                             "triangles": res.get("triangles"), "error": None})
+                lines.append(f"PASS {label} -> {res.get('filepath', fp)} ({res.get('triangles')} tris)")
+        manifest_path = os.path.join(out_dir, "batch_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump({"engine": eng, "output_dir": out_dir,
+                       "written_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                       "rows": rows}, fh, indent=2)
+        lines.append(f"manifest: {manifest_path}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @mcp.prompt()

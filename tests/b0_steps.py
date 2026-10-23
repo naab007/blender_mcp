@@ -320,7 +320,11 @@ def b15():
     legacy_expected = ["blendermcp_hyper3d_api_key", "blendermcp_sketchfab_api_key",
                        "blendermcp_hunyuan3d_secret_id", "blendermcp_hunyuan3d_secret_key"]
     missing_legacy = [p for p in legacy_expected if p not in scene_props]
-    assert not missing_legacy, "legacy secret props must stay registered through 2.1.x, missing: %s" % missing_legacy
+    if tuple(addon.bl_info["version"]) >= (2, 4, 0):
+        # PLAN.md 13.1 H15 (2.4.0): the legacy StringProperties are no longer registered; orphaned idprops migrate via scene.get()
+        assert len(missing_legacy) == 4, "H15: legacy secret props still registered at 2.4.0: %s" % [p for p in legacy_expected if p in scene_props]
+    else:
+        assert not missing_legacy, "legacy secret props must stay registered through 2.1.x, missing: %s" % missing_legacy
     draw_src = inspect.getsource(addon.BLENDERMCP_PT_Panel.draw)
     drawn = [p for p in legacy_expected if p in draw_src]
     assert not drawn, "panel draw() still references legacy secret props: %s" % drawn
